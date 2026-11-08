@@ -6,7 +6,9 @@
 // Usage: node scripts/merge-test.js [--write dir]   (--write saves the inputs
 // and one merged town as .json files, handy for trying them in the browser)
 
-import { World, fw, fd } from '../src/world/world.js';
+import { World, plotOf, findPlot, groundUnder } from '../src/world/world.js';
+import { pieces as netPieces } from '../src/save/mergeParts.js';
+import { spline, pointAt, wrapAngle, angDiff } from '../src/world/geom.js';
 import { growDemoTown } from '../src/world/demo.js';
 import { PathFinder } from '../src/sim/path.js';
 import { Sim } from '../src/sim/sim.js';
@@ -17,7 +19,6 @@ import { serialize, deserialize } from '../src/save/saves.js';
 import { mergeTowns, layoutMerge, besideOffset, reportLines, MERGE_MAX_N, newVillage } from '../src/save/merge.js';
 import { BUILDINGS, TECHS, LINE_COLORS } from '../src/defs.js';
 import { auditTown } from './audit.js';
-import { linksOf } from '../src/world/roadShape.js';
 
 let failures = 0, passes = 0;
 const ok = (cond, msg) => { if (!cond) { failures++; console.error('FAIL', msg); } else passes++; };
@@ -44,45 +45,35 @@ function makeTown(N, seed, name, { day = 1, research = null, bigParks = false, s
   const g = gameFor(w);
   g.sim.seedFounders();
   w.money = 6000;
-  const stops = [];
-  for (let z = 0; z < N && stops.length < 3; z++) for (let x = 0; x < N && stops.length < 3; x++) {
-    if (stops.some(s => Math.abs(s.x - x) + Math.abs(s.z - z) < 7)) continue;
-    const r = w.placeBuilding('coachstop', x, z, { free: true, ignoreMoney: true, instant: true });
+  const stops = [], FREE = { free: true, ignoreMoney: true, instant: true };
+  for (const [fx, fz] of [[0.3, 0.3], [0.7, 0.4], [0.5, 0.7], [0.3, 0.7], [0.7, 0.7]]) {
+    if (stops.length >= 3) break;
+    const p = findPlot(w, 'coachstop', { x: N * fx, z: N * fz }, { r: N * 0.4, opts: FREE, test: (x, z, a, c) => !c || (c.access && c.access.conn && !stops.some(s => Math.hypot(s.x - x, s.z - z) < 7)) });
+    if (!p) continue;
+    const r = w.placeBuilding('coachstop', p.x, p.z, { ...FREE, a: p.a });
     if (r.ok && r.building.connected) stops.push(r.building); else if (r.ok) w.removeBuilding(r.building.id, 0);
   }
   if (stops.length >= 2) w.lines.push({ id: w.newId(), mode: 'coach', name: 'Coach Line 1', color: LINE_COLORS[0], stops: stops.map(s => s.id), vehicles: 1 });
   const home = [...w.buildings.values()].find(b => b.type === 'house' && !b.con && b.residents.length);
   if (home) {
-    for (let r = 2; r < 9; r++) {
-      let done = false;
-      for (let dz = -r; dz <= r && !done; dz++) for (let dx = -r; dx <= r && !done; dx++) {
-        const c = w.moveCheck(home, home.x + dx, home.z + dz);
-        if (c.ok && c.access.some(a => a.conn)) done = w.moveBuilding(home.id, home.x + dx, home.z + dz).ok;
-      }
-      if (done) break;
-    }
+    const p = findPlot(w, 'house', { x: home.x + 3, z: home.z + 3 }, { r: 9, opts: { ignoreMoney: true }, test: (x, z, a, c) => Math.hypot(x - home.x, z - home.z) > 1.5 && (!c || (c.access && c.access.conn)) });
+    if (p) w.moveBuilding(home.id, p.x, p.z, { a: p.a });
   }
-  for (let z = 2; z < N - 2; z++) {
-    const c = w.checkBuild('house', N >> 1, z, { ignoreMoney: true });
-    if (c.ok) { w.placeBuilding('house', N >> 1, z, {}); break; }
+  {
+    const p = findPlot(w, 'house', { x: N / 2, z: N / 2 }, { r: N / 2, opts: { ignoreMoney: true } });
+    if (p) w.placeBuilding('house', p.x, p.z, { a: p.a });
   }
   // a City Park and a Grand Park, laid out round what they grew from
   if (bigParks) for (const [type, flavor] of [['citypark', 'grandpark#1@1,-1/zoo#0@-1,1'], ['grandpark', 'landscapepark#1@-1,1/rosegarden']]) {
-    const S = BUILDINGS[type].size;
-    let done = false;
-    for (let z = 2; z < N - S - 1 && !done; z++) for (let x = 2; x < N - S - 1 && !done; x++) {
-      if (w.checkBuild(type, x, z, { ignoreMoney: true, ignoreUnlock: true }).ok) done = w.placeBuilding(type, x, z, { instant: true, ignoreUnlock: true, ignoreMoney: true, free: true, flavor }).ok;
-    }
+    const p = findPlot(w, type, { x: N / 2, z: N / 2 }, { r: N, opts: { ignoreMoney: true, ignoreUnlock: true } });
+    if (p) w.placeBuilding(type, p.x, p.z, { a: p.a, instant: true, ignoreUnlock: true, ignoreMoney: true, free: true, flavor });
   }
   // the town hall grown into a Capitol (or a Parliament), in its own style
   if (seat) {
-    const th = [...w.buildings.values()].find(b => b.type === 'townhall'), S = BUILDINGS[seat].size;
+    const th = [...w.buildings.values()].find(b => b.type === 'townhall');
     w.removeBuilding(th.id, 0);
-    let done = false;
-    for (let z = 2; z < N - S - 1 && !done; z++) for (let x = 2; x < N - S - 1 && !done; x++) {
-      const c = w.checkBuild(seat, x, z, { ignoreMoney: true, ignoreUnlock: true });
-      if (c.ok && c.access.some(a => a.conn)) done = w.placeBuilding(seat, x, z, { instant: true, ignoreUnlock: true, ignoreMoney: true, free: true, level: 1, flavor: 'gothic' }).ok;
-    }
+    const p = findPlot(w, seat, { x: th.x, z: th.z }, { r: N, opts: { ignoreMoney: true, ignoreUnlock: true }, test: (x, z, a, c) => !c || (c.access && c.access.conn) });
+    if (p) w.placeBuilding(seat, p.x, p.z, { a: p.a, instant: true, ignoreUnlock: true, ignoreMoney: true, free: true, level: 1, flavor: 'gothic' });
   }
   w.day = day;
   if (research) w.research = { done: research.slice(), current: null, progress: 0, bank: 5 };
@@ -98,23 +89,13 @@ const maxStep = (t) => {
   return m;
 };
 
-function roadPieces(w) {
-  const N = w.N, seen = new Uint8Array(N * N);
-  let pieces = 0;
-  for (let s = 0; s < N * N; s++) {
-    if (!w.roads[s] || seen[s]) continue;
-    pieces++;
-    const q = [s]; seen[s] = 1;
-    for (let k = 0; k < q.length; k++) {
-      const i = q[k], x = i % N, z = (i / N) | 0;
-      // (along every link: the grid, and diagonal streets corner to corner)
-      for (const [nx, nz] of linksOf(w, x, z)) {
-        const ni = nz * N + nx;
-        if (!seen[ni]) { seen[ni] = 1; q.push(ni); }
-      }
-    }
-  }
-  return pieces;
+// the separate pieces of the road network
+function roadPieces(w) { return netPieces(w.roads).length; }
+// how much road crosses water
+function bridged(w) {
+  let n = 0;
+  for (const e of w.roads.edges.values()) { const hy = w._heights(e); n += hy.wet.reduce((a, v) => a + v, 0) * hy.step; }
+  return n;
 }
 
 // steepest corner-to-corner step within `band` corners of either town's edge
@@ -154,21 +135,17 @@ function checkMerge(label, dA, dB, arr, { simDays = 0 } = {}) {
   const gone = wA.buildings.size + wB.buildings.size - w.buildings.size;
   ok(gone === rep.refunded.length + rep.removed.length, `${label}: buildings add up (${gone} gone, ${rep.refunded.length} refunded, ${rep.removed.length} dropped)`);
   // the ground suits every building
-  const wet = [...w.buildings.values()].filter(b => { for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) if (w.terrain.isWater(b.x + dx, b.z + dz)) return true; return false; });
+  const wet = [...w.buildings.values()].filter(b => groundUnder(w.terrain, plotOf(b)).water);
   ok(!wet.length, `${label}: no building stands in water${wet.length ? ` (${wet.map(b => b.type).join(', ')})` : ''}`);
-  const steep = [...w.buildings.values()].filter(b => {
-    let lo = Infinity, hi = -Infinity;
-    for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) { lo = Math.min(lo, w.terrain.tileMin(b.x + dx, b.z + dz)); hi = Math.max(hi, w.terrain.tileMax(b.x + dx, b.z + dz)); }
-    return hi - lo > 1.3;
-  });
+  const steep = [...w.buildings.values()].filter(b => { const g = groundUnder(w.terrain, plotOf(b)); return g.maxH - g.minH > 1.3; });
   ok(!steep.length, `${label}: no building on a cliff`);
   // one road network, reaching the edge of the map, that every building uses
   const pieces = roadPieces(w);
   ok(pieces === 1, `${label}: one road network (${pieces} piece${pieces === 1 ? '' : 's'})`);
-  const e = w.entry;
-  ok(w.roadAt(e.x, e.z) && (e.x === 0 || e.z === 0 || e.x === w.N - 1 || e.z === w.N - 1), `${label}: the road out of town starts at the map edge (${e.x},${e.z})`);
+  const e = w.entry, at = (v) => v <= 0.02 || v >= w.N - 0.02;
+  ok(w.roads.nodes.has(e.node) && (at(e.x) || at(e.z)), `${label}: the road out of town starts at the map edge (${e.x.toFixed(1)},${e.z.toFixed(1)})`);
   const cut = [...w.buildings.values()].filter(b => !BUILDINGS[b.type].park && !b.connected);
-  ok(!cut.length, `${label}: every building reaches the road network${cut.length ? ` (${cut.length} cut off: ${cut.slice(0, 3).map(b => b.type + '@' + b.x + ',' + b.z).join(' ')})` : ''}`);
+  ok(!cut.length, `${label}: every building reaches the road network${cut.length ? ` (${cut.length} cut off: ${cut.slice(0, 3).map(b => b.type + '@' + b.x.toFixed(1) + ',' + b.z.toFixed(1)).join(' ')})` : ''}`);
   // a smooth join: no step steeper than the steepest in either valley, at the
   // edges of the two maps or anywhere else (overlaps join inside the overlap)
   const natural = Math.max(maxStep(wA.terrain), maxStep(wB.terrain), 0.75);
@@ -177,8 +154,7 @@ function checkMerge(label, dA, dB, arr, { simDays = 0 } = {}) {
   ok(anywhere <= natural + 0.05, `${label}: no cliff anywhere on the merged map (steepest step ${anywhere.toFixed(2)})`);
   // streets stay on dry ground: no more bridges than both towns had, plus a
   // few where joined-up rivers cross a road
-  const bridges = (x) => { let n = 0; for (let i = 0; i < x.N * x.N; i++) if (x.roads[i] && x.terrain.isWater(i % x.N, (i / x.N) | 0)) n++; return n; };
-  ok(bridges(w) <= bridges(wA) + bridges(wB) + 6 * rep.rivers + rep.roadsLaid, `${label}: roads were not flooded (${bridges(w)} bridge tiles, towns had ${bridges(wA)} + ${bridges(wB)})`);
+  ok(bridged(w) <= bridged(wA) + bridged(wB) + 6 * rep.rivers + rep.roadsLaid + 1, `${label}: roads were not flooded (${bridged(w).toFixed(1)} of bridge, towns had ${bridged(wA).toFixed(1)} + ${bridged(wB).toFixed(1)})`);
   // people: everyone has a real home, nobody was lost without being counted
   const homeless = [...w.residents.values()].filter(r => r.home == null || !BUILDINGS[w.buildings.get(r.home)?.type]?.levels[w.buildings.get(r.home).level].housing);
   ok(!homeless.length, `${label}: every villager has a home`);
@@ -301,84 +277,64 @@ for (const [label, a, b, arr, days] of runs) {
 {
   const wA = deserialize(T.a);
   let k = 0;
-  for (let i = 0; i < wA.N * wA.N; i++) if (wA.roads[i]) { wA.buried[i] = k & 1; wA.dress[i] = 1 + (k % 2); k++; }
+  for (const e of wA.roads.edges.values()) { e.buried = k & 1; e.dress = 1 + (k % 2); k++; }
   const dA = JSON.parse(JSON.stringify(serialize(wA)));
   const arr = { ...besideOffset(48, 48, 'right'), rot: 0 };
   const r = checkMerge('dressed streets beside', dA, T.b, arr);
   if (r) {
     const w = r.w, L = layoutMerge(wA, deserialize(T.b), arr);
-    let kept = 0, wrong = 0, stray = 0;
-    for (let z = 0; z < wA.N; z++) for (let x = 0; x < wA.N; x++) {
-      const i = z * wA.N + x, X = L.ax + x, Z = L.az + z;
-      if (!wA.roads[i] || !w.inBounds(X, Z) || !w.roads[Z * w.N + X]) continue;
-      const j = Z * w.N + X;
-      if (w.buried[j] === wA.buried[i] && w.dress[j] === wA.dress[i]) kept++; else wrong++;
+    let kept = 0, wrong = 0;
+    for (const e of wA.roads.edges.values()) {
+      const p = pointAt(e.pts, e.cum, e.len / 2), h = w.roads.nearest(p[0] + L.ax, p[1] + L.az, 0.02);
+      if (!h) continue;
+      if ((h.e.buried || 0) === e.buried && h.e.dress === e.dress) kept++; else wrong++;
     }
-    for (let j = 0; j < w.N * w.N; j++) if (!w.roads[j] && (w.buried[j] || w.dress[j])) stray++;
-    ok(kept > 20 && !wrong && !stray, `buried lines and dressings go with their streets (${kept} kept, ${wrong} changed, ${stray} off-street)`);
+    ok(kept > 6 && !wrong, `buried lines and dressings go with their streets (${kept} kept, ${wrong} changed)`);
   }
 }
-// a boulevard and its look come through a merge, beside and turned (the
-// boulevard worked out again from the merged roads; the audit checks every
-// look still suits its tile)
+// a curving street and buildings standing at odd angles come through a
+// merge, beside and turned: the curve as it was (turned with its town), the
+// buildings turned with it
 {
-  const { applyDress } = await import('../src/world/roadDress.js');
-  const { DRESSINGS, lookPart } = await import('../src/config.js');
-  const wA = deserialize(T.a), N = wA.N, HEDGE = DRESSINGS.findIndex(d => d && d.key === 'bhedge');
-  const free = (x, z) => wA.inBounds(x, z) && !wA.roadAt(x, z) && !wA.buildingOn(x, z) && wA.checkRoad(x, z, 1).ok && !wA.terrain.isWater(x, z);
-  let pair = null;
-  for (let z = 2; z < N - 3 && !pair; z++) for (let x = 2; x < N - 8 && !pair; x++) {
-    const a = [0, 1, 2, 3, 4, 5].map(k => [x + k, z]), b = a.map(([ax, az]) => [ax, az + 1]);
-    // (touching the town's roads, or the merge would take it up as unjoined)
-    const touch = [[x - 1, z], [x - 1, z + 1], [x + 6, z], [x + 6, z + 1], ...a.map(([ax]) => [ax, z - 1]), ...a.map(([ax]) => [ax, z + 2])];
-    if ([...a, ...b].every(([ax, az]) => free(ax, az)) && touch.some(([tx, tz]) => wA.inBounds(tx, tz) && wA.connected[wA.idx(tx, tz)])) pair = [...a, ...b];
-  }
-  wA.money = 1e5;
-  const laid = pair && wA.placeRoads(pair, 1).placed === 12;
-  const look = laid && applyDress(wA, pair, HEDGE);
-  const looked = (w) => { let n = 0; for (let i = 0; i < w.N * w.N; i++) if (w.blvd[i] && lookPart(w.dress[i]) === HEDGE) n++; return n; };
-  const n0 = looked(wA);
-  ok(laid && look && look.ok && n0 >= 8, `a town with a boulevard with a hedge down it (${n0} lane tiles)`);
-  const dA = JSON.parse(JSON.stringify(serialize(wA)));
-  for (const [label, arr] of [['a boulevard beside', { ...besideOffset(48, 48, 'right'), rot: 0 }], ['a boulevard turned 90°', { ...besideOffset(48, 48, 'left'), rot: 1 }]]) {
-    const r = checkMerge(label, dA, T.b, arr);
-    if (r) ok(looked(r.w) >= n0, `${label}: the boulevard and its look come through (${looked(r.w)} of ${n0} lane tiles)`);
-  }
-}
-// a diagonal street and the house facing it come through a merge, beside
-// and turned (the links turned with their town; the audit checks they still
-// run between roads, both ways)
-{
-  const { CORNERS, diagLinked } = await import('../src/world/roadShape.js');
   const wA = deserialize(T.a), N = wA.N;
   wA.money = 1e5;
+  // a long curving street from the town's middle, and houses along it at all angles
   let laid = null;
-  for (let z = 2; z < N - 2 && !laid; z++) for (let x = 2; x < N - 2 && !laid; x++) {
-    if (!wA.connected[wA.idx(x, z)]) continue;
-    for (let k = 0; k < 4 && !laid; k++) {
-      const tiles = [0, 1, 2, 3, 4, 5].map(i => [x + CORNERS[k][0] * i, z + CORNERS[k][1] * i]);
-      if (!tiles.every(([tx, tz]) => wA.inBounds(tx, tz)) || !wA.checkStroke(tiles, 1).slice(1).every(c => c.ok && !c.noop)) continue;
-      if (wA.placeRoads(tiles, 1, { stroke: true }).placed !== 5) continue;
-      // a house on a plot beside it (its corner by the street)
-      for (const n of [2, 3]) for (const [hx, hz] of [[tiles[n + 1][0], tiles[n][1]], [tiles[n][0], tiles[n + 1][1]]]) {
-        if (laid) continue;
-        const h = wA.placeBuilding('house', hx, hz, { instant: true, free: true });
-        if (h.ok) laid = { tiles, house: h.building };
-      }
-    }
+  const hall = [...wA.buildings.values()].find(b => BUILDINGS[b.type].seat);
+  for (let k = 0; k < 16 && !laid; k++) {
+    const a0 = (k * Math.PI) / 8, h = wA.roads.nearest(hall.x + Math.cos(a0) * 4, hall.z + Math.sin(a0) * 4, 3);
+    if (!h) continue;
+    const s0 = [h.x, h.z], ctrl = [s0, [s0[0] + Math.cos(a0) * 3 + 1, s0[1] + Math.sin(a0) * 3 - 1], [s0[0] + Math.cos(a0) * 6 - 1, s0[1] + Math.sin(a0) * 6 + 1.5], [s0[0] + Math.cos(a0) * 9, s0[1] + Math.sin(a0) * 9]];
+    const r = wA.placeRoad(ctrl, 1);
+    if (r.placed) laid = r;
   }
-  const links = (w) => { let n = 0; for (let i = 0; i < w.N * w.N; i++) for (let k = 0; k < 4; k++) if (diagLinked(w, i % w.N, (i / w.N) | 0, k)) n++; return n / 2; };
-  const facing = (w) => [...w.buildings.values()].filter(b => b.diag).length;
-  ok(laid && laid.house && laid.house.diag && wA.diagN === 5, `a town with a diagonal street and a house facing it (${wA.diagN} links)`);
-  // and a few buildings turned and nudged by hand (their poses go with them)
-  const posed = [...wA.buildings.values()].filter(b => !b.con && !b.spare).slice(0, 6);
-  posed.forEach((b, i) => wA.setPose(b.id, [0.1 * (i - 2), 0.05, -0.05]));
-  const poses = (w) => [...w.buildings.values()].filter(b => b.pose).length;
+  const turned = [];
+  for (let i = 0; i < 12 && turned.length < 5; i++) {
+    const p = findPlot(wA, 'house', { x: N / 2 + (i % 4) * 3 - 4, z: N / 2 + Math.floor(i / 4) * 3 - 3 }, { r: N, opts: { ignoreMoney: true } });
+    if (!p) continue;
+    const a = p.a + ((i % 3) - 1) * 0.3, r = wA.placeBuilding('house', p.x, p.z, { a, instant: true, free: true });
+    if (r.ok) turned.push(r.building);
+  }
+  ok(laid && turned.length >= 3, `a town with a curving street and houses at odd angles (${turned.length})`);
   const dA = JSON.parse(JSON.stringify(serialize(wA)));
-  for (const [label, a, b, arr] of [['a diagonal beside', dA, T.b, { ...besideOffset(48, 48, 'right'), rot: 0 }], ['a diagonal turned 90°', T.b, dA, { ...besideOffset(48, 48, 'left'), rot: 1 }]]) {
-    const r = checkMerge(label, a, b, arr);
-    if (r) ok(links(r.w) >= 5 && r.w.diagN === links(r.w) && facing(r.w) >= 1, `${label}: the street comes through linked, and the house still faces it (${links(r.w)} links, ${facing(r.w)} facing)`);
-    if (r) ok(poses(r.w) >= posed.filter(b => b.pose).length - 1, `${label}: buildings turned on their plots stay turned (${poses(r.w)} of ${posed.filter(b => b.pose).length})`);
+  const curveLen = (w) => [...w.roads.edges.values()].reduce((a, e) => a + e.len, 0);
+  for (const [label, arr, k] of [['curves beside', { ...besideOffset(48, 48, 'right'), rot: 0 }, 0], ['curves turned 90°', { ...besideOffset(48, 48, 'left'), rot: 1 }, 1]]) {
+    const r = checkMerge(label, T.b, dA, arr);
+    if (!r) continue;
+    const off = r.rep && r.w ? [...r.w.buildings.keys()] : [];
+    void off;
+    // each turned house, found in the merged town by where it went and how it faces
+    const L = layoutMerge(deserialize(T.b), wA, arr);
+    let same = 0;
+    for (const b of turned) {
+      let [x, z] = [b.x, b.z];
+      for (let q = 0; q < k; q++) { const t = x; x = wA.N - z; z = t; }
+      x += L.bx; z += L.bz;
+      const o = [...r.w.buildings.values()].find(o2 => o2.type === 'house' && Math.hypot(o2.x - x, o2.z - z) < 0.01);
+      if (o && angDiff(o.a, wrapAngle(b.a - (k * Math.PI) / 2)) < 1e-3) same++;
+    }
+    ok(same === turned.length, `${label}: buildings at odd angles stay where they were, turned with their town (${same} of ${turned.length})`);
+    ok(curveLen(r.w) >= curveLen(deserialize(T.b)) + curveLen(wA) - 2, `${label}: the curving streets come through whole (${curveLen(r.w).toFixed(1)} of road)`);
   }
 }
 // something must actually have been settled across all those arrangements

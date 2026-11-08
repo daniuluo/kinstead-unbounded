@@ -529,7 +529,13 @@ export class World {
     if (f < 0.02) return 0;
     const [cx, cz] = toWorld(R, 0, f / 2);
     const out = rect(cx, cz, R.a, R.hw, R.hd + f / 2);
-    for (const o of this.plots.query(aabbOf(out))) if (o !== b && rectsOverlap(out, plotOf(o), 0.004)) return 0;
+    // (nor into a neighbour's plot, or the verge in front of it, as far as
+    // that one may come forward too)
+    for (const o of this.plots.query(aabbOf(out, FRONT))) {
+      if (o === b) continue;
+      const O = plotOf(o), [ox, oz] = toWorld(O, 0, FRONT / 2);
+      if (rectsOverlap(out, O, 0.004) || (o.access && rectsOverlap(out, rect(ox, oz, O.a, O.hw, O.hd + FRONT / 2), 0.004))) return 0;
+    }
     return Math.round(f * 1000) / 1000;
   }
 

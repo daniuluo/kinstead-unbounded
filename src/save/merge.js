@@ -1,5 +1,7 @@
 // Merging two saved towns into one. Town B is turned in quarter turns and set
-// beside, apart from or over town A on one square map. The ground is blended
+// beside, apart from or over town A on one square map (plots, roads and
+// track carried across by the same turn and shift, at whatever angles they
+// stand; see mergeParts.js). The ground is blended
 // across the join so the two valleys meet without cliffs, rivers are carried
 // over where they line up, the road networks are joined into one, and every
 // clash is settled automatically: overlapping plots, a second town hall,
@@ -11,9 +13,9 @@
 // sits at (x, z) relative to A's after `rot` clockwise quarter turns (seen
 // from above, x to the right and z down, as in the 2D view).
 
-import { World, capOf, TREE } from '../world/world.js';
-// (being made over for the town without a grid: see the gridless notes)
-const fw = (b) => b.w, fd = (b) => b.d;
+import { World, capOf, TREE, plotOf } from '../world/world.js';
+import { aabbOf, inRect, grow, rect } from '../world/geom.js';
+import { carry, recRect, settle, mergeNets, route, layRoute, pieces, piecePoints, groundProblem, freePlot } from './mergeParts.js';
 import { Terrain } from '../world/terrain.js';
 import { BUILDINGS, TRANSIT, LINE_COLORS } from '../defs.js';
 import { CONFIG } from '../config.js';
@@ -22,8 +24,6 @@ import { RNG, makeNoise2D, fbm, hash2, smoothstep, clamp, lerp } from '../util/r
 import { firstName } from '../util/names.js';
 import { Sim } from '../sim/sim.js';
 import { starterSave } from '../world/starters.js';
-import { turnDiag, linkStroke, tidyDiag, diagCapable } from '../world/diagonal.js';
-import { linksOf, CORNERS } from '../world/roadShape.js';
 
 // Largest merged map. Two big valleys side by side are trimmed of empty
 // countryside at their outer edges to fit (never of buildings).
@@ -54,10 +54,10 @@ export function besideOffset(NA, NB, side, along = null) {
 
 function contentBox(w, ox, oz, k) {
   let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
-  for (const b of w.buildings.values()) {
-    const [x, z, bw, bd] = rotRect(b.x, b.z, fw(b), fd(b), w.N, k);
+  for (const b of w.buildings.values()) for (const [px, pz] of plotOf(b).pts) {
+    const [x, z] = rotPoint(px, pz, w.N, k);
     x0 = Math.min(x0, x + ox); z0 = Math.min(z0, z + oz);
-    x1 = Math.max(x1, x + ox + bw); z1 = Math.max(z1, z + oz + bd);
+    x1 = Math.max(x1, x + ox); z1 = Math.max(z1, z + oz);
   }
   return x0 === Infinity ? null : { x0, z0, x1, z1 };
 }
@@ -220,35 +220,25 @@ export function mergeWorlds(wA, wB, arr = {}, opts = {}) {
   // ---- buildings, with overlaps settled: the more valuable plot stays
   const recs = [];
   for (const s of [A, B]) for (const b of s.w.buildings.values()) {
-    const [x, z, w, d] = s.rect(b.x, b.z, fw(b), fd(b));
     const con = b.con ? { ...b.con } : null;
     if (con && con.dest != null) con.dest = s.id(con.dest);
     if (con && con.from != null) con.from = s.id(con.from);
+    const g = s.w.terrain && plotOf(b);
+    let lo = Infinity, hi = -Infinity;
+    for (const [px, pz] of g.pts.concat([[b.x, b.z]])) { const h = s.w.terrain.heightAt(px, pz); lo = Math.min(lo, h); hi = Math.max(hi, h); }
+    const at = carry(s, b);
     recs.push({
-      s, idx: recs.length, id: s.id(b.id), type: b.type, level: b.level, x, z, w, d, rot: ((b.rot || 0) + 3 * s.k) % 4,
+      s, idx: recs.length, id: s.id(b.id), type: b.type, level: b.level, ...at, w: b.w, d: b.d,
       variant: b.variant, built: b.built, flavor: b.flavor || null, look: b.look || null, con,
-      spare: b.spare ? (s.k % 2 ? { w: b.spare.d, d: b.spare.w } : { ...b.spare }) : null,
-      // (a turn on its plot is from the way it faces, so it turns with its town)
-      pose: b.pose ? { ...b.pose } : null,
-      leases: (b.leases || []).map(l => ({ ...l, with: s.id(l.with), side: rotSide(l.side, s.k) })),
-      value: s.w.buildValue(b), slope0: footSlope(s.w.terrain, b.x, b.z, fw(b), fd(b)), x0: x, z0: z,
+      spare: b.spare ? { ...b.spare } : null,
+      // (garden strips are on its own sides, which turn with it)
+      leases: (b.leases || []).map(l => ({ ...l, with: s.id(l.with) })),
+      value: s.w.buildValue(b), slope0: hi - lo, x0: at.x, z0: at.z,
     });
   }
   const nameOf = (r) => BUILDINGS[r.type].levels[r.level].name;
-  const occ = new Int32Array(N * N).fill(-1);
-  const kept = [], losers = [];
   const order = recs.slice().sort((a, b) => b.value - a.value || a.s.tag - b.s.tag || a.id - b.id);
-  for (const r of order) {
-    if (r.x < 0 || r.z < 0 || r.x + r.w > N || r.z + r.d > N) { losers.push({ r, why: 'fell outside the merged map' }); continue; }
-    let clash = -1;
-    for (let dz = 0; dz < r.d && clash < 0; dz++) for (let dx = 0; dx < r.w; dx++) {
-      const o = occ[(r.z + dz) * N + r.x + dx];
-      if (o >= 0) { clash = o; break; }
-    }
-    if (clash >= 0) { losers.push({ r, why: `overlapped the ${nameOf(recs[clash])} from ${recs[clash].s.label}` }); continue; }
-    for (let dz = 0; dz < r.d; dz++) for (let dx = 0; dx < r.w; dx++) occ[(r.z + dz) * N + r.x + dx] = r.idx;
-    kept.push(r);
-  }
+  const [kept, losers, plotIx] = settle(order, N, nameOf);
   // one of each unique building (and one seat of government, whatever it
   // has grown into): a second town hall becomes a plaza, a second Capitol a
   // grand park and a second Parliament a city park, on the same ground
@@ -270,41 +260,33 @@ export function mergeWorlds(wA, wB, arr = {}, opts = {}) {
       r.value = pv;
     } else {
       kept.splice(kept.indexOf(r), 1);
-      for (let dz = 0; dz < r.d; dz++) for (let dx = 0; dx < r.w; dx++) occ[(r.z + dz) * N + r.x + dx] = -1;
+      plotIx.remove(r);
       losers.push({ r, why: `only one ${BUILDINGS[r.type].name} is allowed`, dup: true });
     }
   }
   for (const l of losers) if (BUILDINGS[l.r.type].unique && uniq[keyOf(l.r)]) l.dup = true;
 
-  // ---- roads and track (the other town's buildings win over them)
-  const roads = new Uint8Array(N * N), rails = new Uint8Array(N * N);
-  // buried power lines, street dressings and diagonal links go with their
-  // street (the links turned with their town)
-  const buried = new Uint8Array(N * N), dress = new Uint8Array(N * N), diag = new Uint8Array(N * N);
-  const roadSeeds = [], dryWay = new Uint8Array(N * N);
-  for (const s of [A, B]) {
-    const sN = s.N;
-    for (let z = 0; z < sN; z++) for (let x = 0; x < sN; x++) {
-      const v = s.w.roads[z * sN + x], rv = s.w.rails[z * sN + x];
-      if (!v && !rv) continue;
-      const [X, Z] = s.tile(x, z);
-      if (X < 0 || Z < 0 || X >= N || Z >= N) continue;
-      const i = Z * N + X, o = occ[i];
-      if (o >= 0 && recs[o].s !== s) { if (v) rep.roadsDropped++; if (rv) rep.railsDropped++; continue; }
-      if (v > roads[i]) roads[i] = v;
-      if (rv) rails[i] = 1;
-      const k = z * sN + x;
-      if (v && s.w.buried && s.w.buried[k]) buried[i] = 1;
-      if (v && s.w.dress && s.w.dress[k] && !dress[i]) dress[i] = s.w.dress[k];
-      if (v && s.w.diag && s.w.diag[k]) diag[i] = turnDiag(s.w.diag[k], s.k);
-      // remember which streets and tracks ran on dry ground (not bridges)
-      if (!s.w.terrain.isWater(x, z)) dryWay[i] = 1;
-      roadSeeds.push(i, s.tag);
+  // ---- where the streets and track ran, for the ground's blend: every
+  // unit square a road passed over (and whether over dry ground)
+  const roadSeeds = [], dryWay = new Uint8Array(N * N), seenWay = new Set();
+  for (const s of [A, B]) for (const net of [s.w.roads, s.w.rails]) for (const e of net.edges.values()) {
+    for (let d = 0; d <= e.len + 1e-9; d += 0.5) {
+      const p = pointAtEdge(e, d), [X, Z] = s.point(p[0], p[1]), x = Math.floor(X), z = Math.floor(Z);
+      if (x < 0 || z < 0 || x >= N || z >= N) continue;
+      const i = z * N + x;
+      if (!s.w.waterAt(p[0], p[1])) dryWay[i] = 1;
+      if (!seenWay.has(i)) { seenWay.add(i); roadSeeds.push(i, s.tag); }
     }
   }
 
   // ---- who owns the ground: each town keeps the land around its own
   // buildings and streets; where they overlap the join runs half-way between
+  // (the corners of the terrain's mesh round each plot)
+  const cornersOf = (r) => {
+    const R = recRect(r), [x0, z0, x1, z1] = aabbOf(R, 0.5), out = [];
+    for (let cz = Math.max(0, Math.floor(z0)); cz <= Math.min(N, Math.ceil(z1)); cz++) for (let cx = Math.max(0, Math.floor(x0)); cx <= Math.min(N, Math.ceil(x1)); cx++) if (inRect(R, cx, cz, 0.5)) out.push(cz * S + cx);
+    return out;
+  };
   const own = new Uint8Array(S * S), lab = new Uint8Array(S * S);
   {
     const dist = new Int32Array(S * S).fill(1 << 30);
@@ -312,7 +294,7 @@ export function mergeWorlds(wA, wB, arr = {}, opts = {}) {
     const seed = (c, d, t) => {
       if (d < dist[c] || (d === dist[c] && t < lab[c])) { dist[c] = d; lab[c] = t; (buckets[d] ||= []).push(c); }
     };
-    for (const r of kept) for (let dz = 0; dz <= r.d; dz++) for (let dx = 0; dx <= r.w; dx++) seed((r.z + dz) * S + r.x + dx, 0, r.s.tag);
+    for (const r of kept) for (const c of cornersOf(r)) seed(c, 0, r.s.tag);
     for (let k = 0; k < roadSeeds.length; k += 2) {
       const i = roadSeeds[k], x = i % N, z = (i / N) | 0;
       for (const c of [z * S + x, z * S + x + 1, (z + 1) * S + x, (z + 1) * S + x + 1]) seed(c, 2, roadSeeds[k + 1]);
@@ -345,8 +327,7 @@ export function mergeWorlds(wA, wB, arr = {}, opts = {}) {
   const grp = new Int32Array(S * S).fill(-1);
   const parent = recs.map((_, i) => i);
   const find = (i) => { while (parent[i] !== i) i = parent[i] = parent[parent[i]]; return i; };
-  for (const r of kept) for (let dz = 0; dz <= r.d; dz++) for (let dx = 0; dx <= r.w; dx++) {
-    const c = (r.z + dz) * S + r.x + dx;
+  for (const r of kept) for (const c of cornersOf(r)) {
     if (own[c] !== r.s.tag) continue;
     if (grp[c] < 0) grp[c] = r.idx; else parent[find(grp[c])] = find(r.idx);
   }
@@ -359,24 +340,14 @@ export function mergeWorlds(wA, wB, arr = {}, opts = {}) {
   const H = blendTerrain({ N, own, grp, hOf, seam: arr.seam, rep, SRC, ways: roadSeeds, dryWay });
   const terrain = new Terrain(N, H);
 
-  // ---- the merged world
+  // ---- the merged world: roads and track, A's as they were and B's laid
+  // over them (the other town's buildings win over them, and deep water)
   const w = new World(N, wA.seed, terrain);
   w.townName = (arr.name || '').trim() || wA.townName;
-  w.roads.set(roads);
-  w.rails.set(rails);
-  w.buried.set(buried);
-  w.dress.set(dress);
-  w.diag.set(diag);
-  tidyDiag(w);
-  for (let i = 0; i < N * N; i++) {
-    if (!roads[i] && !rails[i]) continue;
-    const x = i % N, z = (i / N) | 0;
-    if (terrain.isWater(x, z) && terrain.tileAvg(x, z) < -0.9) {
-      if (roads[i]) rep.roadsDropped++;
-      if (rails[i]) rep.railsDropped++;
-      w.roads[i] = 0; w.rails[i] = 0;
-    }
-  }
+  const deep = (x, z) => terrain.heightAt(x, z) < -0.9;
+  const R0 = mergeNets('road', A, B, plotIx, N, deep), L0 = mergeNets('rail', A, B, plotIx, N, deep);
+  w.roads = R0.net; w.rails = L0.net;
+  rep.roadsDropped += R0.dropped; rep.railsDropped += L0.dropped;
   // buildings the new ground no longer suits join the ones to be moved
   for (const r of kept.slice()) {
     const why = groundProblem(w, r);
@@ -385,8 +356,10 @@ export function mergeWorlds(wA, wB, arr = {}, opts = {}) {
     losers.push({ r, why });
   }
   for (const r of kept) restore(w, r);
+  w.updateRailLinks();
   for (const r of kept.slice()) {
-    if (BUILDINGS[r.type].needsRail && !w.findRail(r.x, r.z, r.w, r.d)) { unplace(w, r); kept.splice(kept.indexOf(r), 1); losers.push({ r, why: 'lost its railway track' }); }
+    const b = w.buildings.get(r.id);
+    if (BUILDINGS[r.type].needsRail && b && !b.rail) { unplace(w, r); kept.splice(kept.indexOf(r), 1); losers.push({ r, why: 'lost its railway track' }); }
   }
 
   // ---- trees: each town keeps the trees on its own ground; new woods grow
@@ -396,30 +369,30 @@ export function mergeWorlds(wA, wB, arr = {}, opts = {}) {
     n[own[z * S + x]]++; n[own[z * S + x + 1]]++; n[own[(z + 1) * S + x]]++; n[own[(z + 1) * S + x + 1]]++;
     return n[1] >= n[2] && n[1] >= n[0] ? 1 : n[2] >= n[0] ? 2 : FILLER;
   };
-  const clearTile = (x, z) => w.inBounds(x, z) && !w.roads[z * N + x] && !w.rails[z * N + x] && w.buildingAt[z * N + x] < 0 && !terrain.isWater(x, z);
+  const clearAt = (x, z) => w.inBounds(x, z) && !w.roadAt(x, z, 0.1) && !w.railAt(x, z, 0.1) && !w.buildingAt(x, z) && !w.waterAt(x, z);
   for (const s of [A, B]) for (const t of s.w.trees) {
     const [X, Z] = s.point(t.x, t.z), tx = Math.floor(X), tz = Math.floor(Z);
-    if (!w.inBounds(tx, tz) || tileOwn(tx, tz) !== s.tag || !clearTile(tx, tz)) continue;
+    if (tx < 0 || tz < 0 || tx >= N || tz >= N || tileOwn(tx, tz) !== s.tag || !clearAt(X, Z)) continue;
     w.addTree(X, Z, t.k, t.s, t.r);
   }
-  growCountryside(w, tileOwn, clearTile, (wA.seed ^ wB.seed) >>> 0);
-  for (const b of w.buildings.values()) w._clearTreesNear(b.x, b.z, fw(b), fd(b), 0.22);
+  growCountryside(w, tileOwn, clearAt, (wA.seed ^ wB.seed) >>> 0);
+  for (const b of w.buildings.values()) w._clearTreesIn(grow(plotOf(b), 0.22));
 
   // ---- one road network, with a road out to the edge of the map
-  clearCorners(w);
-  pickEntry(w, [A, B].map(s => s.tile(s.w.entry.x, s.w.entry.z)), rep);
+  pickEntry(w, [R0.entry[1], R0.entry[2]], rep);
   w.updateRoadNetwork();
   joinRoads(w, rep);
   // homes and shops left with no street at all get a short lane, if one fits
   for (const r of kept.slice()) {
-    if (BUILDINGS[r.type].park || w.findAccess(r.x, r.z, r.w, r.d).length) continue;
-    if (laneTo(w, r, rep)) continue;
+    const b = w.buildings.get(r.id);
+    if (!b || BUILDINGS[r.type].park || (b.access && b.connected)) continue;
+    if (laneTo(w, b, rep)) continue;
     unplace(w, r); kept.splice(kept.indexOf(r), 1);
     losers.push({ r, why: 'was cut off from every road' });
   }
   w.updateRoadNetwork();
 
-  // ---- the plots that lost out: nudged to the nearest free plot, or refunded
+  // ---- the plots that lost out: moved to the nearest free plot, or refunded
   losers.sort((a, b) => b.r.value - a.r.value);
   for (const l of losers) {
     const { r, why } = l, nm = nameOf(r), from = r.s.label;
@@ -431,12 +404,11 @@ export function mergeWorlds(wA, wB, arr = {}, opts = {}) {
       rep.refundTotal += back;
       continue;
     }
-    const spot = dup ? null : findPlot(w, r);
+    const spot = dup ? null : freePlot(w, r);
     if (spot) {
       Object.assign(r, spot, { leases: [], moved: true });
       restore(w, r);
-      for (let dz = 0; dz < r.d; dz++) for (let dx = 0; dx < r.w; dx++) w._clearTrees(r.x + dx, r.z + dz);
-      w._clearTreesNear(r.x, r.z, r.w, r.d, 0.22);
+      w._clearTreesIn(grow(recRect(r), 0.22));
       kept.push(r);
       rep.moved.push({ name: nm, from, why, dist: Math.round(Math.hypot(r.x - r.x0, r.z - r.z0)), at: [r.x, r.z] });
     } else {
@@ -460,6 +432,7 @@ export function mergeWorlds(wA, wB, arr = {}, opts = {}) {
     b.leases = ok.map(l => ({ ...l }));
     const e = w._ext(b);
     for (const l of b.leases) e[l.side] = l.buyer ? l.amt : -l.amt;
+    w._file(b);
   }
   // a building put up for a move whose old plot is gone uses fresh materials
   for (const b of w.buildings.values()) {
@@ -474,21 +447,15 @@ export function mergeWorlds(wA, wB, arr = {}, opts = {}) {
   w.updateRailLinks();
   // farmland goes with its farm, on ground nothing else took; fields cut off
   // from their farm (one that moved, say) are dropped
-  for (const s of [A, B]) {
-    if (!s.w.fields) continue;
-    for (let z = 0; z < s.N; z++) for (let x = 0; x < s.N; x++) {
-      const f = s.w.fields[z * s.N + x];
-      if (f < 0) continue;
-      const [X, Z] = s.tile(x, z);
-      if (!w.inBounds(X, Z)) continue;
-      const i = w.idx(X, Z), id = s.id(f), farm = w.buildings.get(id);
-      if (!farm || !BUILDINGS[farm.type].fields || w.roads[i] || w.rails[i] || w.buildingAt[i] >= 0 || w.fields[i] >= 0 || w.terrain.isWater(X, Z)) continue;
-      w.fields[i] = id;
-    }
+  for (const s of [A, B]) for (const f of s.w.parcels.values()) {
+    const at = carry(s, f), id = s.id(f.farm), farm = w.buildings.get(id), fid = s.id(f.id);
+    if (!farm || !BUILDINGS[farm.type].fields || w.parcels.has(fid)) continue;
+    const R = rect(at.x, at.z, at.a, 0.5, 0.5);
+    if (R.pts.some(([x, z]) => x < 0 || z < 0 || x > N || z > N) || w._plotBlock(R) || w.fieldIx.query(aabbOf(R)).length) continue;
+    if ([...R.pts, [R.cx, R.cz]].some(([x, z]) => w.waterAt(x, z))) continue;
+    w._addField(id, at.x, at.z, at.a, fid);
   }
   w._pruneFields();
-  // streets that were taken up keep no buried line or dressing
-  for (let i = 0; i < N * N; i++) if (!w.roads[i]) { w.buried[i] = 0; w.dress[i] = 0; }
 
   const data = serialize(w);
   if (opts.preview) return { data, world: w, report: rep, layout: L };
@@ -496,10 +463,12 @@ export function mergeWorlds(wA, wB, arr = {}, opts = {}) {
 }
 
 // --------------------------------------------------------------- terrain
-function footSlope(t, x, z, w, d) {
-  let lo = Infinity, hi = -Infinity;
-  for (let dz = 0; dz < d; dz++) for (let dx = 0; dx < w; dx++) { lo = Math.min(lo, t.tileMin(x + dx, z + dz)); hi = Math.max(hi, t.tileMax(x + dx, z + dz)); }
-  return hi - lo;
+// (a point along a road edge)
+function pointAtEdge(e, d) {
+  let i = 0;
+  while (i < e.cum.length - 2 && e.cum[i + 1] < d) i++;
+  const seg = e.cum[i + 1] - e.cum[i] || 1, t = Math.max(0, Math.min(1, (d - e.cum[i]) / seg));
+  return [e.pts[i][0] + (e.pts[i + 1][0] - e.pts[i][0]) * t, e.pts[i][1] + (e.pts[i + 1][1] - e.pts[i][1]) * t];
 }
 
 // Gradient-domain blend: inside a band around every join the new heights
@@ -774,232 +743,140 @@ function blendTerrain({ N, own, grp, hOf, seam, rep, SRC, ways, dryWay }) {
 
 // ------------------------------------------------------------ buildings
 function restore(w, r) {
-  w.restoreBuilding({ id: r.id, type: r.type, level: r.level, x: r.x, z: r.z, variant: r.variant, rot: r.rot, built: r.built, w: r.w, d: r.d, flavor: r.flavor, con: r.con, look: r.look, spare: r.spare, pose: r.pose });
+  w.restoreBuilding({ id: r.id, type: r.type, level: r.level, x: r.x, z: r.z, a: r.a, variant: r.variant, built: r.built, w: r.w, d: r.d, flavor: r.flavor, con: r.con, look: r.look, spare: r.spare });
 }
 
 function unplace(w, r) {
-  for (let dz = 0; dz < r.d; dz++) for (let dx = 0; dx < r.w; dx++) w.buildingAt[w.idx(r.x + dx, r.z + dz)] = -1;
+  const b = w.buildings.get(r.id);
+  if (b) w.plots.remove(b);
   w.buildings.delete(r.id);
 }
 
-// Why a plot no longer works on the blended ground (null if it is fine).
-function groundProblem(w, r) {
-  const t = w.terrain;
-  let lo = Infinity, hi = -Infinity;
-  for (let dz = 0; dz < r.d; dz++) for (let dx = 0; dx < r.w; dx++) {
-    const x = r.x + dx, z = r.z + dz, i = w.idx(x, z);
-    if (t.isWater(x, z)) return 'ended up in water';
-    if (w.roads[i] || w.rails[i]) return 'had a road or track run through it';
-    lo = Math.min(lo, t.tileMin(x, z)); hi = Math.max(hi, t.tileMax(x, z));
-  }
-  const lim = Math.max(r.w, r.d) === 1 ? 0.9 : 1.1;
-  if (hi - lo > Math.max(lim, r.slope0 + 0.05)) return 'ended up on ground too steep to stand on';
-  if (BUILDINGS[r.type].needsWater) {
-    let wet = false;
-    for (let k = -1; k <= r.w && !wet; k++) wet = [[r.x + k, r.z - 1], [r.x + k, r.z + r.d]].some(([x, z]) => w.inBounds(x, z) && t.isWater(x, z));
-    for (let k = 0; k < r.d && !wet; k++) wet = [[r.x - 1, r.z + k], [r.x + r.w, r.z + k]].some(([x, z]) => w.inBounds(x, z) && t.isWater(x, z));
-    if (!wet) return 'is no longer beside water';
-  }
-  return null;
-}
-
-// Nearest free plot where the building is allowed and reaches a road
-// joined to the town (parks need no road).
-function findPlot(w, r) {
-  const def = BUILDINGS[r.type];
-  const shapes = r.w === r.d ? [[r.w, r.d]] : [[r.w, r.d], [r.d, r.w]];
-  for (let rad = 1; rad <= 18; rad++) {
-    let best = null, bd = Infinity;
-    for (let dz = -rad; dz <= rad; dz++) for (let dx = -rad; dx <= rad; dx++) {
-      if (Math.max(Math.abs(dx), Math.abs(dz)) !== rad) continue;
-      const x = r.x0 + dx, z = r.z0 + dz, d = Math.hypot(dx, dz);
-      if (d >= bd) continue;
-      for (const [W, D] of shapes) {
-        const c = w.checkBuild(r.type, x, z, { w: W, d: D, ignoreUnlock: true, ignoreUnique: true, ignoreMoney: true });
-        if (!c.ok || (!def.park && !c.access.some(a => a.conn))) continue;
-        best = { x, z, w: W, d: D, rot: c.access.length ? c.access[0].rot : r.rot }; bd = d;
-        break;
-      }
-    }
-    if (best) return best;
-  }
-  return null;
-}
-
 // --------------------------------------------------------------- roads
+const EDGE = 0.02;
+const atEdge = (N, x, z) => x <= EDGE || z <= EDGE || x >= N - EDGE || z >= N - EDGE;
+// The way out of the valley: either town's, if it still ends at the edge of
+// the merged map; else any road that reaches the edge, nearest the town
+// hall; else a new road out to the nearest edge.
 function pickEntry(w, cands, rep) {
   const N = w.N;
-  const edge = (x, z) => x === 0 || z === 0 || x === N - 1 || z === N - 1;
-  for (const [x, z] of cands) if (w.inBounds(x, z) && w.roads[w.idx(x, z)] && edge(x, z)) { w.entry = { x, z }; return; }
-  // any street that already reaches the edge, nearest the town hall
+  for (const id of cands) {
+    const n = id != null && w.roads.nodes.get(id);
+    if (n && atEdge(N, n.x, n.z)) { w.entry = { node: n.id, x: n.x, z: n.z }; return; }
+  }
   let hall = null;
   for (const b of w.buildings.values()) if (BUILDINGS[b.type].seat) hall = b;
   const fx = hall ? hall.x : N / 2, fz = hall ? hall.z : N / 2;
   let best = null, bd = Infinity;
-  for (let k = 0; k < N; k++) for (const [x, z] of [[k, 0], [k, N - 1], [0, k], [N - 1, k]]) {
-    if (!w.roads[w.idx(x, z)]) continue;
-    const d = Math.hypot(x - fx, z - fz);
-    if (d < bd) { bd = d; best = { x, z }; }
+  for (const n of w.roads.nodes.values()) {
+    if (!atEdge(N, n.x, n.z)) continue;
+    const d = Math.hypot(n.x - fx, n.z - fz);
+    if (d < bd) { bd = d; best = n; }
   }
-  if (best) { w.entry = best; return; }
-  // otherwise lay a new road out to the nearest edge
-  const starts = [];
-  for (let i = 0; i < N * N; i++) if (w.roads[i]) starts.push(i);
-  const path = starts.length ? cheapestPath(w, starts, (i) => edge(i % N, (i / N) | 0)) : null;
+  if (best) { w.entry = { node: best.id, x: best.x, z: best.z }; return; }
+  // a new road from the network (or the town hall) out to the nearest edge
+  const from = [];
+  for (const e of w.roads.edges.values()) for (let s = 0; s <= e.len; s += 0.5) from.push(pointAtEdge(e, s));
+  if (!from.length) from.push([fx, fz]);
+  const path = route(w, from, (x, z) => x <= 0.5 || z <= 0.5 || x >= N - 0.5 || z >= N - 0.5);
   if (path) {
-    const fresh = new Set();
-    for (const i of path) if (!w.roads[i]) { w.roads[i] = 1; fresh.add(i); w._clearTrees(i % N, (i / N) | 0); rep.entryLaid++; }
-    laid(w, path, fresh);
-    const e = path[path.length - 1];
-    w.entry = { x: e % N, z: (e / N) | 0 };
-  } else {
-    w.entry = { x: Math.floor(fx), z: Math.floor(fz) };
+    // (out to the very edge)
+    const [ex, ez] = path[path.length - 1];
+    path.push([ex <= 0.5 ? 0 : ex >= N - 0.5 ? N : ex, ez <= 0.5 ? 0 : ez >= N - 0.5 ? N : ez]);
+    rep.entryLaid += Math.round(layRoute(w, path));
+    const n = w.roads.nodeNear(path[path.length - 1][0], path[path.length - 1][1], 0.05);
+    if (n) { w.entry = { node: n.id, x: n.x, z: n.z }; return; }
   }
-}
-
-// Cheapest buildable road from any start tile to a tile where goal(i) holds
-// (bridges cost more, buildings block, steep ground and deep water too).
-function cheapestPath(w, starts, goal, maxCost = Infinity, lenient = false) {
-  const N = w.N, t = w.terrain;
-  const cost = new Float32Array(N * N).fill(Infinity), prev = new Int32Array(N * N).fill(-1);
-  const heap = new MinHeap();
-  const isStart = new Uint8Array(N * N);
-  for (const s of starts) { cost[s] = 0; isStart[s] = 1; heap.push(0, s); }
-  const step = (x, z) => {
-    const i = z * N + x;
-    if (w.buildingAt[i] >= 0) return Infinity;
-    if (w.roads[i]) return 0.6;
-    const water = t.isWater(x, z);
-    if (water && t.tileAvg(x, z) < (lenient ? -1.3 : -0.9)) return Infinity;
-    if (!water && t.slope(x, z) > (lenient ? 1.6 : 0.85)) return Infinity;
-    return 1 + t.slope(x, z) * 3 + (water ? 5 : 0) + (w.rails[i] ? 1 : 0) + w.treeCount[i] * 0.2;
-  };
-  while (heap.size) {
-    const i = heap.pop();
-    const ci = cost[i];
-    if (ci > maxCost) return null;
-    if (!isStart[i] && goal(i)) {
-      const path = [];
-      for (let k = i; k !== -1; k = prev[k]) path.push(k);
-      return path.reverse();
-    }
-    const x = i % N, z = (i / N) | 0;
-    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-      const nx = x + dx, nz = z + dz;
-      if (nx < 0 || nz < 0 || nx >= N || nz >= N) continue;
-      const ni = nz * N + nx, c = ci + step(nx, nz);
-      if (c < cost[ni]) { cost[ni] = c; prev[ni] = i; heap.push(c, ni); }
-    }
-  }
-  return null;
-}
-
-// A diagonal of one town may now pass the corner of a building of the other
-// that can't turn to face it: that link goes (both tiles stay road).
-function clearCorners(w) {
-  const N = w.N, D = w.diag;
-  let n = 0;
-  for (let i = 0; i < N * N; i++) {
-    if (!(D[i] & 15)) continue;
-    const x = i % N, z = (i / N) | 0;
-    for (let k = 0; k < 4; k++) {
-      const [dx, dz] = CORNERS[k];
-      if (!(D[i] & (1 << k)) || !w.inBounds(x + dx, z + dz)) continue;
-      if (![[x + dx, z], [x, z + dz]].some(([ox, oz]) => { const b = w.buildingOn(ox, oz); return b && !diagCapable(b); })) continue;
-      D[i] &= ~(1 << k);
-      D[(z + dz) * N + x + dx] &= ~(1 << ((k + 2) & 3));
-      n++;
-    }
-  }
-  if (n) tidyDiag(w);
-}
-
-// A road just laid along a path of tiles (each next to the last) joins the
-// streets it runs into, even a diagonal's tile cut off from the road beside.
-function laid(w, path, fresh) {
-  const N = w.N;
-  linkStroke(w, path.map(i => [i % N, (i / N) | 0]), fresh);
-}
-
-function roadPieces(w) {
-  const N = w.N, comp = new Int32Array(N * N).fill(-1), pieces = [];
-  for (let s = 0; s < N * N; s++) {
-    if (!w.roads[s] || comp[s] >= 0) continue;
-    const id = pieces.length, tiles = [s];
-    comp[s] = id;
-    for (let q = 0; q < tiles.length; q++) {
-      const i = tiles[q], x = i % N, z = (i / N) | 0;
-      // along the grid (not where a diagonal passes by, cut off) and diagonally
-      for (const [nx, nz] of linksOf(w, x, z)) {
-        const ni = nz * N + nx;
-        if (comp[ni] < 0) { comp[ni] = id; tiles.push(ni); }
-      }
-    }
-    pieces.push(tiles);
-  }
-  return { comp, pieces };
+  // (nothing reaches the edge: the nearest end of a road will have to do)
+  const n = [...w.roads.nodes.values()].sort((a, b) => Math.min(a.x, a.z, N - a.x, N - a.z) - Math.min(b.x, b.z, N - b.x, N - b.z))[0];
+  w.entry = n ? { node: n.id, x: n.x, z: n.z } : { node: -1, x: fx, z: fz };
 }
 
 // Join every separate piece of road to the network that reaches the edge of
 // the map, laying the cheapest new road between them. Stray scraps with no
 // buildings on them are cleared instead.
 function joinRoads(w, rep) {
-  const N = w.N;
-  let { comp, pieces } = roadPieces(w);
-  const main = comp[w.idx(w.entry.x, w.entry.z)];
-  if (main < 0) return;
+  const net = w.roads;
+  const comp = () => { const m = new Map(); pieces(net).forEach((p, i) => { for (const n of p) m.set(n, i); }); return m; };
+  let C = comp();
+  if (!C.has(w.entry.node)) return;
+  // pieces nobody reaches the town from (no building's way to the street),
+  // and short: cleared
   const served = new Set();
-  for (const b of w.buildings.values()) for (const a of w.findAccess(b.x, b.z, fw(b), fd(b))) served.add(comp[w.idx(a.x, a.z)]);
-  for (let p = 0; p < pieces.length; p++) {
-    if (p === main || served.has(p) || pieces[p].length >= 3) continue;
-    for (const i of pieces[p]) { w.roads[i] = 0; comp[i] = -1; }
-    rep.strays += pieces[p].length;
-    pieces[p] = null;
-  }
-  const inMain = new Uint8Array(N * N);
-  let net = [];
-  for (const i of pieces[main]) { inMain[i] = 1; net.push(i); }
-  const left = new Set(pieces.map((t, p) => (t && p !== main ? p : -1)).filter(p => p >= 0));
+  for (const b of w.buildings.values()) if (b.access) { const e = net.edges.get(b.access.e); if (e) served.add(C.get(e.a)); }
+  const all = pieces(net);
+  all.forEach((p, i) => {
+    if (i === C.get(w.entry.node) || served.has(i)) return;
+    const es = [...net.edges.values()].filter(e => p.includes(e.a));
+    const len = es.reduce((s, e) => s + e.len, 0);
+    if (len >= 3) return;
+    for (const e of es) net.removeEdge(e.id);
+    for (const n of p) if (net.nodes.has(n) && !net.nodes.get(n).edges.length) net._dropNode(net.nodes.get(n));
+    rep.strays += Math.round(len);
+  });
   let lenient = false;
-  while (left.size) {
-    const path = cheapestPath(w, net, (i) => w.roads[i] && !inMain[i] && left.has(comp[i]), Infinity, lenient);
-    // nothing buildable reaches it: try again allowing steeper banks and deeper bridges
+  for (let guard = 0; guard < 40; guard++) {
+    C = comp();
+    const main = C.get(w.entry.node), ps = pieces(net);
+    const left = ps.map((p, i) => i).filter(i => i !== main);
+    if (!left.length) break;
+    const mainPts = piecePoints(net, ps[main]);
+    const others = new Set(left.flatMap(i => ps[i]));
+    // (to the nearest point of any other piece)
+    const onOther = (x, z) => { const h = net.nearest(x, z, 0.3); return !!h && others.has(h.e.a); };
+    const path = route(w, mainPts, onOther, { lenient });
     if (!path && !lenient) { lenient = true; continue; }
     if (!path) break;
-    const hit = comp[path[path.length - 1]];
-    const lvl = Math.max(1, Math.min(w.roads[path[0]] || 1, w.roads[path[path.length - 1]] || 1));
-    const fresh = new Set();
-    for (const i of path) {
-      if (!w.roads[i]) { w.roads[i] = lvl; fresh.add(i); w._clearTrees(i % N, (i / N) | 0); rep.roadsLaid++; }
-      if (!inMain[i]) { inMain[i] = 1; net.push(i); }
+    // (the piece it is making for, before anything is laid)
+    const h0 = net.nearest(path[path.length - 1][0], path[path.length - 1][1], 0.3);
+    const pi = h0 && C.has(h0.e.a) ? C.get(h0.e.a) : left[0];
+    const before = pieces(net).length, had = new Set(net.edges.keys());
+    const laid = layRoute(w, path);
+    if (pieces(net).length >= before) {
+      // (it wouldn't join up: what was laid goes again, and so does the
+      // piece it was making for)
+      for (const id of [...net.edges.keys()]) if (!had.has(id)) { const e = net.edges.get(id); net.removeEdge(id); net.tidy([e.a, e.b], new Set([w.entry.node])); }
+      for (const n of [...net.nodes.values()]) if (!n.edges.length && n.id !== w.entry.node) net._dropNode(n);
+      const target = new Set(ps[pi] || []);
+      for (const e of [...net.edges.values()]) if (target.has(e.a)) { net.removeEdge(e.id); rep.unjoinedTiles += Math.round(e.len); }
+      for (const n of target) if (net.nodes.has(n) && !net.nodes.get(n).edges.length) net._dropNode(net.nodes.get(n));
+      rep.unjoined++;
+      continue;
     }
-    laid(w, path, fresh);
-    for (const i of pieces[hit]) if (!inMain[i]) { inMain[i] = 1; net.push(i); }
-    left.delete(hit);
+    rep.roadsLaid += Math.round(laid);
     rep.joined++;
   }
-  // pieces boxed in by buildings go; anything they served gets a lane or moves
-  for (const p of left) for (const i of pieces[p]) { w.roads[i] = 0; rep.unjoinedTiles++; }
-  rep.unjoined = left.size;
+  // pieces nothing could reach go (what they served gets a lane, or moves)
+  C = comp();
+  const main = C.get(w.entry.node), ps = pieces(net);
+  ps.forEach((p, i) => {
+    if (i === main) return;
+    const set = new Set(p);
+    for (const e of [...net.edges.values()]) if (set.has(e.a)) { net.removeEdge(e.id); rep.unjoinedTiles += Math.round(e.len); }
+    for (const n of p) if (net.nodes.has(n)) net._dropNode(net.nodes.get(n));
+    rep.unjoined++;
+  });
   w.updateRoadNetwork();
 }
 
 // A short lane from the town's streets to a building that lost its road.
-function laneTo(w, r, rep) {
-  const N = w.N, net = [];
-  for (let i = 0; i < N * N; i++) if (w.roads[i] && w.connected[i]) net.push(i);
-  if (!net.length) return false;
-  const ring = new Set(), side = [];
-  for (let k = 0; k < r.w; k++) side.push([r.x + k, r.z - 1], [r.x + k, r.z + r.d]);
-  for (let k = 0; k < r.d; k++) side.push([r.x - 1, r.z + k], [r.x + r.w, r.z + k]);
-  for (const [x, z] of side) if (w.inBounds(x, z)) ring.add(w.idx(x, z));
-  const path = cheapestPath(w, net, (i) => ring.has(i), 18);
+function laneTo(w, b, rep) {
+  const from = [];
+  for (const e of w.roads.edges.values()) if (w.edgeConnected(e.id)) for (let s = 0; s <= e.len; s += 0.5) from.push(pointAtEdge(e, s));
+  if (!from.length) return false;
+  const R = plotOf(b), [fx, fz] = [R.cx + R.ux * (R.hd + 0.5), R.cz + R.uz * (R.hd + 0.5)];
+  const path = route(w, from, (x, z) => Math.hypot(x - fx, z - fz) < 0.4, { maxCost: 18 });
   if (!path) return false;
-  const fresh = new Set();
-  for (const i of path) if (!w.roads[i]) { w.roads[i] = 1; fresh.add(i); w._clearTrees(i % N, (i / N) | 0); rep.roadsLaid++; }
-  laid(w, path, fresh);
+  path.push([fx, fz]);
+  const had = new Set(w.roads.edges.keys());
+  const laid = layRoute(w, path);
   w.updateRoadNetwork();
-  return true;
+  if (w.buildings.get(b.id).connected) { rep.roadsLaid += Math.round(laid); return true; }
+  // (it didn't get through: what was laid goes again)
+  for (const id of [...w.roads.edges.keys()]) if (!had.has(id)) { const e = w.roads.edges.get(id); w.roads.removeEdge(id); w.roads.tidy([e.a, e.b], new Set([w.entry.node])); }
+  for (const n of [...w.roads.nodes.values()]) if (!n.edges.length && n.id !== w.entry.node) w.roads._dropNode(n);
+  w.updateRoadNetwork();
+  return false;
 }
 
 // ---------------------------------------------------------- countryside
@@ -1007,7 +884,7 @@ function growCountryside(w, tileOwn, clear, seed) {
   const N = w.N, t = w.terrain, rng = new RNG(seed + 404);
   const nF = makeNoise2D(seed + 303);
   for (let z = 0; z < N; z++) for (let x = 0; x < N; x++) {
-    if (tileOwn(x, z) !== FILLER || !clear(x, z)) continue;
+    if (tileOwn(x, z) !== FILLER || !clear(x + 0.5, z + 0.5)) continue;
     const h = t.tileAvg(x, z), slope = t.slope(x, z), forest = fbm(nF, x * 0.085, z * 0.085, 3);
     if (rng.chance(forest > 0.12 ? 0.5 + forest : 0.035)) {
       const n = forest > 0.35 ? rng.int(2, 3) : 1;
@@ -1151,17 +1028,17 @@ export function reportLines(rep) {
   const n = (k, one, many = one + 's') => `${k} ${k === 1 ? one : many}`;
   const money = (v) => (Number.isFinite(v) ? `$${Math.round(v).toLocaleString('en-US')}` : '∞');
   out.push(['map', `Merged map: ${rep.N}×${rep.N}${rep.cropped ? ' (empty countryside trimmed at the outer edges)' : ''}${rep.countryside > rep.N ? ' · new countryside fills the gaps' : ''}`]);
-  out.push(['landscape', `Ground blended across a ${rep.seam.width}-tile band each side of the join${rep.rivers ? ` · ${n(rep.rivers, 'river')} carried across` : ''}`]);
+  out.push(['landscape', `Ground blended across a band ${rep.seam.width} wide each side of the join${rep.rivers ? ` · ${n(rep.rivers, 'river')} carried across` : ''}`]);
   if (rep.moved.length) out.push(['local_shipping', `${n(rep.moved.length, 'building')} moved to the nearest free plot`]);
   if (rep.converted.length) out.push(['swap_horiz', rep.converted.map(c => `the ${c.from} ${c.name} becomes a ${c.to}`).join('; ')]);
   if (rep.refunded.length) out.push(['payments', `${n(rep.refunded.length, 'building')} refunded (${money(rep.refunded.reduce((s, r) => s + r.refund, 0))})`]);
   if (rep.removed.length) out.push(['cleaning_services', `${n(rep.removed.length, 'half-finished job')} dropped`]);
   const roadBits = [];
   if (rep.joined) roadBits.push(`${n(rep.joined, 'road network')} joined on`);
-  if (rep.roadsLaid + rep.entryLaid) roadBits.push(`${n(rep.roadsLaid + rep.entryLaid, 'tile')} of new road`);
-  if (rep.roadsDropped) roadBits.push(`${n(rep.roadsDropped, 'road tile')} under buildings or deep water removed`);
-  if (rep.railsDropped) roadBits.push(`${n(rep.railsDropped, 'track tile')} removed`);
-  if (rep.strays) roadBits.push(`${n(rep.strays, 'stray road tile')} cleared`);
+  if (rep.roadsLaid + rep.entryLaid) roadBits.push(`${rep.roadsLaid + rep.entryLaid} units of new road`);
+  if (rep.roadsDropped) roadBits.push(`${n(rep.roadsDropped, 'stretch', 'stretches')} of road under buildings or deep water removed`);
+  if (rep.railsDropped) roadBits.push(`${n(rep.railsDropped, 'stretch', 'stretches')} of track removed`);
+  if (rep.strays) roadBits.push(`${rep.strays} units of stray road cleared`);
   if (rep.unjoined) roadBits.push(`${n(rep.unjoined, 'road piece')} boxed in by buildings removed`);
   out.push(['add_road', roadBits.length ? roadBits.join(' · ') : 'Roads already meet — nothing to join']);
   const people = [];
