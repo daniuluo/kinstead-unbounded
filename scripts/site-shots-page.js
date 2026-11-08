@@ -8,9 +8,8 @@ import { BUILDINGS } from '../src/defs.js';
 import { STARTERS } from '../src/world/starters.js';
 import { newVillage, mergeTowns, besideOffset } from '../src/save/merge.js';
 import { deserialize } from '../src/save/saves.js';
-import { fw, fd } from '../src/world/world.js';
-import { strokeTiles } from '../src/world/diagonal.js';
-import { CORNERS } from '../src/world/roadShape.js';
+import { plotOf, ownPlot, findPlot, SETBACK } from '../src/world/world.js';
+import { aabbOf, toWorld, pointAt } from '../src/world/geom.js';
 
 // name, the town, the canvas size (pixel art at 2× makes the picture half
 // that), what to look at, the zoom, the time of day and the season
@@ -33,7 +32,7 @@ const SHOTS = [
   { name: 'farms', town: 'mill', W: 960, H: 600, focus: 'farm', zoom: 2.4, hours: 11, season: 1, fields: true },
   { name: 'merge', merge: ['market', 'hamlet'], W: 960, H: 600, zoom: 1.6, fit: true, hours: 10, season: 1 },
   { name: 'gondola', valley: { seed: 477851, N: 64, relief: 'mountains' }, W: 960, H: 600, climb: true, zoom: 2.3, hours: 10.5, season: 1 },
-  { name: 'diagonals', town: 'market', W: 960, H: 600, diagonal: true, zoom: 4.8, hours: 10.5, season: 1 },
+  { name: 'curves', town: 'market', W: 960, H: 600, curve: true, zoom: 4.8, hours: 10.5, season: 1 },
   { name: 'camera', town: 'market', W: 960, H: 600, focus: 'townhall', zoom: 2.4, hours: 15, season: 1, turn: 160, elev: 15, fov: 45, sky: true },
 ];
 
@@ -100,7 +99,7 @@ async function loadTown(spec) {
     const box = (d) => {
       const w = deserialize(structuredClone(d));
       let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
-      for (const o of w.buildings.values()) { x0 = Math.min(x0, o.x); z0 = Math.min(z0, o.z); x1 = Math.max(x1, o.x + fw(o)); z1 = Math.max(z1, o.z + fd(o)); }
+      for (const o of w.buildings.values()) { const [a0, b0, a1, b1] = aabbOf(plotOf(o)); x0 = Math.min(x0, a0); z0 = Math.min(z0, b0); x1 = Math.max(x1, a1); z1 = Math.max(z1, b1); }
       return { x0, z0, x1, z1 };
     };
     const A = box(a), B = box(b);
@@ -137,14 +136,14 @@ function setDay(season, plus = 2) {
 
 function centre(w) {
   let x = 0, z = 0, n = 0;
-  for (const b of w.buildings.values()) { x += b.x + fw(b) / 2; z += b.z + fd(b) / 2; n++; }
+  for (const b of w.buildings.values()) { x += b.x; z += b.z; n++; }
   return n ? { x: x / n, z: z / n } : { x: w.N / 2, z: w.N / 2 };
 }
 function focusOn(w, type) {
   const c = centre(w);
   // (the town hall: the seat, whatever it has grown into)
   const th = [...w.buildings.values()].find(b => BUILDINGS[b.type].seat);
-  const at = th ? { x: th.x + 0.5, z: th.z + 0.5 } : c;
+  const at = th ? { x: th.x, z: th.z } : c;
   if (!type) return c;
   let best = null, bd = Infinity;
   for (const b of w.buildings.values()) {
@@ -152,13 +151,13 @@ function focusOn(w, type) {
     const d = Math.hypot(b.x - at.x, b.z - at.z);
     if (d < bd) { bd = d; best = b; }
   }
-  return best ? { x: best.x + fw(best) / 2, z: best.z + fd(best) / 2 } : c;
+  return best ? { x: best.x, z: best.z } : c;
 }
 // The zoom that fits every building in a W×H picture (the isometric view
 // sees a box of buildings about 0.75 × (width + depth) across).
 function fitZoom(w, W, H, most) {
   let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
-  for (const b of w.buildings.values()) { x0 = Math.min(x0, b.x); z0 = Math.min(z0, b.z); x1 = Math.max(x1, b.x + fw(b)); z1 = Math.max(z1, b.z + fd(b)); }
+  for (const b of w.buildings.values()) { const [a0, b0, a1, b1] = aabbOf(plotOf(b)); x0 = Math.min(x0, a0); z0 = Math.min(z0, b0); x1 = Math.max(x1, a1); z1 = Math.max(z1, b1); }
   const across = CONFIG.VIEW_HEIGHT * (W / H);
   return { zoom: Math.min(most, across / (0.75 * ((x1 - x0) + (z1 - z0)) + 3)), p: { x: (x0 + x1) / 2, z: (z0 + z1) / 2 } };
 }
@@ -194,8 +193,9 @@ function aim(p, zoom, view = null, spec = {}) {
 function plough(w, at) {
   for (const b of w.buildings.values()) {
     if (!BUILDINGS[b.type].fields) continue;
-    const tiles = [];
-    for (let z = b.z - 4; z < b.z + fd(b) + 4; z++) for (let x = b.x - 4; x < b.x + fw(b) + 4; x++) tiles.push([x, z]);
+    // (squares of land beside it and behind it, lined up with it)
+    const R = ownPlot(b), tiles = [];
+    for (let j = -5; j <= 2; j++) for (let i = -5; i <= 5; i++) tiles.push([...toWorld(R, i + 0.5 * ((b.w + 1) % 2), j - 0.5 + 0.5 * (b.d % 2)), b.a]);
     w.setFields(b.id, tiles, true);
     if (Math.hypot(b.x - at.x, b.z - at.z) < 1) w.setProduce(b.id, 'wheat');
   }
@@ -208,34 +208,33 @@ function plough(w, at) {
 function gondola(w, p) {
   const g = G();
   w.setSandbox({ ...w.sandbox, infiniteMoney: true, unlockAll: true });
-  const open = (x, z) => w.inBounds(x, z) && !w.buildingOn(x, z) && !w.roadAt(x, z) && !w.terrain.isWater(x, z) && [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dz]) => w.roadAt(x + dx, z + dz));
+  // (spots for a station along the streets near the middle: [x, z, a])
+  const open = [];
+  findPlot(w, 'gondola', p, { r: 10, step: 0.5, test: (x, z, a, chk) => { if (chk && chk.access) open.push([x, z, a]); return !chk; } });
   const under = (a, b) => {
-    const seen = new Set(), L = Math.hypot(b.x - a.x, b.z - a.z);
-    for (let u = 0; u <= L; u += 0.25) { const o = w.buildingOn(Math.floor(a.x + 0.5 + ((b.x - a.x) * u) / L), Math.floor(a.z + 0.5 + ((b.z - a.z) * u) / L)); if (o) seen.add(o.id); }
+    const seen = new Set(), L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    for (let u = 0; u <= L; u += 0.25) { const o = w.buildingAt(a[0] + ((b[0] - a[0]) * u) / L, a[1] + ((b[1] - a[1]) * u) / L); if (o) seen.add(o.id); }
     return seen.size;
   };
   // the best pair: across the view, near the middle, over the most roofs,
   // with open ground halfway for a pylon
   let best = null;
-  for (let z = Math.floor(p.z) - 9; z <= p.z + 9; z++) for (let x = Math.floor(p.x) - 9; x <= p.x + 9; x++) {
-    if (!open(x, z)) continue;
-    for (let z2 = z - 10; z2 <= z; z2++) for (let x2 = x; x2 <= x + 10; x2++) {
-      const d = Math.hypot(x2 - x, z2 - z), across = ((x2 - x) - (z2 - z)) / Math.SQRT2 / (d || 1);
-      if (d < 7.5 || d > 10 || across < 0.93 || !open(x2, z2)) continue;
-      const mx = (x + x2) / 2 + 0.5, mz = (z + z2) / 2 + 0.5;
-      const pylon = [-1, -0.5, 0, 0.5, 1].some(o => g.transit._pylonSpot(mx + ((x2 - x) / d) * o, mz + ((z2 - z) / d) * o) === 0);
-      const score = under({ x, z }, { x: x2, z: z2 }) + (pylon ? 4 : 0) - Math.hypot(mx - p.x, mz - p.z) * 0.3;
-      if (!best || score > best.score) best = { a: [x, z], b: [x2, z2], score };
-    }
+  for (const A of open) for (const B of open) {
+    const dx = B[0] - A[0], dz = B[1] - A[1], d = Math.hypot(dx, dz), across = (dx - dz) / Math.SQRT2 / (d || 1);
+    if (d < 7.5 || d > 10 || across < 0.93) continue;
+    const mx = (A[0] + B[0]) / 2, mz = (A[1] + B[1]) / 2;
+    const pylon = [-1, -0.5, 0, 0.5, 1].some(o => g.transit._pylonSpot(mx + (dx / d) * o, mz + (dz / d) * o) === 0);
+    const score = under(A, B) + (pylon ? 4 : 0) - Math.hypot(mx - p.x, mz - p.z) * 0.3;
+    if (!best || score > best.score) best = { a: A, b: B, score };
   }
   if (!best) return p;
-  const st = [best.a, best.b].map(([x, z]) => w.placeBuilding('gondola', x, z, { instant: true })).filter(r => r.ok).map(r => r.building);
+  const st = [best.a, best.b].map(([x, z, a]) => w.placeBuilding('gondola', x, z, { a, instant: true })).filter(r => r.ok).map(r => r.building);
   const r = g.transit.createLine('gondola', st.map(b => b.id));
   if (!r.ok) return p;
   g.transit.setVehicles(r.line.id, 8);
   g.transit.rebuild();
   // aimed halfway up, so the stations and the cable sit in the middle
-  return { x: (best.a[0] + best.b[0]) / 2 + 0.5, z: (best.a[1] + best.b[1]) / 2 + 0.5, y: (st[0].baseY + st[1].baseY) / 2 + 0.6 };
+  return { x: (best.a[0] + best.b[0]) / 2, z: (best.a[1] + best.b[1]) / 2, y: (st[0].baseY + st[1].baseY) / 2 + 0.6 };
 }
 
 // A gondola up out of the valley for its picture, as in La Paz: a station
@@ -245,63 +244,67 @@ function gondola(w, p) {
 // middle of the line, up in the air.
 function climb(w, p) {
   const g = G(), t = w.terrain;
-  let lo = null, hi = null, top = 0;
-  for (let z = 2; z < w.N - 2 && !lo; z++) for (let x = 2; x < w.N - 2 && !lo; x++) {
-    const d = Math.hypot(x - p.x, z - p.z);
-    if (d > 2 && d < 6 && w.checkBuild('gondola', x, z).ok) lo = [x, z];
-  }
-  if (!lo) return p;
+  let hi = null, top = 0;
+  const f = findPlot(w, 'gondola', p, { r: 6, test: (x, z) => Math.hypot(x - p.x, z - p.z) > 2 });
+  if (!f) return p;
+  const lo = [f.x, f.z, f.a];
   for (let z = 3; z < w.N - 3; z++) for (let x = 3; x < w.N - 3; x++) {
-    const h = t.tileAvg(x, z), d = Math.hypot(x - lo[0], z - lo[1]);
-    if (h > top && d > 9 && d < 18 && t.slope(x, z) < 0.3 && t.slope(x, z + 1) < 0.3) { top = h; hi = [x, z]; }
+    const h = t.tileAvg(x, z), d = Math.hypot(x + 0.5 - lo[0], z + 0.5 - lo[1]);
+    if (h > top && d > 9 && d < 18 && t.slope(x, z) < 0.3 && t.slope(x, z + 1) < 0.3 && t.slope(x - 1, z + 1) < 0.3 && t.slope(x + 1, z + 1) < 0.3) { top = h; hi = [x + 0.5, z + 0.5, 0]; }
   }
   if (!hi) return p;
-  w.placeRoads([[hi[0] - 1, hi[1] + 1], [hi[0], hi[1] + 1], [hi[0] + 1, hi[1] + 1]], 1);
-  const st = [lo, hi].map(([x, z]) => w.placeBuilding('gondola', x, z, { instant: true })).filter(r => r.ok).map(r => r.building);
+  // (a street of its own up there, in front of the station)
+  w.placeRoad([[hi[0] - 1.2, hi[1] + 1], [hi[0] + 1.2, hi[1] + 1]], 1);
+  const st = [lo, hi].map(([x, z, a]) => w.placeBuilding('gondola', x, z, { a, instant: true })).filter(r => r.ok).map(r => r.building);
   const r = st.length === 2 ? g.transit.createLine('gondola', st.map(b => b.id)) : { ok: false };
   if (!r.ok) return p;
   g.transit.setVehicles(r.line.id, 10);
   g.transit.rebuild();
   step(60);
-  return { x: (lo[0] + hi[0]) / 2 + 0.5, z: (lo[1] + hi[1]) / 2 + 0.5, y: (st[0].baseY + st[1].baseY) / 2 + 0.8 };
+  return { x: (lo[0] + hi[0]) / 2, z: (lo[1] + hi[1]) / 2, y: (st[0].baseY + st[1].baseY) / 2 + 0.8 };
 }
 
-// A diagonal street out of the town for its picture: from a street near the
-// middle, out across open ground at 45 degrees (running up the picture),
-// lined both sides with houses and shops turned to face it, a lane crossing
-// it along the grid. Returns the middle of it.
-function diagonal(w, p) {
+// A curving street out of the town for its picture: off a street near the
+// middle, out across open ground in a long bend, lined both sides with
+// houses and shops facing it at whatever angle the bend gives them, a lane
+// crossing it. Returns the middle of it.
+function curve(w, p) {
   w.setSandbox({ ...w.sandbox, infiniteMoney: true, unlockAll: true });
-  const len = 9;
+  const L = 9;
   let best = null;
-  for (let z = Math.floor(p.z) - 12; z <= p.z + 12; z++) for (let x = Math.floor(p.x) - 12; x <= p.x + 12; x++) {
-    if (!w.inBounds(x, z) || !w.roadAt(x, z) || !w.connected[w.idx(x, z)]) continue;
-    for (const k of [1, 3]) {
-      const [dx, dz] = CORNERS[k], tiles = strokeTiles({ x, z }, { x: x + dx * len, z: z + dz * len });
-      if (!tiles.every(([tx, tz]) => w.inBounds(tx, tz)) || !w.checkStroke(tiles, 2).slice(1).every(c => c.ok && !c.noop)) continue;
+  for (const e of w.roads.edges.values()) {
+    if (!w.connected.has(e.a) || e.len < 2) continue;
+    for (let s = 0.8; s <= e.len - 0.8; s += 0.5) for (const sd of [1, -1]) for (const bend of [0.7, -0.7]) {
+      const q = pointAt(e.pts, e.cum, s);
+      if (Math.hypot(q[0] - p.x, q[1] - p.z) > 12) continue;
+      const ux = -q[4] * sd, uz = q[3] * sd, c = Math.cos(bend), si = Math.sin(bend), vx = ux * c + uz * si, vz = -ux * si + uz * c;
+      const pts = [[q[0], q[1]], [q[0] + (ux * 0.7 + vx * 0.3) * L / 2, q[1] + (uz * 0.7 + vz * 0.3) * L / 2], [q[0] + (ux + vx) * L / 2 * 0.9, q[1] + (uz + vz) * L / 2 * 0.9]];
+      if (!w.checkRoad(pts, 2).ok) continue;
       // room for buildings either side of it
       let room = 0;
-      for (let i = 1; i < len; i++) for (const [ox, oz] of [[tiles[i + 1][0], tiles[i][1]], [tiles[i][0], tiles[i + 1][1]]]) {
-        if (w.inBounds(ox, oz) && !w.buildingOn(ox, oz) && !w.roadAt(ox, oz) && !w.terrain.isWater(ox, oz) && w.terrain.slope(ox, oz) < 0.6) room++;
+      for (let t = 0.15; t < 1; t += 0.1) {
+        const m = [pts[0][0] + (pts[2][0] - pts[0][0]) * t, pts[0][1] + (pts[2][1] - pts[0][1]) * t];
+        for (const side of [1, -1]) { const ox = m[0] - uz * side * 1.1, oz = m[1] + ux * side * 1.1; if (w.inBounds(ox, oz) && !w.buildingAt(ox, oz) && !w.roadAt(ox, oz, 0.4) && !w.waterAt(ox, oz)) room++; }
       }
-      const score = room * 2 - Math.hypot(x - p.x, z - p.z);
-      if (!best || score > best.score) best = { tiles, score };
+      const score = room * 2 - Math.hypot(q[0] - p.x, q[1] - p.z);
+      if (!best || score > best.score) best = { pts, score };
     }
   }
   if (!best) return p;
-  const { tiles } = best;
-  w.placeRoads(tiles, 2, { stroke: true });
-  // a lane along the grid across it, two thirds of the way out
-  const [cx, cz] = tiles[6];
-  w.placeRoads(strokeTiles({ x: cx - 3, z: cz }, { x: cx + 3, z: cz }, false), 1, { stroke: true });
+  const { pts } = best;
+  w.placeRoad(pts, 2);
+  // a lane across it, two thirds of the way out
+  const m = [pts[1][0] + (pts[2][0] - pts[1][0]) * 0.4, pts[1][1] + (pts[2][1] - pts[1][1]) * 0.4], dx = pts[2][0] - pts[1][0], dz = pts[2][1] - pts[1][1], dl = Math.hypot(dx, dz) || 1;
+  w.placeRoad([[m[0] - (dz / dl) * 3, m[1] + (dx / dl) * 3], [m[0] + (dz / dl) * 3, m[1] - (dx / dl) * 3]], 1);
   const kinds = ['house', 'bakery', 'house', 'house', 'grocer', 'house', 'tavern', 'house', 'house', 'coffeehouse', 'house', 'house', 'tailor', 'house', 'house', 'house'];
   let n = 0;
-  for (let i = 0; i < len; i++) for (const [ox, oz] of [[tiles[i + 1][0], tiles[i][1]], [tiles[i][0], tiles[i + 1][1]]]) {
+  for (let t = 0.1; t < 1; t += 0.07) for (const side of [1, -1]) {
+    const q = [pts[0][0] + (pts[2][0] - pts[0][0]) * t, pts[0][1] + (pts[2][1] - pts[0][1]) * t];
     const type = BUILDINGS[kinds[n % kinds.length]] ? kinds[n % kinds.length] : 'house';
-    if (w.placeBuilding(type, ox, oz, { instant: true, variant: 1000 + n * 7919 }).ok) n++;
+    const f = findPlot(w, type, { x: q[0] - (dz / dl) * side, z: q[1] + (dx / dl) * side }, { r: 1.2 });
+    if (f && w.placeBuilding(type, f.x, f.z, { a: f.a, instant: true, variant: 1000 + n * 7919 }).ok) n++;
   }
-  const [mx, mz] = tiles[5];
-  return { x: mx + 0.5, z: mz + 0.5 };
+  return { x: pts[1][0], z: pts[1][1] };
 }
 
 function settings(spec) {
@@ -337,13 +340,13 @@ async function lineup(spec, p) {
   const [V, THREE] = await Promise.all([import('../src/render/villagers.js'), import('three')]);
   // the road tile nearest the shop with nothing built between it and the
   // camera (which looks from +x, +z in the usual view)
-  const open = (x, z) => w.inBounds(x, z) && w.buildingAt[w.idx(x, z)] < 0;
+  const open = (x, z) => w.inBounds(x, z) && !w.buildingAt(x, z);
   let spot = null, bd = Infinity;
-  for (let z = Math.floor(p.z) - 8; z <= p.z + 8; z++) for (let x = Math.floor(p.x) - 8; x <= p.x + 8; x++) {
+  for (let z = Math.floor(p.z) - 8; z <= p.z + 8; z += 0.5) for (let x = Math.floor(p.x) - 8; x <= p.x + 8; x += 0.5) {
     if (!w.inBounds(x, z) || !w.roadAt(x, z)) continue;
     if (!open(x + 1, z) || !open(x, z + 1) || !open(x + 1, z + 1) || !open(x + 2, z + 1) || !open(x + 1, z + 2)) continue;
-    const d = Math.hypot(x + 0.5 - p.x, z + 0.5 - p.z);
-    if (d < bd) { bd = d; spot = { x: x + 0.5, z: z + 0.5 }; }
+    const d = Math.hypot(x - p.x, z - p.z);
+    if (d < bd) { bd = d; spot = { x, z }; }
   }
   spot ||= p;
   w.hours = spec.hours;
@@ -389,7 +392,7 @@ async function shoot(spec) {
   if (spec.fields) plough(w, p);
   if (spec.gondola) p = gondola(w, p);
   if (spec.climb) p = climb(w, focusOn(w, 'townhall'));
-  if (spec.diagonal) p = diagonal(w, p);
+  if (spec.curve) p = curve(w, p);
   let pic;
   if (spec.lineup) {
     setDay(spec.season);
@@ -425,7 +428,8 @@ export async function run(only = null) {
   await sleep(500);
   const list = SHOTS.filter(s => !only || only.includes(s.name));
   // one town at a time
-  list.sort((a, b) => (a.merge ? 'zz' : a.town).localeCompare(b.merge ? 'zz' : b.town));
+  const key = (s) => (s.merge ? 'zz' : s.valley ? 'zy' : s.town);
+  list.sort((a, b) => key(a).localeCompare(key(b)));
   for (const spec of list) {
     try { await shoot(spec); } catch (e) { say(`${spec.name}: ${e && e.stack ? e.stack : e}`); }
   }

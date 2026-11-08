@@ -127,7 +127,7 @@ export function workingHTML(game, b) {
   // what that means for its work
   const rows = [];
   if (!home) rows.push(['Working', k >= 1 ? 'Fully' : k > 0 ? `At ${pct(k)}` : 'Stopped']);
-  if (L.radius && servicesOf(def).length && !def.park) rows.push(['Reach now', `${sim.reachOf(b).toFixed(1).replace(/\.0$/, '')} of ${L.radius} tiles`]);
+  if (L.radius && servicesOf(def).length && !def.park) rows.push(['Reach now', `${sim.reachOf(b).toFixed(1).replace(/\.0$/, '')} of ${L.radius} units`]);
   if (L.seats) rows.push(['Places now', `${sim.seatsOf(b)} of ${capOf(b, 'seats')}`]);
   if (L.kw) rows.push(['Making', `${Math.round(L.kw * k)} of ${L.kw} kW`]);
   if (L.supply) rows.push(['Drawing water for', `${Math.round(sim.supplyOf(b))} of ${L.supply} people`]);

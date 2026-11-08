@@ -22,8 +22,8 @@ const HAPPY = {
   appeal: { want: 'nicer scenery', label: 'Scenery', icon: 'park', tip: 'Plant trees, or build gardens and parks nearby', act: { label: 'Parks', cat: 'parks' } },
   play: { want: 'somewhere to play', label: 'Play', icon: 'toys', tip: 'Build a play area or playing field within reach of homes with children', act: { label: 'Parks', cat: 'parks' } },
   potter: { want: 'an allotment to dig', label: 'Allotment', icon: 'agriculture', tip: 'Build allotments within reach of homes with elders', act: { label: 'Parks', cat: 'parks' } },
-  shops: { want: 'shops nearby', label: 'Shops nearby', icon: 'storefront', tip: 'Build a shop, café or tavern within 7 tiles', act: { label: 'Commerce', cat: 'commercial' } },
-  transit: { want: 'a coach stop nearby', label: 'Transport', icon: 'directions_bus', tip: 'Put a coach stop within 4 tiles', act: { label: 'Transit', cat: 'transit' } },
+  shops: { want: 'shops nearby', label: 'Shops nearby', icon: 'storefront', tip: 'Build a shop, café or tavern within 7 units', act: { label: 'Commerce', cat: 'commercial' } },
+  transit: { want: 'a coach stop nearby', label: 'Transport', icon: 'directions_bus', tip: 'Put a coach stop within 4 units', act: { label: 'Transit', cat: 'transit' } },
   pollution: { want: 'less smoke', label: 'Smoke', icon: 'factory', tip: 'Industry is too close — move it, or plant trees between', act: { label: 'Show homes' } },
   land: { label: 'Garden deal', icon: 'yard', tip: '' },
   tax: { want: 'lower taxes', label: 'Taxes', icon: 'payments', tip: 'Lower the tax rate in the budget', act: { label: 'Budget', budget: true } },
@@ -314,17 +314,17 @@ export class UI {
     const h = $('toolHint');
     let msg = '';
     switch (t.kind) {
-      case 'road': msg = `Drag to lay ${ROAD_LEVELS[t.level].name.toLowerCase()} · ${t.grid ? 'along the grid only (Tab: diagonals too)' : 'drag at 45° for a diagonal street (Tab: grid only)'} · drawing over roads upgrades them · right-click to stop`; break;
-      case 'rail': msg = 'Drag to lay track · trains need a loop · track can cross roads · right-click to stop'; break;
+      case 'road': msg = `Drag to draw ${ROAD_LEVELS[t.level].name.toLowerCase()} along the way you go · Shift: straight · cross or end on a road for a junction · click a road to pick its stretch · right-click to stop`; break;
+      case 'rail': msg = 'Drag to lay track along the way you go · Shift: straight · trains need a loop · track crosses roads nearly square · right-click to stop'; break;
       case 'roadsel': msg = `Click a road to pick its stretch · Shift-click adds · drag to pick a ${t.box ? 'box' : 'line'} (Tab: ${t.box ? 'line' : 'box'}) · Backspace undoes · right-click clears`; break;
-      case 'build': msg = `Click to place a ${BUILDINGS[t.type].levels[0].name}${KINDS[t.type] ? ` (${t.flavor ? KINDS[t.type][t.flavor].name.toLowerCase() : 'its kind by its seed'}: choose above)` : ''} · builders will put it up · Tab flips the entrance · Z / C turn it · right-click to stop`; break;
+      case 'build': msg = `Click to place a ${BUILDINGS[t.type].levels[0].name}${KINDS[t.type] ? ` (${t.flavor ? KINDS[t.type][t.flavor].name.toLowerCase() : 'its kind by its seed'}: choose above)` : ''} · it faces the nearest street · Z / C turn it (Shift: a little) · Tab lines it up along the street · right-click to stop`; break;
       case 'move': {
         const b = this.world.buildings.get(t.id);
-        msg = b ? `Click a new plot for the ${BUILDINGS[b.type].levels[b.level].name} · it is taken down, carted over and rebuilt · Tab flips the entrance · right-click to cancel` : '';
+        msg = b ? `Click a new plot for the ${BUILDINGS[b.type].levels[b.level].name} · it is taken down, carted over and rebuilt · Z / C turn it · Tab lines it up along the street · right-click to cancel` : '';
         break;
       }
       case 'bulldoze': msg = 'Click or drag to demolish · right-click to stop'; break;
-      case 'fields': msg = t.add ? `Drag a box over open land to plough it as fields · behind or beside the farm, touching it or its fields · $${CONFIG.FIELD_COST} each · right-click to stop` : 'Drag over the farm\'s fields to take them out (a quarter back) · right-click to stop'; break;
+      case 'fields': msg = t.add ? `Drag a box over open land to plough it as fields (squares at the farm's angle) · behind or beside the farm, touching it or its fields · $${CONFIG.FIELD_COST} each · right-click to stop` : 'Drag over the farm\'s fields to take them out (a quarter back) · right-click to stop'; break;
       case 'terrain': msg = `Click or drag to ${t.mode === 'flatten' ? 'level' : t.mode} the land · $${TERRAFORM_COST} each`; break;
       case 'trees': msg = `Click or drag to plant trees · $${TREE_COST} each`; break;
       case 'line': msg = `Click ${t.mode === 'rail' ? 'stations on a loop of track' : t.mode === 'gondola' ? 'gondola stations (the cable runs straight between them)' : 'coach stops'} in order (${t.stops.length} chosen) · Enter to create · Backspace to undo · Esc to cancel`; break;
@@ -505,10 +505,10 @@ export class UI {
   _tilesHTML(cur, n) {
     const F = [
       ['housing', 'Homes for', (v) => v], ['jobs', 'Jobs', (v) => v], ['seats', 'Student places', (v) => v], ['teaches', 'Teaches', (v) => EDU[v]], ['income', 'Earnings / worker', (v) => `$${v}`],
-      ['tax', 'Tax / worker', (v) => `${v}×`], ['visit', 'Per visit', (v) => `$${v}`], ['radius', 'Reach', (v) => `${v} tiles`],
+      ['tax', 'Tax / worker', (v) => `${v}×`], ['visit', 'Per visit', (v) => `$${v}`], ['radius', 'Reach', (v) => `${v} units`],
       ['appeal', 'Scenery', (v) => `+${v}`], ['supply', 'Water for', (v) => `${v}`], ['kw', 'Power', (v) => `${v} kW`],
-      ['rate', 'Builder speed', (v) => `${v}×`], ['taxBonus', 'Town tax', (v) => `+${Math.round(v * 100)}%`], ['culture', 'Culture reach', (v) => `${v} tiles`],
-      ['pollution', 'Smoke', (v) => `${v} tiles`, true], ['upkeep', 'Upkeep / day', (v) => `$${v}`, true],
+      ['rate', 'Builder speed', (v) => `${v}×`], ['taxBonus', 'Town tax', (v) => `+${Math.round(v * 100)}%`], ['culture', 'Culture reach', (v) => `${v} units`],
+      ['pollution', 'Smoke', (v) => `${v} units`, true], ['upkeep', 'Upkeep / day', (v) => `$${v}`, true],
     ];
     const tiles = [];
     for (const [k, label, f, worse] of F) {
@@ -599,9 +599,9 @@ export class UI {
     }
     if (visitOf(b)) rows.push(['Per visit', `$${visitOf(b)}`]);
     if (L.upkeep) rows.push(['Upkeep', `$${S.upkeep} / day`]);
-    for (const s of servicesOf(def)) rows.push(s === 'water' ? [`${SERVICES[s].icon} Water`, 'Into the mains along the roads'] : [`${SERVICES[s].icon} ${SERVICES[s].name} reach`, `${L.radius} tiles`]);
-    if (L.culture) rows.push([`${SERVICES.culture.icon} Culture reach`, `${L.culture} tiles`]);
-    if (def.park) rows.push(['Scenery', `+${L.appeal} within ${L.radius} tiles`]);
+    for (const s of servicesOf(def)) rows.push(s === 'water' ? [`${SERVICES[s].icon} Water`, 'Into the mains along the roads'] : [`${SERVICES[s].icon} ${SERVICES[s].name} reach`, `${L.radius} units`]);
+    if (L.culture) rows.push([`${SERVICES.culture.icon} Culture reach`, `${L.culture} units`]);
+    if (def.park) rows.push(['Scenery', `+${L.appeal} within ${L.radius} units`]);
     if (L.pollution) rows.push(['Pollution', `${L.pollution} tile radius`]);
     if (L.taxBonus) rows.push(['Tax bonus', `+${Math.round(L.taxBonus * 100)}%`]);
     if (def.stop) {
@@ -745,10 +745,10 @@ export class UI {
     const w = this.world, def = BUILDINGS[b.type], q = civicQuarter(w), R = CIVIC_QUARTER.reach, pc = Math.round(CIVIC_QUARTER.tax * 100);
     let h = '<div class="sec quarter"><h5>🏛️ Civic quarter</h5>';
     if (def.seat) {
-      h += `<div class="note">Each of these with its middle within ${R} tiles of this one's makes part of a civic quarter, and each kind there adds ${pc}% to the town's taxes.</div>`;
+      h += `<div class="note">Each of these with its middle within ${R} units of this one's makes part of a civic quarter, and each kind there adds ${pc}% to the town's taxes.</div>`;
       for (const t of CIVIC_TYPES) {
         const m = q.members.find(e => e.b.type === t);
-        h += `<div class="row"><span>${BUILDINGS[t].icon} ${esc(BUILDINGS[t].name)}</span><b>${m ? `<span class="chip link ok" data-act="building" data-id="${m.b.id}">${esc(BUILDINGS[t].levels[m.b.level].name)} · ${Math.round(m.d)} tiles</span>` : '<span class="muted">none near</span>'}</b></div>`;
+        h += `<div class="row"><span>${BUILDINGS[t].icon} ${esc(BUILDINGS[t].name)}</span><b>${m ? `<span class="chip link ok" data-act="building" data-id="${m.b.id}">${esc(BUILDINGS[t].levels[m.b.level].name)} · ${Math.round(m.d)} units</span>` : '<span class="muted">none near</span>'}</b></div>`;
       }
       h += `<div class="row"><span>Town tax from the quarter</span><b>${q.tax ? `+${Math.round(q.tax * 100)}%` : '—'}</b></div>`;
       return h + '</div>';
@@ -757,10 +757,10 @@ export class UI {
     if (!seat) return h + '<div class="note">There is no town hall for it to stand by.</div></div>';
     const sn = BUILDINGS[seat.type].levels[seat.level].name, s = buildingCenter(seat), c = buildingCenter(b), d = Math.round(Math.hypot(c.x - s.x, c.z - s.z));
     const me = q.members.find(e => e.b === b), first = q.members.find(e => e.b.type === b.type);
-    if (me && first === me) h += `<div class="note ok">Part of the civic quarter, ${d} tiles from the ${esc(sn)}: +${pc}% to the town's taxes.</div>`;
-    else if (me) h += `<div class="note">In the civic quarter, ${d} tiles from the ${esc(sn)}, but the ${esc(BUILDINGS[first.b.type].levels[first.b.level].name)} there already counts for its kind.</div>`;
+    if (me && first === me) h += `<div class="note ok">Part of the civic quarter, ${d} units from the ${esc(sn)}: +${pc}% to the town's taxes.</div>`;
+    else if (me) h += `<div class="note">In the civic quarter, ${d} units from the ${esc(sn)}, but the ${esc(BUILDINGS[first.b.type].levels[first.b.level].name)} there already counts for its kind.</div>`;
     else if (!b.connected) h += `<div class="note no">Not on the roads, so not part of the civic quarter round the ${esc(sn)}.</div>`;
-    else h += `<div class="note">${d} tiles from the ${esc(sn)}: built within ${R} tiles of it, it would make part of a civic quarter, +${pc}% to the town's taxes.</div>`;
+    else h += `<div class="note">${d} units from the ${esc(sn)}: built within ${R} units of it, it would make part of a civic quarter, +${pc}% to the town's taxes.</div>`;
     return h + '</div>';
   }
 

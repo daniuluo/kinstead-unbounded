@@ -240,7 +240,7 @@ export class MergeDialog {
           <div class="field"><label>Turn or overlap</label>
             <div class="inline"><button class="btn small" id="mgTurn">${ms('rotate_right')} Turn B 90°</button><button class="btn small" id="mgOver">${ms('join_inner')} Centre B on A</button></div></div>
           <div class="grid2">
-            <div class="field"><label>Blend width</label><select id="mgSeam">${[[0, 'Auto'], [3, '3 tiles'], [5, '5 tiles'], [8, '8 tiles'], [12, '12 tiles']].map(([v, t]) => `<option value="${v}" ${v === this.seam ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
+            <div class="field"><label>Blend width</label><select id="mgSeam">${[[0, 'Auto'], [3, '3 units'], [5, '5 units'], [8, '8 units'], [12, '12 units']].map(([v, t]) => `<option value="${v}" ${v === this.seam ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
             <div class="field"><label>Merged town's name</label><input id="mgName" maxlength="40" value="${esc(this.name)}"></div>
           </div>
           <div class="merge-info" id="mgInfo"></div>
@@ -350,7 +350,7 @@ export class MergeDialog {
     const el = this.win && this.win.querySelector('#mgInfo'), sum = this.win && this.win.querySelector('#mgSum'), go = this.win && this.win.querySelector('#mgGo');
     if (!el) return;
     const L = this._layout();
-    const how = L.mode === 'overlap' ? `B overlaps A by ${fmt(L.overlap)} tiles` : L.mode === 'beside' ? 'B sits right beside A' : 'B is apart from A, with new countryside between';
+    const how = L.mode === 'overlap' ? `B overlaps A by ${fmt(L.overlap)} units` : L.mode === 'beside' ? 'B sits right beside A' : 'B is apart from A, with new countryside between';
     el.className = 'merge-info' + (L.ok ? '' : ' bad');
     el.innerHTML = L.ok
       ? `${ms('crop_free')} Merged map <b>${L.N}×${L.N}</b>${L.cropped ? ' (empty countryside trimmed)' : ''} · ${how}`

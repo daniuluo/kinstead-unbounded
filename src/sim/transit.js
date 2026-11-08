@@ -1539,7 +1539,18 @@ export class Transit {
     if (es.length === 1) kind = 0;
     else if (es.length !== 2) kind = 1;
     else if (Math.PI - angDiff(net.dirAt(es[0], n.id), net.dirAt(es[1], n.id)) > 0.6) kind = 2;
-    const out = kind ? { r: Math.max(...es.map(e => HALF[e.level])) + 0.3, kind } : null;
+    let r = Math.max(...es.map(e => HALF[e.level])) + 0.3;
+    // (two junctions a short stretch apart are one wide junction: their
+    // zones meet halfway along it, so a vehicle claims its way through both
+    // at once and never stands between them waiting on one with its tail in
+    // the other)
+    if (kind) for (const e of es) {
+      if (e.len >= 2.2) continue;
+      const o = net.nodes.get(net.other(e, n.id)), oe = o ? o.edges.map(id => net.edges.get(id)) : [];
+      const knot = oe.length > 2 || (oe.length === 2 && Math.PI - angDiff(net.dirAt(oe[0], o.id), net.dirAt(oe[1], o.id)) > 0.6);
+      if (knot) r = Math.max(r, Math.min(1.15, e.len / 2 + 0.05));
+    }
+    const out = kind ? { r, kind } : null;
     this._knots.set(n.id, out);
     return out;
   }
@@ -1548,7 +1559,7 @@ export class Transit {
   // junction or turning place, 2 a bend), x, z (its middle) }, or null.
   _zoneAt(x, z) {
     const w = this.world;
-    for (const n of w.roads.nodeIx.near(x, z, 0.65)) {
+    for (const n of w.roads.nodeIx.near(x, z, 1.2)) {
       const K = this._knotOf(n);
       if (K && Math.hypot(n.x - x, n.z - z) < K.r) return { k: n.id, kind: K.kind, x: n.x, z: n.z };
     }

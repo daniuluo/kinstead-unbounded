@@ -25,13 +25,13 @@ export function stats(type, level) {
   const cap = visitors(type, level);
   if (Number.isFinite(cap)) out.push(['Visitors at once', `${cap} ${WHO[visitKind(def)]}`]);
   if (def.shop) out.push(['Sells', sellsText({ type })]);
-  for (const s of servicesOf(def)) out.push([`${SERVICES[s].name} reach`, `${L.radius} tiles`]);
-  if (def.park && L.appeal) out.push(['Scenery', `+${L.appeal} within ${L.radius} tiles`]);
+  for (const s of servicesOf(def)) out.push([`${SERVICES[s].name} reach`, `${L.radius} units`]);
+  if (def.park && L.appeal) out.push(['Scenery', `+${L.appeal} within ${L.radius} units`]);
   else if (L.appeal) out.push(['Scenery', `+${L.appeal}`]);
   if (L.visit) out.push(['Per visit', `$${L.visit}`]);
   if (def.play) out.push(['Play', 'homes with children nearby are happier']);
   if (def.potter) out.push(['Digging', 'homes with elders nearby are happier']);
-  if (L.culture) out.push(['Culture reach', `${L.culture} tiles`]);
+  if (L.culture) out.push(['Culture reach', `${L.culture} units`]);
   const res = RESEARCH_SOURCES[type];
   if (res) out.push(['Research', `${res[Math.min(level, res.length - 1)]} a day`]);
   if (L.income) out.push(['Earnings', `$${L.income} a worker a day`]);
@@ -39,7 +39,7 @@ export function stats(type, level) {
   if (L.kw) out.push(['Power', `${L.kw} kW`]);
   if (L.rate) out.push(['Builder speed', `${L.rate}×`]);
   if (L.taxBonus) out.push(['Town tax', `+${Math.round(L.taxBonus * 100)}%`]);
-  if (L.pollution) out.push(['Smoke', `${L.pollution} tiles around`]);
+  if (L.pollution) out.push(['Smoke', `${L.pollution} units around`]);
   if (L.upkeep) out.push(['Upkeep', `$${L.upkeep} a day`]);
   return out;
 }
