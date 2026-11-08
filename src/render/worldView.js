@@ -11,8 +11,8 @@ import { buildModel, workArea } from './buildings.js';
 import { PARK_SEASON_STEPS } from './parks.js';
 import { siteGeo, bodyBox } from './construction.js';
 import { Rain } from './rain.js';
-import { fw, fd } from '../world/world.js';
-import { facingAngle } from '../world/diagonal.js';
+import { ownPlot } from '../world/world.js';
+import { toWorld } from '../world/geom.js';
 import { BUILDINGS } from '../defs.js';
 
 const easeOutBack = (t) => { const c1 = 1.70158, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
@@ -38,10 +38,9 @@ export class WorldView {
     // another building's plot or a road at (x, z) (not building id's own):
     // what a pier reaching out beyond its plot stops short of
     this.takenFn = (x, z, id) => {
-      const tx = Math.floor(x), tz = Math.floor(z);
-      if (!world.inBounds(tx, tz)) return false;
-      const o = world.buildingAt[world.idx(tx, tz)];
-      return (o >= 0 && o !== id) || !!world.roadAt(tx, tz);
+      if (!world.inBounds(x, z)) return false;
+      const o = world.buildingAt(x, z);
+      return (!!o && o.id !== id) || !!world.roadAt(x, z, 0.05);
     };
     this.items = new Map();
     this.anims = [];
@@ -133,8 +132,8 @@ export class WorldView {
     const mesh = new THREE.Mesh(model.geo, MAT.building);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
-    mesh.position.set(b.x + (b.w ?? b.size) / 2 + model.jitter.ox, b.baseY, b.z + (b.d ?? b.size) / 2 + model.jitter.oz);
-    mesh.rotation.y = facingAngle(b) + model.jitter.yaw;
+    mesh.position.set(b.x, b.baseY, b.z);
+    mesh.rotation.y = b.a;
     mesh.userData.buildingId = b.id;
     let spin = null;
     if (model.spin) {
@@ -160,7 +159,7 @@ export class WorldView {
     b.work = workArea(b);
     b.spots = model.spots && model.spots.length ? model.spots.map(p => { const v = toWorld({ x: p.x, y: 0, z: p.z }); return [v.x, v.z]; }) : null;
     b.door = this._doorOf(model, mesh, b);
-    b.foot = model.foot;   // all it stands on, in world space (see world/pose.js)
+    b.foot = model.foot;   // all it stands on, in world space
     b.open = !!model.open;   // open-air: villagers wander in it rather than going in
     // a gondola station's way up from the street and its deck, for its riders
     b.stair = model.stair ? model.stair.map(p => toWorld(p)) : null;
@@ -185,21 +184,19 @@ export class WorldView {
     const target = buildModel(up ? { ...b, type: con.toType || b.type, level: con.to, look: con.look !== undefined ? con.look : b.look, flavor: con.flavor !== undefined ? con.flavor : b.flavor } : b, opts);
     const old = up ? buildModel(b, opts) : null;
     for (const m of [target, old]) if (m && m.spin) m.spin.geo.dispose();
-    const jit = target.jitter;
     const mesh = new THREE.Mesh(new THREE.BufferGeometry(), MAT.site);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
-    mesh.position.set(b.x + fw(b) / 2 + jit.ox, b.baseY, b.z + fd(b) / 2 + jit.oz);
-    mesh.rotation.y = facingAngle(b) + jit.yaw;
+    mesh.position.set(b.x, b.baseY, b.z);
+    mesh.rotation.y = b.a;
     mesh.userData.buildingId = b.id;
     this.group.add(mesh);
     const th = mesh.rotation.y, co = Math.cos(th), si = Math.sin(th), cx = mesh.position.x, cz = mesh.position.z;
     const t = this.world.terrain;
     const gy = (lx, lz) => t.heightAt(cx + lx * co + lz * si, cz - lx * si + lz * co) - b.baseY;
-    const odd = (b.rot & 1) === 1;
     const site = {
       target: target.geo, old: old ? old.geo : null, box: bodyBox(target.geo), oldBox: old ? bodyBox(old.geo) : null,
-      gy, Ex: (odd ? fd(b) : fw(b)) / 2, Ez: (odd ? fw(b) : fd(b)) / 2, key: '', puff: 0,
+      gy, Ex: b.w / 2, Ez: b.d / 2, key: '', puff: 0,
     };
     const item = { b, mesh, spin: null, smoke: [], glows: [], fountain: null, work: null, site };
     b.work = workArea(b);
@@ -445,7 +442,7 @@ export class WorldView {
       it.site.puff += dt * b._crew * 0.7 * Math.min(3, Math.sqrt(gameDt / Math.max(dt, 1e-4)));
       while (it.site.puff >= 1) {
         it.site.puff -= 1;
-        const px = b.x + Math.random() * fw(b), pz = b.z + Math.random() * fd(b);
+        const [px, pz] = toWorld(ownPlot(b), (Math.random() - 0.5) * b.w, (Math.random() - 0.5) * b.d);
         this.smoke.emit({
           x: px, y: b.baseY + 0.03 + Math.random() * 0.2, z: pz, vx: (Math.random() - 0.5) * 0.15, vy: 0.08, vz: (Math.random() - 0.5) * 0.15,
           drag: 2, wind: 0.3, life: 0.8 + Math.random() * 0.5, size: 0.05, size1: 0.18, r: 0.8, g: 0.74, b: 0.64, alpha: 0.42, alpha1: 0,
@@ -514,8 +511,7 @@ export class WorldView {
         this.fireflyTimer -= 0.08;
         const tg = this.R.rig.target;
         const x = tg.x + (Math.random() - 0.5) * 22, z = tg.z + (Math.random() - 0.5) * 22;
-        const tx = Math.floor(x), tz = Math.floor(z);
-        if (!this.world.inBounds(tx, tz) || !this.world.treeCount[this.world.idx(tx, tz)]) continue;
+        if (!this.world.inBounds(x, z) || !this.world.treesNear(x, z, 0.7).length) continue;
         this.fx.emit({
           x, y: this.world.terrain.heightAt(x, z) + 0.15 + Math.random() * 0.4, z,
           vx: (Math.random() - 0.5) * 0.1, vy: (Math.random() - 0.5) * 0.04, vz: (Math.random() - 0.5) * 0.1,

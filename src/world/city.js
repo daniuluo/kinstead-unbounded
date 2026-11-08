@@ -25,7 +25,8 @@
 // comes from steam. Its options: radius (null: the whole valley), xEvery (the
 // cross streets), workforce, skilled, parks, fill, stopGap.
 
-import { World, capOf, householdCap, isOpen, fw, fd } from './world.js';
+import { World, capOf, householdCap, isOpen } from './world.js';
+const fw = (b) => b.w, fd = (b) => b.d;
 import { BUILDINGS, TECHS, GRAND, servicesOf } from '../defs.js';
 import { stageForAge } from '../sim/people.js';
 import { RNG, hash2 } from '../util/rng.js';

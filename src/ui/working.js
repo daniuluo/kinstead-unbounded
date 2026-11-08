@@ -3,7 +3,8 @@
 // "Working" section with what to do about each problem.
 
 import { BUILDINGS, needsOf, servicesOf } from '../defs.js';
-import { fw, fd, isOpen, capOf } from '../world/world.js';
+import { isOpen, capOf } from '../world/world.js';
+import { streetOf } from '../world/streets.js';
 import { EDU } from '../sim/people.js';
 
 export const BLOCKER_ICON = { road: 'link_off', workers: 'person_off', power: 'power_off', water: 'format_color_reset', priority: 'flag' };
@@ -54,7 +55,7 @@ export class BlockedIcons {
         const site = it.site || !!b.con;
         if (site ? !(b.con && b.con.priority) : !(b.blockers && b.blockers.length)) continue;
         const bb = it.mesh && it.mesh.geometry && it.mesh.geometry.boundingBox;
-        const p = g.renderer.worldToScreen(this.v.set(b.x + fw(b) / 2, b.baseY + (bb ? bb.max.y : 0.7) + 0.12, b.z + fd(b) / 2));
+        const p = g.renderer.worldToScreen(this.v.set(b.x, b.baseY + (bb ? bb.max.y : 0.7) + 0.12, b.z));
         if (p.behind || p.x < -20 || p.y < -20 || p.x > innerWidth + 20 || p.y > innerHeight + 20) continue;
         const all = site ? [['priority', 'prio']] : ORDER.filter(k => b.blockers.includes(k)).map(k => [k, blockerEffect(b, k)]);
         const key = all.map(a => a.join(':')).join(' ');
@@ -140,24 +141,22 @@ export function workingHTML(game, b) {
 }
 
 // Every road tile in town (to bury all the power lines at once).
-export function townRoadTiles(w) {
-  const out = [];
-  for (let z = 0; z < w.N; z++) for (let x = 0; x < w.N; x++) if (w.roadAt(x, z)) out.push([x, z]);
-  return out;
-}
+// every road edge in town (ids)
+export function townRoadTiles(w) { return [...w.roads.edges.keys()]; }
 
-// The power lines along the streets: how many are on poles, and buttons to
-// bury this street's (x, z given: a road panel) or every one in town.
-export function buryHTML(game, x = null, z = null) {
+// The power lines along the streets: how much is on poles, and buttons to
+// bury this street's (e given: a road panel) or every one in town.
+export function buryHTML(game, e = null) {
   const w = game.world;
   if (![...w.buildings.values()].some(b => BUILDINGS[b.type].generator && isOpen(b))) return '';
   const all = townRoadTiles(w);
-  const under = all.filter(([tx, tz]) => w.buried[w.idx(tx, tz)]).length;
+  const len = (list) => list.reduce((s, id) => s + w.roads.edges.get(id).len, 0);
+  const under = len(all.filter(id => w.roads.edges.get(id).buried));
   let h = '<div class="sec"><h5><span class="ms">bolt</span> Power lines</h5>';
-  if (x != null) h += `<div class="row"><span>Along this street</span><b>${w.buried[w.idx(x, z)] ? 'Underground' : 'On poles and wires'}</b></div>`;
-  h += `<div class="row"><span>In town</span><b>${under} of ${all.length} road tiles underground</b></div>`;
+  if (e != null) h += `<div class="row"><span>Along this stretch</span><b>${w.roads.edges.get(e).buried ? 'Underground' : 'On poles and wires'}</b></div>`;
+  h += `<div class="row"><span>In town</span><b>${under.toFixed(0)} of ${len(all).toFixed(0)} units of road underground</b></div>`;
   if (!w.hasTech('cables')) return h + '<div class="note">Research Underground Cables (Power) to bury the lines: no more poles and wires, and prettier streets.</div></div>';
-  const street = x != null ? w.buryCost(w.streetTiles(x, z)) : 0, town = w.buryCost(all);
+  const street = e != null ? w.buryCost(streetOf(w, e)) : 0, town = w.buryCost(all);
   const btn = (scope, label, cost) => `<button class="btn" data-act="bury" data-scope="${scope}" ${w.money >= cost ? '' : 'disabled'}>${label} · $${Math.round(cost).toLocaleString('en-US')}</button>`;
   if (street || town) h += `<div class="actions col">${street ? btn('street', 'Bury the lines along this street', street) : ''}${town ? btn('town', 'Bury every line in town', town) : ''}</div>`;
   else h += '<div class="note">Every line in town is underground.</div>';

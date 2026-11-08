@@ -10,7 +10,9 @@ import { BUILDINGS, produceOf } from '../defs.js';
 import { GeoBuilder } from '../render/geo.js';
 import { RNG } from '../util/rng.js';
 import { workArea } from '../render/buildings.js';
-import { homeField } from '../world/world.js';
+import { homeField, plotOf } from '../world/world.js';
+import { inRect, toLocal, toWorld, grow } from '../world/geom.js';
+import { inArea } from './agents.js';
 
 // speed / run: tiles per second at 1x · walk / idle: seconds · turn: how much
 // the heading wanders (radians per second) · per: habitat tiles per animal
@@ -157,38 +159,35 @@ export class Animals {
   }
 
   // ------------------------------------------------------------ terrain sense
+  // Can animal a stand at (x, z)?
   _tileOk(a, x, z) {
     const w = this.world, t = w.terrain;
-    const tx = Math.floor(x), tz = Math.floor(z);
-    if (!w.inBounds(tx, tz)) return false;
-    const i = w.idx(tx, tz);
+    if (!w.inBounds(x, z) || x < 0.05 || z < 0.05 || x > w.N - 0.05 || z > w.N - 0.05) return false;
     const sp = SPECIES[a.sp];
-    if (sp.swim) return t.tileAvg(tx, tz) < -0.08 && t.heightAt(x, z) < -0.12;
+    if (sp.swim) return t.heightAt(x, z) < -0.12 && t.heightAt(x + 0.3, z) < -0.05 && t.heightAt(x - 0.3, z) < -0.05 && t.heightAt(x, z + 0.3) < -0.05 && t.heightAt(x, z - 0.3) < -0.05;
     if (sp.habitat === 'farm') {
       const f = w.buildings.get(a.farm);
       if (!f) return false;
       // its farmland (its own field behind the yard, and its fields), clear
       // of the fence round it; an orchard's hens keep to the orchard
-      const home = homeField(f), land = (nx, nz) => w.inBounds(nx, nz) && (w.fields[w.idx(nx, nz)] === f.id || home.some(([hx, hz]) => hx === nx && hz === nz));
-      if (!land(tx, tz)) {
+      const land = [homeField(f), ...w.fieldsOf(f.id).map(q => q.rect)].filter(Boolean);
+      if (!land.some(R => inRect(R, x, z))) {
         const r = f.work || (f.work = workArea(f));
-        return !!r && w.buildingAt[i] === f.id && x > r[0] + 0.03 && x < r[2] - 0.03 && z > r[1] + 0.03 && z < r[3] - 0.03;
+        if (!r) return false;
+        const [lx, lz] = r[4] ? toLocal(r[4], x, z) : [x, z];
+        return lx > r[0] + 0.03 && lx < r[2] - 0.03 && lz > r[1] + 0.03 && lz < r[3] - 0.03;
       }
-      const fx = x - tx, fz = z - tz, M = 0.08, mine = land;
-      return (fx > M || mine(tx - 1, tz)) && (fx < 1 - M || mine(tx + 1, tz)) && (fz > M || mine(tx, tz - 1)) && (fz < 1 - M || mine(tx, tz + 1));
+      // (inside the fence: within its field, or across into the next)
+      return land.some(R => inRect(R, x, z, -0.08)) || land.filter(R => inRect(R, x, z, 0.02)).length > 1;
     }
-    if (t.isWater(tx, tz) || t.heightAt(x, z) < 0.05) return false;
-    if (w.buildingAt[i] >= 0 || w.rails[i]) return false;
-    if (w.roads[i] && !a.crossing) return false;
-    if (t.slope(tx, tz) > 0.95) return false;
-    // keep clear of walls and fences on neighbouring plots
-    const fx = x - tx, fz = z - tz, M = 0.16;
-    const blocked = (nx, nz) => w.inBounds(nx, nz) && w.buildingAt[w.idx(nx, nz)] >= 0;
-    if (fx < M && blocked(tx - 1, tz)) return false;
-    if (fx > 1 - M && blocked(tx + 1, tz)) return false;
-    if (fz < M && blocked(tx, tz - 1)) return false;
-    if (fz > 1 - M && blocked(tx, tz + 1)) return false;
-    return true;
+    if (w.waterAt(x, z) || t.heightAt(x, z) < 0.05) return false;
+    if (w.railAt(x, z, 0.08) || w.fieldAt(x, z)) return false;
+    if (w.roadAt(x, z, 0.05) && !a.crossing) return false;
+    // keep clear of plots, their walls and fences
+    for (const b of w.plots.near(x, z, 0.2)) if (inRect(plotOf(b), x, z, 0.16)) return false;
+    // not on a cliff
+    const s = Math.abs(t.heightAt(x + 0.25, z) - t.heightAt(x - 0.25, z)) + Math.abs(t.heightAt(x, z + 0.25) - t.heightAt(x, z - 0.25));
+    return s < 0.95;
   }
 
   // Is the straight walk from a to (x, z) clear? Returns 'road' if it crosses one.
@@ -199,8 +198,7 @@ export class Animals {
     const w = this.world;
     for (let k = 1; k <= n; k++) {
       const px = a.x + (dx * k) / n, pz = a.z + (dz * k) / n;
-      const tx = Math.floor(px), tz = Math.floor(pz);
-      if (w.inBounds(tx, tz) && w.roads[w.idx(tx, tz)] && SPECIES[a.sp].habitat !== 'farm' && !SPECIES[a.sp].swim) {
+      if (w.roadAt(px, pz, 0.05) && SPECIES[a.sp].habitat !== 'farm' && !SPECIES[a.sp].swim) {
         road = true;
         const saved = a.crossing; a.crossing = true;
         const ok = this._tileOk(a, px, pz);
@@ -224,15 +222,12 @@ export class Animals {
       } else if (sp.habitat === 'farm') {
         const f = w.buildings.get(a.farm);
         if (!f || !f.work) return false;
-        const q = f.work, fields = w.fieldTiles && w.fieldTiles.get(f.id);
-        if (fields && fields.length && r.next() < 0.6) {
+        const q = f.work, fields = w.fieldsOf(f.id);
+        if (fields.length && r.next() < 0.6) {
           // wander out into the fields
-          const ti = fields[(r.next() * fields.length) | 0];
-          x = (ti % w.N) + 0.12 + r.next() * 0.76; z = ((ti / w.N) | 0) + 0.12 + r.next() * 0.76;
-        } else {
-          x = q[0] + 0.05 + r.next() * (q[2] - q[0] - 0.1);
-          z = q[1] + 0.05 + r.next() * (q[3] - q[1] - 0.1);
-        }
+          const F = fields[(r.next() * fields.length) | 0];
+          [x, z] = toWorld(F.rect, (r.next() - 0.5) * 0.76, (r.next() - 0.5) * 0.76);
+        } else [x, z] = inArea(q, q[0] + 0.05 + r.next() * (q[2] - q[0] - 0.1), q[1] + 0.05 + r.next() * (q[3] - q[1] - 0.1));
         if (Math.hypot(x - a.x, z - a.z) > 0.9) { const k = 0.9 / Math.hypot(x - a.x, z - a.z); x = a.x + (x - a.x) * k; z = a.z + (z - a.z) * k; }
       } else {
         const ang = r.next() * Math.PI * 2, d = 0.4 + r.next() * sp.range;
@@ -252,28 +247,18 @@ export class Animals {
     return false;
   }
 
-  _nearTrees(x, z) {
-    const w = this.world, tx = Math.floor(x), tz = Math.floor(z);
-    for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
-      if (w.inBounds(tx + dx, tz + dz) && w.treeCount[w.idx(tx + dx, tz + dz)]) return true;
-    }
-    return false;
-  }
+  _nearTrees(x, z) { return this.world.treeIx.near(x, z, 1.2).length > 0; }
 
   // ------------------------------------------------------------ population
   _habitats() {
     const w = this.world, t = w.terrain, N = w.N;
     const forest = [], meadow = [], water = [];
+    // (a unit square of ground at a time: wild land well away from the town)
     for (let z = 0; z < N; z++) for (let x = 0; x < N; x++) {
-      const i = w.idx(x, z);
       if (t.isWater(x, z)) { if (t.tileAvg(x, z) < -0.15) water.push([x, z]); continue; }
-      if (w.buildingAt[i] >= 0 || w.roads[i] || w.rails[i] || t.slope(x, z) > 0.7) continue;
-      let near = false;
-      for (let dz = -2; dz <= 2 && !near; dz++) for (let dx = -2; dx <= 2; dx++) {
-        if (w.inBounds(x + dx, z + dz) && w.buildingAt[w.idx(x + dx, z + dz)] >= 0) { near = true; break; }
-      }
-      if (near) continue;
-      if (w.treeCount[i]) forest.push([x, z]);
+      const cx = x + 0.5, cz = z + 0.5;
+      if (t.slope(x, z) > 0.7 || w.roadAt(cx, cz, 0.4) || w.railAt(cx, cz, 0.4) || w.plots.near(cx, cz, 2).length) continue;
+      if (w.treeIx.near(cx, cz, 0.5).length) forest.push([x, z]);
       else if (t.tileAvg(x, z) > 0.2 && t.tileAvg(x, z) < 2) meadow.push([x, z]);
     }
     return { forest, meadow, water };
@@ -341,11 +326,11 @@ export class Animals {
         for (let k = h[sp]; k < wn[sp]; k++) {
           for (let t = 0; t < 6; t++) {
             // in the farm's own field, or out in one of the others
-            const fields = w.fieldTiles && w.fieldTiles.get(id);
-            if (fields && fields.length && r.next() < 0.6) {
-              const ti = fields[(r.next() * fields.length) | 0];
-              if (this._spawn(sp, (ti % w.N) + 0.15 + r.next() * 0.7, ((ti / w.N) | 0) + 0.15 + r.next() * 0.7, { farm: id })) break;
-            } else if (this._spawn(sp, q[0] + 0.1 + r.next() * (q[2] - q[0] - 0.2), q[1] + 0.1 + r.next() * (q[3] - q[1] - 0.2), { farm: id })) break;
+            const fields = w.fieldsOf(id);
+            if (fields.length && r.next() < 0.6) {
+              const F = fields[(r.next() * fields.length) | 0];
+              if (this._spawn(sp, ...toWorld(F.rect, (r.next() - 0.5) * 0.7, (r.next() - 0.5) * 0.7), { farm: id })) break;
+            } else if (this._spawn(sp, ...inArea(q, q[0] + 0.1 + r.next() * (q[2] - q[0] - 0.2), q[1] + 0.1 + r.next() * (q[3] - q[1] - 0.2)), { farm: id })) break;
           }
         }
       }
@@ -487,7 +472,7 @@ export class Animals {
     a.t = t ?? sp.idle[0] + this.rng.next() * (sp.idle[1] - sp.idle[0]);
     // never stop in the middle of a road: finish crossing first
     const w = this.world, tx = Math.floor(a.x), tz = Math.floor(a.z);
-    if (a.crossing && w.inBounds(tx, tz) && w.roads[w.idx(tx, tz)]) { a.state = 'walk'; a.t = 1.5; return; }
+    if (a.crossing && w.roadAt(a.x, a.z, 0.05)) { a.state = 'walk'; a.t = 1.5; return; }
     a.crossing = false;
   }
 

@@ -4,7 +4,9 @@
 // actual town, and picking one shows that town behind the window.
 
 import { STARTERS, loadStarter, starterSummary, starterGrown } from '../world/starters.js';
-import { World, fw, fd } from '../world/world.js';
+import { World, plotOf } from '../world/world.js';
+import { aabbOf } from '../world/geom.js';
+import { drawNets, fillPlot } from './mapDraw.js';
 import { BUILDINGS } from '../defs.js';
 import { CONFIG } from '../config.js';
 
@@ -105,8 +107,9 @@ export function drawTownMap(canvas, w) {
   // frame the buildings, with a margin, at the canvas's shape
   let x0 = N, z0 = N, x1 = 0, z1 = 0;
   for (const b of w.buildings.values()) {
-    x0 = Math.min(x0, b.x); z0 = Math.min(z0, b.z);
-    x1 = Math.max(x1, b.x + fw(b)); z1 = Math.max(z1, b.z + fd(b));
+    const [ax, az, bx, bz] = aabbOf(plotOf(b));
+    x0 = Math.min(x0, ax); z0 = Math.min(z0, az);
+    x1 = Math.max(x1, bx); z1 = Math.max(z1, bz);
   }
   if (x0 > x1) { x0 = z0 = 0; x1 = z1 = N; }
   const ar = canvas.width / canvas.height;
@@ -132,28 +135,18 @@ export function drawTownMap(canvas, w) {
       }
       g.fillStyle = col;
       g.fillRect(x, z, 1.02, 1.02);
-      const trees = w.treeCount[w.idx(x, z)];
-      if (trees && !t.isWater(x, z)) {
-        g.fillStyle = 'rgba(38,82,40,0.9)';
-        g.fillRect(x + 0.2, z + 0.2, 0.6, 0.6);
-        if (trees > 1) g.fillRect(x + 0.05, z + 0.55, 0.4, 0.4);
-      }
-      const r = w.roads[w.idx(x, z)];
-      if (r) {
-        g.fillStyle = t.isWater(x, z) ? '#8a6a40' : ROAD[r] || ROAD[1];
-        g.fillRect(x, z, 1.02, 1.02);
-      }
     }
   }
-  // buildings: a coloured roof with a darker rim
+  // the woods: a dark dot for each tree
+  g.fillStyle = 'rgba(38,82,40,0.9)';
+  for (const tr of w.trees) if (tr.x >= cx - 1 && tr.x <= cx + cw + 1 && tr.z >= cz - 1 && tr.z <= cz + ch + 1) g.fillRect(tr.x - 0.17, tr.z - 0.17, 0.34, 0.34);
+  // the roads as they run, and the buildings: a coloured roof with a darker rim
+  drawNets(g, w, ROAD);
   for (const b of w.buildings.values()) {
     const def = BUILDINGS[b.type];
     const col = def.seat ? '#7d4cb0' : def.outdoorWork ? '#d9c467' : CAT[def.cat] || '#999';
-    const W = fw(b), D = fd(b);
-    g.fillStyle = 'rgba(40,30,20,0.55)';
-    g.fillRect(b.x + 0.08, b.z + 0.08, W - 0.16, D - 0.16);
-    g.fillStyle = col;
-    g.fillRect(b.x + 0.18, b.z + 0.18, W - 0.36, D - 0.36);
+    fillPlot(g, b, 'rgba(40,30,20,0.55)', 0.08);
+    fillPlot(g, b, col, 0.18);
   }
   g.setTransform(1, 0, 0, 1, 0, 0);
 }

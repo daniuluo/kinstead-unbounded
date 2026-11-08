@@ -7,7 +7,7 @@ import { Renderer } from './render/renderer.js';
 import { Sky, daylightHour } from './render/sky.js';
 import { WorldView } from './render/worldView.js';
 import { Particles } from './render/particles.js';
-import { World, fw, fd } from './world/world.js';
+import { World, plotOf } from './world/world.js';
 import { growDemoTown } from './world/demo.js';
 import { loadStarter } from './world/starters.js';
 import { PathFinder } from './sim/path.js';
@@ -188,7 +188,7 @@ export class Game {
     this.renderer.setBounds(world.N);
     this.renderer.groundAt = (x, z) => world.terrain.heightAt(x, z);
     let focus = { x: world.N / 2, z: world.N / 2 };
-    for (const b of world.buildings.values()) if (BUILDINGS[b.type].seat) focus = { x: b.x + fw(b) / 2, z: b.z + fd(b) / 2 };
+    for (const b of world.buildings.values()) if (BUILDINGS[b.type].seat) focus = { x: b.x, z: b.z };
     this.renderer.lookAt(focus.x, focus.z, true);
     this._demoFocus = focus;
     this.renderer.rig.zoom = this.renderer.rig.zoomT = demo ? 1.25 : 1.7;
@@ -393,7 +393,7 @@ export class Game {
     this.sfx('fanfare');
     let at = null;
     for (const b of this.world.buildings.values()) if (BUILDINGS[b.type].seat) at = b;
-    const x = at ? at.x + fw(at) / 2 : this.renderer.rig.target.x, z = at ? at.z + fd(at) / 2 : this.renderer.rig.target.z;
+    const x = at ? at.x : this.renderer.rig.target.x, z = at ? at.z : this.renderer.rig.target.z;
     this.view.fireworks(x, at ? at.baseY : 1, z);
   }
 
@@ -539,17 +539,17 @@ export class Game {
       const col = SERVICES[mode].color;
       ov.setMap(sim.coverage[mode], (v, x, z) => (v ? [col, w.terrain.isWater(x, z) ? 0.12 : 0.34] : null));
     } else if (mode === 'happiness') {
-      const vals = new Float32Array(N * N).fill(-1);
+      // each home's own plot, in its colour
+      const c = new THREE.Color(), a = new THREE.Color('#e0533d'), m = new THREE.Color('#e8c84a'), g = new THREE.Color('#5fbf4e');
+      const shapes = [];
       for (const b of w.buildings.values()) {
         if (!BUILDINGS[b.type].levels[b.level].housing) continue;
-        vals[w.idx(b.x, b.z)] = b.happiness / 100;
-      }
-      const c = new THREE.Color(), a = new THREE.Color('#e0533d'), m = new THREE.Color('#e8c84a'), g = new THREE.Color('#5fbf4e');
-      ov.setMap(vals, (v) => {
-        if (v < 0) return null;
+        const v = b.happiness / 100;
         if (v < 0.5) c.copy(a).lerp(m, v * 2); else c.copy(m).lerp(g, (v - 0.5) * 2);
-        return ['#' + c.getHexString(), 0.6];
-      });
+        shapes.push({ pts: plotOf(b).pts, color: '#' + c.getHexString(), alpha: 0.6, border: false, y: b.baseY + 0.04 });
+      }
+      ov.setMapShapes(shapes);
+      void N;
     } else if (mode === 'appeal') {
       ov.setMap(sim.appeal, (v) => (v > 0.5 ? ['#3fae4e', Math.min(0.6, v / 25)] : null));
     } else if (mode === 'pollution') {

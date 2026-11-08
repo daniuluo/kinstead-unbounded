@@ -7,9 +7,10 @@ import { CONFIG } from '../config.js';
 import { MAT } from './materials.js';
 import { BUILDINGS, produceOf } from '../defs.js';
 import { makeNoise2D, fbm, hash2, clamp, smoothstep } from '../util/rng.js';
-import { doorPoint, fw, fd, farmlandOf } from '../world/world.js';
-import { railArc } from './roadsView.js';
-import { roadTile, cornerFrame, SIDES, CORNERS, diagLinked, cutsOf } from '../world/roadShape.js';
+import { doorPoint, farmlandOf, plotOf, ownPlot, HALF } from '../world/world.js';
+import { aabbOf, toLocal, rectDist } from '../world/geom.js';
+import { primsIn, fieldAt } from '../world/streets.js';
+import { roadSquares } from './roadsView.js';
 
 export const SUB = 5;
 const BASE_Y = -2.2;
@@ -172,11 +173,13 @@ export class TerrainView {
       this._areas = new Map();
       for (const b of w.buildings.values()) this._areas.set(b.id, TerrainView.areaOf(b));
     }
-    // smooth tree-density field at tile corners
+    // smooth tree-density field at the corners of each unit square
+    const count = new Uint8Array(N * N);
+    for (const tr of w.trees) { const tx = Math.floor(tr.x), tz = Math.floor(tr.z); if (tx >= 0 && tz >= 0 && tx < N && tz < N && count[tz * N + tx] < 255) count[tz * N + tx]++; }
     const forest = new Float32Array((N + 1) * (N + 1));
     for (let z = 0; z <= N; z++) for (let x = 0; x <= N; x++) {
       let s = 0;
-      for (const [dx, dz] of [[-1, -1], [0, -1], [-1, 0], [0, 0]]) { const tx = x + dx, tz = z + dz; if (w.inBounds(tx, tz)) s += Math.min(3, w.treeCount[w.idx(tx, tz)]); }
+      for (const [dx, dz] of [[-1, -1], [0, -1], [-1, 0], [0, 0]]) { const tx = x + dx, tz = z + dz; if (tx >= 0 && tz >= 0 && tx < N && tz < N) s += Math.min(3, count[tz * N + tx]); }
       forest[z * (N + 1) + x] = s / 4;
     }
     const forestAt = (x, z) => {
@@ -222,8 +225,8 @@ export class TerrainView {
   }
 
   // Where a building paints the ground (its yard and the path from its
-  // door to the street), in tiles, as it stands now.
-  static areaOf(b) { const M = 2; return [b.x - M, b.z - M, b.x + fw(b) + M, b.z + fd(b) + M]; }
+  // door to the street), as it stands now: [x0, z0, x1, z1].
+  static areaOf(b) { return aabbOf(plotOf(b), 2); }
 
   // A building has come, gone or changed: the ground where it stood and
   // where it stands now wants repainting (see repaintPending).
@@ -289,23 +292,26 @@ export class TerrainView {
   // the plot, furrowed as one in the farm's frame, with soft edges where it
   // meets anything else (the yard too).
   _paintFields() {
-    const w = this.world, N = w.N, season = this.season;
+    const w = this.world, season = this.season;
     for (const farm of w.buildings.values()) {
       if (!BUILDINGS[farm.type].fields) continue;
       const land = farmlandOf(w, farm);
-      if (!land.size) continue;
-      const P = produceOf(farm), th = (farm.rot * Math.PI) / 2, co = Math.cos(th), si = Math.sin(th);
-      const cx = farm.x + fw(farm) / 2, cz = farm.z + fd(farm) / 2;
-      for (const t of land) {
-        const x = t % N, z = (t / N) | 0;
-        const same = (dx, dz) => w.inBounds(x + dx, z + dz) && land.has((z + dz) * N + x + dx);
-        const W = !same(-1, 0), Eo = !same(1, 0), Nn = !same(0, -1), S = !same(0, 1);
-        this._range(x - (W ? 0.08 : 0), z - (Nn ? 0.08 : 0), x + 1 + (Eo ? 0.08 : 0), z + 1 + (S ? 0.08 : 0), (vi, px, pz, i, j) => {
-          if ((!W && px < x) || (!Eo && px > x + 1) || (!Nn && pz < z) || (!S && pz > z + 1)) return;
-          const edge = Math.min(W ? px - x : 9, Eo ? x + 1 - px : 9, Nn ? pz - z : 9, S ? z + 1 - pz : 9);
-          const a = smoothstep(-0.04, 0.12, edge);
-          const dx = px - cx, dz = pz - cz;
-          this._fieldPaint(vi, i, j, P, season, dx * co - dz * si, dx * si + dz * co, 1, a);
+      if (!land.length) continue;
+      const P = produceOf(farm), F = ownPlot(farm);
+      // (each point once, however many of the farm's fields it is near: soft
+      // only at the edge of the farmland as a whole)
+      const done = new Set();
+      for (const R of land) {
+        const [x0, z0, x1, z1] = aabbOf(R, 0.1);
+        this._range(x0, z0, x1, z1, (vi, px, pz, i, j) => {
+          if (done.has(vi)) return;
+          let out = Infinity;
+          for (const Q of land) { out = Math.min(out, rectDist(Q, px, pz)); if (!out) break; }
+          if (out > 0.1) return;
+          done.add(vi);
+          const a = smoothstep(0.1, -0.02, out);
+          const [lx, lz] = toLocal(F, px, pz);
+          this._fieldPaint(vi, i, j, P, season, lx, lz, 1, a);
         });
       }
     }
@@ -333,19 +339,14 @@ export class TerrainView {
     const bare = (season === 3 ? 1 - sw : 0) + (next === 3 ? sw : 0);
     for (const b of w.buildings.values()) {
       const def = BUILDINGS[b.type];
-      const odd = (b.rot & 1) === 1;
-      const Ex = (odd ? fd(b) : fw(b)) / 2, Ez = (odd ? fw(b) : fd(b)) / 2, E = Math.max(Ex, Ez);
-      const cx = b.x + fw(b) / 2, cz = b.z + fd(b) / 2;
-      const th = (b.rot * Math.PI) / 2, co = Math.cos(th), si = Math.sin(th);
-      const work = b.work;
+      const R = plotOf(b), Ex = R.hw, Ez = R.hd;
       const kind = b.con && b.con.kind !== 'upgrade' ? 'packed' : def.ground ? def.ground : def.fields && !def.fruit ? 'farm' : b.type === 'plaza' ? 'plaza'
         : (b.type === 'lumber' || b.type === 'workshop') ? 'packed'
           : (def.park && b.type !== 'plaza') ? 'lawn'
             : (b.type === 'station' || b.type === 'coachstop' || def.seat) ? 'stone' : 'yard';
-      const M = 0.14;
-      this._range(b.x - M, b.z - M, b.x + fw(b) + M, b.z + fd(b) + M, (vi, x, z, i, j) => {
-        const dx = x - cx, dz = z - cz;
-        const lx = dx * co - dz * si, lz = dx * si + dz * co;
+      const [ax0, az0, ax1, az1] = aabbOf(R, 0.14);
+      this._range(ax0, az0, ax1, az1, (vi, x, z, i, j) => {
+        const [lx, lz] = toLocal(R, x, z);
         const edge = Math.min(Ex - Math.abs(lx), Ez - Math.abs(lz));
         const nz = this.n3(x * 2.3, z * 2.3) * 0.06;
         let a;
@@ -374,7 +375,7 @@ export class TerrainView {
       // worn footpath from the door to the road
       if (b.access) {
         const d = doorPoint(b);
-        const ax = b.access.x + 0.5 - d.x, az = b.access.z + 0.5 - d.z;
+        const ax = b.access.x - d.x, az = b.access.z - d.z;
         const len = Math.hypot(ax, az) || 1, ux = ax / len, uz = az / len;
         const p0x = d.x - ux * 0.28, p0z = d.z - uz * 0.28, p1x = d.x + ux * 0.32, p1z = d.z + uz * 0.32;
         const stone = b.level >= 1 && kind !== 'yard';
@@ -388,60 +389,31 @@ export class TerrainView {
     }
   }
 
-  // Road / rail skeleton for one tile: segments from a (gently wobbling)
-  // centre to each linked edge, so paths meander instead of ruling straight lines.
-  // cut: sides not to link across (a boulevard's median, as world.blvd bits).
-  _arms(x, z, grid, amp = 0, cut = 0) {
-    const w = this.world, N = w.N;
-    const j = (px, pz) => this.n2(px * 0.9 + 7.3, pz * 0.9 - 2.1) * amp;
-    const cx = x + 0.5 + j(x + 0.5, z + 0.5), cz = z + 0.5 + j(z + 0.5, x + 0.5);
-    const segs = [];
-    for (const [dx, dz, bit] of [[1, 0, 2], [-1, 0, 8], [0, 1, 4], [0, -1, 1]]) {
-      const nx = x + dx, nz = z + dz;
-      const linked = (nx >= 0 && nz >= 0 && nx < N && nz < N) ? grid[nz * N + nx] : (grid === w.roads && x === w.entry.x && z === w.entry.z);
-      if (!linked || (cut & bit)) continue;
-      const mx = x + 0.5 + dx * 0.5, mz = z + 0.5 + dz * 0.5;
-      const off = j(mx, mz);
-      segs.push([cx, cz, mx + (dz ? off : 0), mz + (dx ? off : 0)]);
-    }
-    // diagonal streets: straight on to the corner the next tile shares (no
-    // wobble there, so both halves meet)
-    if (grid === w.roads && w.diagN) for (let k = 0; k < 4; k++) if (diagLinked(w, x, z, k)) segs.push([cx, cz, x + 0.5 + CORNERS[k][0] * 0.5, z + 0.5 + CORNERS[k][1] * 0.5]);
-    if (!segs.length) segs.push([cx, cz, cx, cz]);
-    return segs;
-  }
-
   _paintRoads() {
-    const w = this.world, N = w.N, t = w.terrain;
+    const w = this.world, t = w.terrain;
     const V = this.V, clip = this._clip || [0, V - 1, 0, V - 1];
     if (!this._cov || this._cov.length !== V * V) { this._cov = new Float32Array(V * V); this._lvl = new Uint8Array(V * V); this._dn = new Float32Array(V * V); }
     const cov = this._cov, lvl = this._lvl, dn = this._dn;
     for (let j = clip[2]; j <= clip[3]; j++) cov.fill(0, j * V + clip[0], j * V + clip[1] + 1);
     const HW = [0, 0.2, 0.27, 0.32], SOFT = [0, 0.05, 0.035, 0.028];
-    // the road tiles whose paint reaches the part being repainted
-    const ti0 = Math.floor(clip[0] / SUB - 1.45), ti1 = Math.ceil(clip[1] / SUB + 0.45), tj0 = Math.floor(clip[2] / SUB - 1.45), tj1 = Math.ceil(clip[3] / SUB + 0.45);
-    for (let z = Math.max(0, tj0 - 1); z < Math.min(N, tj1 + 2); z++) for (let x = Math.max(0, ti0 - 1); x < Math.min(N, ti1 + 2); x++) {
-      const L = w.roads[z * N + x];
-      if (!L) continue;
-      // follow the road's own shape: round a bend, and filled in where two
-      // arms meet (see roadShape.js)
-      const shape = roadTile(w, x, z);
-      let segs;
-      if (shape && shape.bend >= 0) {
-        const arc = railArc(x, z, [SIDES[shape.bend], SIDES[(shape.bend + 1) & 3]]);
-        segs = [];
-        for (let k = 0; k < arc.length - 1; k++) segs.push([arc[k][0], arc[k][1], arc[k + 1][0], arc[k + 1][1]]);
-      } else segs = this._arms(x, z, w.roads, L === 3 ? 0.02 : 0.07, (w.blvd ? w.blvd[z * N + x] : 0) | cutsOf(w, x, z));
-      const corners = shape ? shape.fillets.map(k => cornerFrame(x, z, k)) : [];
-      const hw = HW[L], sf = SOFT[L];
-      this._range(x - 0.45, z - 0.45, x + 1.45, z + 1.45, (vi, px, pz) => {
-        let d = 9;
-        for (const s of segs) { const dd = segDist(px, pz, s[0], s[1], s[2], s[3]); if (dd < d) d = dd; }
-        // in a filled corner the edge is a quarter circle round the tile corner
-        for (const f of corners) {
-          const u = (px - f.Kx) * f.ux + (pz - f.Kz) * f.uz, v = (px - f.Kx) * f.vx + (pz - f.Kz) * f.vz;
-          if (u >= 0 && v >= 0 && u <= 0.5 && v <= 0.5) d = Math.min(d, Math.max(0, 0.5 - Math.hypot(u, v)));
-        }
+    // the unit squares a road reaches (and those round them, where its
+    // shoulder is), in the part being repainted: the road's own field there,
+    // as wide as each level's painted shoulder
+    const x0 = clip[0] / SUB, x1 = clip[1] / SUB, z0 = clip[2] / SUB, z1 = clip[3] / SUB;
+    const squares = new Set();
+    for (const k of roadSquares(w)) {
+      const x = k % 65536, z = Math.floor(k / 65536);
+      if (x + 1.5 < x0 || x - 0.5 > x1 || z + 1.5 < z0 || z - 0.5 > z1) continue;
+      for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) squares.add((z + dz) * 65536 + x + dx);
+    }
+    for (const k of squares) {
+      const x = k % 65536, z = Math.floor(k / 65536);
+      const prims = primsIn(w, [x, z, x + 1, z + 1], 0.5);
+      if (!prims.length) continue;
+      this._range(x, z, x + 1, z + 1, (vi, px, pz) => {
+        const [f, L] = fieldAt(prims, px, pz);
+        if (!L) return;
+        const hw = HW[L], sf = SOFT[L], d = f + HALF[L];
         if (d > hw + sf * 2 + 0.1) return;
         const rough = L === 1 ? this.n3(px * 3.1, pz * 3.1) * 0.06 + this.n1(px * 9, pz * 9) * 0.025 : this.n3(px * 5, pz * 5) * 0.012;
         const c = 1 - smoothstep(hw - sf, hw + sf, d + rough);
@@ -474,21 +446,19 @@ export class TerrainView {
   }
 
   _paintRails() {
-    const w = this.world, N = w.N;
-    for (let z = 0; z < N; z++) for (let x = 0; x < N; x++) {
-      if (!w.rails[z * N + x] || w.terrain.isWater(x, z)) continue;
-      let segs = this._arms(x, z, w.rails);
-      const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]].filter(([dx, dz]) => w.railAt(x + dx, z + dz));
-      const arc = railArc(x, z, dirs);
-      if (arc) { segs = []; for (let k = 0; k < arc.length - 1; k++) segs.push([arc[k][0], arc[k][1], arc[k + 1][0], arc[k + 1][1]]); }
-      const onRoad = !!w.roads[z * N + x];
-      this._range(x - 0.4, z - 0.4, x + 1.4, z + 1.4, (vi, px, pz, i, j) => {
+    const w = this.world;
+    const done = new Set();
+    for (const e of w.rails.edges.values()) for (let k = 0; k + 1 < e.pts.length; k++) {
+      const [ax, az] = e.pts[k], [bx, bz] = e.pts[k + 1];
+      this._range(Math.min(ax, bx) - 0.3, Math.min(az, bz) - 0.3, Math.max(ax, bx) + 0.3, Math.max(az, bz) + 0.3, (vi, px, pz, i, j) => {
+        if (done.has(vi) || w.waterAt(px, pz)) return;
         let d = 9;
-        for (const s of segs) { const dd = segDist(px, pz, s[0], s[1], s[2], s[3]); if (dd < d) d = dd; }
+        for (const sg of w.rails.segsIn([px - 0.3, pz - 0.3, px + 0.3, pz + 0.3])) { const p = sg.e.pts[sg.i], q = sg.e.pts[sg.i + 1]; d = Math.min(d, segDist(px, pz, p[0], p[1], q[0], q[1])); }
         const a = 1 - smoothstep(0.17, 0.24, d + this.n3(px * 4, pz * 4) * 0.02);
         if (a <= 0) return;
+        done.add(vi);
         _b.copy(GRAVEL[hash2(i, j, 8) < 0.5 ? 0 : 1]);
-        this._blend(vi, _b, a * (onRoad ? 0.5 : 0.95), 0.6);
+        this._blend(vi, _b, a * (w.roadAt(px, pz, 0.05) ? 0.5 : 0.95), 0.6);
       });
     }
   }

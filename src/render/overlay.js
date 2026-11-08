@@ -1,4 +1,6 @@
-// Tile overlays that hug the terrain: cursor / placement preview and data maps.
+// Overlays that hug the terrain: the cursor and placement previews (plots
+// as the rectangles they are, at any angle; roads as ribbons along their
+// curves; round brushes), other players' pointers, and data maps.
 
 import * as THREE from 'three';
 import { bridgeDeckY } from '../world/world.js';
@@ -26,64 +28,93 @@ export class Overlay {
     this._c = new THREE.Color();
   }
 
-  _tileQuad(pos, col, x, z, color, alpha, lift = 0.07, inset = 0, yOverride = null) {
-    const t = this.world.terrain;
-    const w = this.world;
-    const h = (cx, cz) => {
-      if (yOverride !== null) return yOverride;
-      return t.ch(cx, cz) + lift;
-    };
-    let base = null;
-    if (w.inBounds(x, z)) {
-      const b = w.buildingOn(x, z);
-      if (b) base = b.baseY + 0.04;
-      else if (w.roads[w.idx(x, z)] && t.isWater(x, z)) base = bridgeDeckY() + 0.03;
-      else if (t.isWater(x, z)) base = Math.max(t.tileMax(x, z), 0.02) + 0.02;
-    }
-    const y = (cx, cz) => (base !== null ? base : h(cx, cz));
-    const x0 = x + inset, x1 = x + 1 - inset, z0 = z + inset, z1 = z + 1 - inset;
-    const p = [[x0, y(x, z), z0], [x0, y(x, z + 1), z1], [x1, y(x + 1, z + 1), z1], [x0, y(x, z), z0], [x1, y(x + 1, z + 1), z1], [x1, y(x + 1, z), z0]];
-    for (const v of p) { pos.push(v[0], v[1], v[2]); col.push(color.r, color.g, color.b, alpha); }
+  // The height an overlay lies at over (x, z): on the ground (or the
+  // water, a bridge's deck), lift above it; y: a height of its own (a plot
+  // drawn at its building's floor).
+  _y(x, z, lift, y = null) {
+    if (y != null) return y;
+    const w = this.world, t = w.terrain;
+    const r = w.roadHeight(x, z);
+    if (r != null) return r + lift - 0.03;
+    if (w.waterAt(x, z)) return Math.max(t.heightAt(x, z), 0.02) + 0.02;
+    return t.heightAt(x, z) + lift;
   }
 
-  // tiles: [{x, z, color, alpha, border}]
-  setCursor(tiles) { this._tiles(this.cursor, tiles); }
+  // A four-cornered patch (corners in order round it), split into small
+  // cells so it follows the ground.
+  _patch(pos, col, P, color, alpha, lift, y, fine = 0.25) {
+    const L = Math.max(Math.hypot(P[1][0] - P[0][0], P[1][1] - P[0][1]), Math.hypot(P[2][0] - P[1][0], P[2][1] - P[1][1]));
+    const n = Math.max(1, Math.min(24, Math.ceil(L / fine)));
+    const at = (u, v) => {
+      const ax = P[0][0] + (P[1][0] - P[0][0]) * u, az = P[0][1] + (P[1][1] - P[0][1]) * u;
+      const bx = P[3][0] + (P[2][0] - P[3][0]) * u, bz = P[3][1] + (P[2][1] - P[3][1]) * u;
+      const x = ax + (bx - ax) * v, z = az + (bz - az) * v;
+      return [x, this._y(x, z, lift, y), z];
+    };
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+      const a = at(i / n, j / n), b = at((i + 1) / n, j / n), c = at((i + 1) / n, (j + 1) / n), d = at(i / n, (j + 1) / n);
+      for (const v of [a, b, c, a, c, d]) { pos.push(v[0], v[1], v[2]); col.push(color.r, color.g, color.b, alpha); }
+    }
+  }
+  // A band along a line, half wide either side of it.
+  _band(pos, col, line, half, color, alpha, lift, y) {
+    for (let i = 0; i + 1 < line.length; i++) {
+      const [ax, az] = line[i], [bx, bz] = line[i + 1], L = Math.hypot(bx - ax, bz - az);
+      if (L < 1e-6) continue;
+      const nx = (-(bz - az) / L) * half, nz = ((bx - ax) / L) * half;
+      this._patch(pos, col, [[ax - nx, az - nz], [bx - nx, bz - nz], [bx + nx, bz + nz], [ax + nx, az + nz]], color, alpha, lift, y);
+    }
+  }
 
-  // Other players' pointers and selections in multiplayer (same tiles, own layer).
-  setRemote(tiles) { this._tiles(this.remote, tiles); }
+  // What to draw: [{ pts: [[x, z] x 4] (a plot), color, alpha, border, y }],
+  // [{ line: [[x, z]...], width, color, alpha }] (a road, or a stroke being
+  // drawn), [{ x, z, r }] (a round brush), or [{ x, z }] (a unit square).
+  setCursor(shapes) { this._shapes(this.cursor, shapes); }
 
-  _tiles(mesh, tiles) {
+  // Shapes on the data map's layer (a home's plot in the colour of its happiness).
+  setMapShapes(shapes) { this._shapes(this.map, shapes); }
+
+  // Other players' pointers and selections in multiplayer (the same shapes, own layer).
+  setRemote(shapes) { this._shapes(this.remote, shapes); }
+
+  _shapes(mesh, shapes) {
     const pos = [], col = [];
     const c = this._c;
-    for (const tl of tiles) {
-      if (!this.world.inBounds(tl.x, tl.z)) continue;
-      c.set(tl.color);
-      this._tileQuad(pos, col, tl.x, tl.z, c, tl.alpha ?? 0.35, 0.07);
-      if (tl.border !== false) {
-        // brighter rim
-        this._rim(pos, col, tl.x, tl.z, c, Math.min(1, (tl.alpha ?? 0.35) + 0.45));
+    for (const s of shapes) {
+      c.set(s.color);
+      const alpha = s.alpha ?? 0.35, rim = Math.min(1, alpha + 0.45);
+      if (s.line) {
+        this._band(pos, col, s.line, (s.width || 0.3) / 2, c, alpha, 0.07, s.y ?? null);
+        continue;
+      }
+      let P = s.pts;
+      if (!P && s.r) {
+        // a round brush: a ring of patches
+        const n = 20;
+        for (let k = 0; k < n; k++) {
+          const a0 = (k / n) * Math.PI * 2, a1 = ((k + 1) / n) * Math.PI * 2;
+          this._patch(pos, col, [[s.x, s.z], [s.x + Math.cos(a0) * s.r, s.z + Math.sin(a0) * s.r], [s.x + Math.cos(a1) * s.r, s.z + Math.sin(a1) * s.r], [s.x, s.z]], c, alpha, 0.07, null);
+        }
+        continue;
+      }
+      if (!P) P = [[s.x, s.z], [s.x + 1, s.z], [s.x + 1, s.z + 1], [s.x, s.z + 1]];
+      this._patch(pos, col, P, c, alpha, 0.07, s.y ?? null);
+      if (s.border !== false) {
+        // a brighter rim, just inside the edge
+        for (let k = 0; k < P.length; k++) {
+          const a = P[k], b = P[(k + 1) % P.length], m = [(P[0][0] + P[2][0]) / 2, (P[0][1] + P[2][1]) / 2];
+          const ins = (p, t) => [p[0] + (m[0] - p[0]) * t, p[1] + (m[1] - p[1]) * t];
+          const L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, t = Math.min(0.2, 0.06 / Math.max(0.1, Math.hypot(m[0] - a[0], m[1] - a[1])));
+          void L;
+          this._patch(pos, col, [a, b, ins(b, t), ins(a, t)], c, rim, 0.075, s.y != null ? s.y + 0.005 : null);
+        }
       }
     }
     this._apply(mesh, pos, col);
   }
 
-  _rim(pos, col, x, z, color, alpha) {
-    const t = this.world.terrain, w = this.world;
-    const b = w.buildingOn(x, z);
-    const water = t.isWater(x, z);
-    const yv = (cx, cz) => (b ? b.baseY + 0.045 : (w.roads[w.idx(x, z)] && water) ? bridgeDeckY() + 0.035 : water ? Math.max(t.tileMax(x, z), 0.02) + 0.025 : t.ch(cx, cz) + 0.075);
-    const k = 0.06;
-    const edges = [
-      [[x, z], [x + 1, z], [0, k]],
-      [[x + 1, z], [x + 1, z + 1], [-k, 0]],
-      [[x + 1, z + 1], [x, z + 1], [0, -k]],
-      [[x, z + 1], [x, z], [k, 0]],
-    ];
-    for (const [[ax, az], [bx, bz], [ox, oz]] of edges) {
-      const a = [ax, yv(ax, az), az], bb = [bx, yv(bx, bz), bz];
-      const a2 = [ax + ox, a[1], az + oz], b2 = [bx + ox, bb[1], bz + oz];
-      for (const v of [a, bb, b2, a, b2, a2]) { pos.push(v[0], v[1], v[2]); col.push(color.r, color.g, color.b, alpha); }
-    }
+  _tileQuad(pos, col, x, z, color, alpha, lift = 0.06, inset = 0) {
+    this._patch(pos, col, [[x + inset, z + inset], [x + 1 - inset, z + inset], [x + 1 - inset, z + 1 - inset], [x + inset, z + 1 - inset]], color, alpha, lift, null, 1);
   }
 
   // values: Float32Array(N*N) 0..1 or null to clear; colorFn(v) -> [hex, alpha]

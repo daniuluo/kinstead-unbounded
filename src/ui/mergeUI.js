@@ -6,7 +6,7 @@
 import { deserialize, serialize, LocalSaves, readJSONFile, downloadJSON, saveFileNameFor } from '../save/saves.js';
 import { mergeWorlds, layoutMerge, besideOffset, reportLines, newVillage } from '../save/merge.js';
 import { BUILDINGS } from '../defs.js';
-import { fw, fd } from '../world/world.js';
+import { drawNets, fillPlot } from './mapDraw.js';
 import { STARTERS } from '../world/starters.js';
 import { townName as genTownName } from '../util/names.js';
 import { RNG, randomSeed } from '../util/rng.js';
@@ -22,12 +22,15 @@ const CAT_COLOR = {
   utilities: [84, 150, 176], parks: [64, 140, 58], transit: [58, 88, 168],
 };
 
-// A small map of a town, one pixel per tile: water, ground by height,
-// woods, roads and track, and buildings coloured by kind.
+// A small map of a town, a few pixels to a unit: water, ground by height,
+// woods, roads and track as they run, and buildings coloured by kind.
+const PX = 4;
 export function townPicture(w) {
   const N = w.N, t = w.terrain, c = document.createElement('canvas');
-  c.width = c.height = N;
-  const g = c.getContext('2d'), img = g.createImageData(N, N), px = img.data;
+  c.width = c.height = N * PX;
+  const g0 = document.createElement('canvas');
+  g0.width = g0.height = N;
+  const g = g0.getContext('2d'), img = g.createImageData(N, N), px = img.data;
   const mix = (a, b, k) => [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k];
   for (let z = 0; z < N; z++) for (let x = 0; x < N; x++) {
     const i = z * N + x, h = t.tileAvg(x, z);
@@ -35,21 +38,22 @@ export function townPicture(w) {
     if (t.isWater(x, z)) col = mix([104, 172, 222], [44, 102, 168], Math.min(1, Math.max(0, -h / 0.8)));
     else {
       col = h < 1.2 ? mix([140, 182, 92], [112, 152, 72], h / 1.2) : h < 2.4 ? mix([112, 152, 72], [150, 140, 104], (h - 1.2) / 1.2) : mix([150, 140, 104], [176, 172, 166], Math.min(1, (h - 2.4) / 1.2));
-      if (w.treeCount[i]) col = mix(col, [52, 96, 44], Math.min(0.6, 0.25 * w.treeCount[i]));
     }
-    if (w.rails[i]) col = [72, 64, 60];
-    if (w.roads[i]) col = w.roads[i] >= 2 ? [188, 180, 166] : [182, 146, 100];
     px[i * 4] = col[0]; px[i * 4 + 1] = col[1]; px[i * 4 + 2] = col[2]; px[i * 4 + 3] = 255;
   }
-  for (const b of w.buildings.values()) {
-    const col = BUILDINGS[b.type].seat ? [250, 244, 228] : CAT_COLOR[BUILDINGS[b.type].cat] || [200, 200, 200];
-    for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) {
-      const i = (b.z + dz) * N + b.x + dx;
-      const k = b.con ? 0.6 : 1;
-      px[i * 4] = col[0] * k + 255 * (1 - k) * 0.5; px[i * 4 + 1] = col[1] * k + 255 * (1 - k) * 0.5; px[i * 4 + 2] = col[2] * k + 255 * (1 - k) * 0.5;
-    }
-  }
   g.putImageData(img, 0, 0);
+  const G = c.getContext('2d');
+  G.imageSmoothingEnabled = false;
+  G.drawImage(g0, 0, 0, N * PX, N * PX);
+  G.setTransform(PX, 0, 0, PX, 0, 0);
+  G.fillStyle = 'rgba(52,96,44,0.75)';
+  for (const tr of w.trees) G.fillRect(tr.x - 0.2, tr.z - 0.2, 0.4, 0.4);
+  drawNets(G, w, [null, 'rgb(182,146,100)', 'rgb(188,180,166)', 'rgb(188,180,166)'], 'rgb(72,64,60)');
+  for (const b of w.buildings.values()) {
+    const col = BUILDINGS[b.type].seat ? [250, 244, 228] : CAT_COLOR[BUILDINGS[b.type].cat] || [200, 200, 200], k = b.con ? 0.6 : 1;
+    fillPlot(G, b, `rgb(${col.map(v => Math.round(v * k + 255 * (1 - k) * 0.5)).join(',')})`, 0.05);
+  }
+  G.setTransform(1, 0, 0, 1, 0, 0);
   return c;
 }
 

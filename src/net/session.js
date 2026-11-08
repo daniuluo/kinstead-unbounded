@@ -111,13 +111,14 @@ function cursorOf(game) {
   else if (t.kind === 'trees') act = 'Planting trees';
   else if (t.kind === 'line') act = 'Planning a line';
   else if (t.kind === 'move') act = 'Moving a building';
-  return { x: h ? h.x : null, z: h ? h.z : null, sel: sel && sel.kind === 'building' ? sel.id : null, act };
+  const r2 = (v) => Math.round(v * 100) / 100;
+  return { x: h ? r2(h.x) : null, z: h ? r2(h.z) : null, sel: sel && sel.kind === 'building' ? sel.id : null, act };
 }
 
 function cleanCursor(c) {
   if (!c || typeof c !== 'object') return null;
-  const n = (v) => (Number.isInteger(v) && v >= 0 && v < 1e6 ? v : null);
-  return { x: n(c.x), z: n(c.z), sel: n(c.sel), act: typeof c.act === 'string' ? c.act.slice(0, 32) : '' };
+  const n = (v) => (Number.isInteger(v) && v >= 0 && v < 1e6 ? v : null), f = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v < 1e4 ? v : null);
+  return { x: f(c.x), z: f(c.z), sel: n(c.sel), act: typeof c.act === 'string' ? c.act.slice(0, 32) : '' };
 }
 
 class Peerish {

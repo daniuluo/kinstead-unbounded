@@ -3,7 +3,6 @@
 import { CONFIG, DRESSINGS, ROAD_LEVELS, SEASONS, titleFor, seasonOf, TITLES, TREE_COST, TERRAFORM_COST, streetPart, lookPart } from '../config.js';
 import { BUILDINGS, CATEGORIES, SERVICES, TRANSIT, RAIL_COST, unlockOf, TECHS, STYLE_TECH, servicesOf, BRANCHES, MERGES, techForLevel, CAPABILITIES, growsInto, plotName, parkOrigin, visitOf, KINDS, kindOf, ESTATE_TYPES, PRODUCE, produceOf, FARM_JOIN, sellsText, choosesProduce, CIVIC_QUARTER, CIVIC_TYPES } from '../defs.js';
 import { isOpen, capOf, isExpanded, sizeK, sizeKFor, scaledLevel, householdCap, civicQuarter, buildingCenter } from '../world/world.js';
-import { TURN_MAX, NUDGE } from '../world/pose.js';
 import { thumb } from './thumbs.js';
 import { computeIssues } from './issues.js';
 import { BlockedIcons, workingHTML, needsNoteHTML, buryHTML, townRoadTiles } from './working.js';
@@ -42,8 +41,7 @@ import { RNG, randomSeed } from '../util/rng.js';
 import { townName as genTownName } from '../util/names.js';
 import { starterPickerHTML, mountStarterPicker, EMPTY } from './starterPicker.js';
 import { roadSelTool, roadSelHTML, roadSelAct, bindRoadSel, dressAct, boulevardHTML } from './roadSelect.js';
-import { roadRun } from '../world/roadEdit.js';
-import { boulevardTiles } from '../world/boulevard.js';
+import { streetOf } from '../world/streets.js';
 import { perfHTML, bindPerf, readPerf, group, check, seg, segValue, bindSegs } from './perfSettings.js';
 import { minionIcon, MINION, MINIONS } from './minion.js';
 
@@ -240,7 +238,7 @@ export class UI {
     if (cat === 'roads') {
       for (const L of [1, 2, 3]) {
         const d = ROAD_LEVELS[L];
-        cards.push(card(`road:${L}`, ['🟫', '🪨', '⬛'][L - 1], d.name, `${d.cost} / tile`, pop < d.unlock ? d.unlock : 0, () => this.game.input.setTool({ kind: 'road', level: L }), 'Drag to build, along the grid or at 45° for a diagonal street. Drawing over a lesser road upgrades it.'));
+        cards.push(card(`road:${L}`, ['🟫', '🪨', '⬛'][L - 1], d.name, `${d.cost} a unit`, pop < d.unlock ? d.unlock : 0, () => this.game.input.setTool({ kind: 'road', level: L }), 'Drag to draw it any way you like: it is laid as a smooth curve, joining the roads it meets (Shift: straight). Click a lesser road to upgrade it.'));
       }
       cards.push(card('roadsel', '<span class="ms">highlight_alt</span>', 'Select roads', '', 0, () => this.game.input.setTool(roadSelTool()), 'Pick whole stretches of road, then upgrade, downgrade or take them all up at once.'));
     } else if (cat === 'terrain') {
@@ -429,9 +427,9 @@ export class UI {
       if (!r) { this.inspect(null); return; }
       html = this._residentHTML(r);
     } else if (sel.kind === 'road') {
-      const L = w.roadAt(sel.x, sel.z);
-      if (!L && !w.railAt(sel.x, sel.z)) { this.inspect(null); return; }
-      html = this._roadHTML(sel.x, sel.z, L);
+      const e = (sel.rail ? w.rails : w.roads).edges.get(sel.e);
+      if (!e) { this.inspect(null); return; }
+      html = this._roadHTML(e, !!sel.rail);
     } else if (sel.kind === 'roadsel') {
       html = roadSelHTML(this.game);
       if (html == null) { this.inspect(null); return; }
@@ -449,7 +447,7 @@ export class UI {
     if (sel.kind === 'roadsel') bindRoadSel(this, el);
     // hovering an expansion option shows the plot it would take
     for (const a of el.querySelectorAll('[data-act="expand"]')) {
-      a.onmouseenter = () => { this.game.input.previewTiles = a.dataset.tiles.split(';').map(t => { const [x, z] = t.split(',').map(Number); return { x, z, color: a.dataset.kind === 'takeover' ? '#ff6b5a' : a.dataset.kind === 'strip' ? '#ffd84a' : '#7fdc6a', alpha: 0.45 }; }); this.game.input.refresh(); };
+      a.onmouseenter = () => { this.game.input.previewTiles = JSON.parse(a.dataset.rects || '[]').map(pts => ({ pts, color: a.dataset.kind === 'takeover' ? '#ff6b5a' : a.dataset.kind === 'strip' ? '#ffd84a' : '#7fdc6a', alpha: 0.45 })); this.game.input.refresh(); };
       a.onmouseleave = () => { this.game.input.previewTiles = null; this.game.input.refresh(); };
     }
   }
@@ -706,7 +704,7 @@ export class UI {
         for (const o of grow) {
           const key = `${b.id}:${o.dir}:${o.kind}`, confirm = this.confirmExpand === key;
           const label = confirm ? `⚠ Click again: ${o.kind === 'takeover' ? 'demolish' : 'shrink'} the neighbour` : `${esc(o.label)} · $${fmt(o.cost)}`;
-          h += `<button class="btn ${o.warn ? 'warn' : ''} ${confirm ? 'gold' : ''}" data-act="expand" data-dir="${o.dir}" data-kind="${o.kind}" data-tiles="${(o.tiles || [[o.x, o.z]]).map(t => t.join(',')).join(';')}" ${w.money >= o.cost ? '' : 'disabled'}>${label}</button>`;
+          h += `<button class="btn ${o.warn ? 'warn' : ''} ${confirm ? 'gold' : ''}" data-act="expand" data-dir="${o.dir}" data-kind="${o.kind}" data-rects="${esc(JSON.stringify(o.rects || []))}" ${w.money >= o.cost ? '' : 'disabled'}>${label}</button>`;
           if (o.warn) h += `<div class="warnline">⚠ ${esc(o.warn)}</div>`;
         }
         h += '</div></div>';
@@ -723,15 +721,14 @@ export class UI {
         h += '</div></div>';
       }
     }
-    // turned and nudged on its plot (see world/pose.js)
-    if (!b.con && !b.spare) {
-      const p = b.pose || { a: 0, x: 0, z: 0 }, deg = Math.round((p.a * 180) / Math.PI);
-      const btn = (op, icon, title, off) => `<button class="btn" data-act="pose" data-op="${op}" title="${title}" ${off ? 'disabled' : ''}><span class="ms">${icon}</span></button>`;
-      h += `<div class="sec"><h5>On its plot</h5><div class="note">${b.pose ? `Turned ${deg ? `${Math.abs(deg)}° ${deg > 0 ? 'anticlockwise' : 'clockwise'}` : 'square'}${p.x || p.z ? ', nudged' : ''}, as you placed it.` : b.curve ? 'Turned to sit square to the curve of the street.' : b.diag ? 'Turned to face the diagonal street.' : 'Square to its street.'} It stays on its plot, a little smaller if it has to.</div><div class="actions">`
-        + btn('ccw', 'rotate_left', 'Turn it anticlockwise', p.a >= TURN_MAX - 1e-6) + btn('cw', 'rotate_right', 'Turn it clockwise', p.a <= -TURN_MAX + 1e-6)
-        + btn('left', 'arrow_back', 'Nudge it left, as seen from the street', p.x <= -NUDGE + 1e-6) + btn('right', 'arrow_forward', 'Nudge it right, as seen from the street', p.x >= NUDGE - 1e-6)
-        + btn('fwd', 'arrow_downward', 'Nudge it towards the street', p.z >= NUDGE - 1e-6) + btn('back', 'arrow_upward', 'Nudge it back from the street', p.z <= -NUDGE + 1e-6)
-        + `<button class="btn" data-act="pose" data-op="square" ${b.pose ? '' : 'disabled'} title="Square it up to its street again">Square up</button></div></div>`;
+    // which way it faces: any angle (turned about its middle)
+    if (!b.con && !b.spare && !(b.leases && b.leases.length)) {
+      const deg = Math.round((b.a * 180) / Math.PI);
+      const btn = (op, icon, title) => `<button class="btn" data-act="turn" data-op="${op}" title="${title}"><span class="ms">${icon}</span></button>`;
+      const face = w.faceRoad(b.x, b.z);
+      h += `<div class="sec"><h5>Which way it faces</h5><div class="note">Facing ${((deg % 360) + 360) % 360}° · turned about its middle; it must still fit and face a street.</div><div class="actions">`
+        + btn('ccw15', 'rotate_left', 'Turn it 15° anticlockwise') + btn('ccw1', 'chevron_left', 'Turn it 1° anticlockwise') + btn('cw1', 'chevron_right', 'Turn it 1° clockwise') + btn('cw15', 'rotate_right', 'Turn it 15° clockwise')
+        + `<button class="btn" data-act="turn" data-op="face" ${face == null ? 'disabled' : ''} title="Turn it square to the street it faces">Face the street</button></div></div>`;
     }
     h += `<div class="actions">`;
     if (!b.con) h += w.hasTech('relocation')
@@ -813,24 +810,24 @@ export class UI {
     return h;
   }
 
-  _roadHTML(x, z, L) {
+  _roadHTML(e, rail) {
     const w = this.world;
     let h = '';
-    if (L) {
-      const d = ROAD_LEVELS[L];
-      h += `<div class="head"><div class="big">${['', '🟫', '🪨', '⬛'][L]}</div><div><h3>${d.name}</h3><div class="sub">${w.terrain.isWater(x, z) ? 'Bridge' : 'Road'} · upkeep ${d.upkeep}/day</div></div></div>`;
-      const lane = !!w.blvd[w.idx(x, z)], dv = w.dress[w.idx(x, z)];
+    if (!rail) {
+      const L = e.level, d = ROAD_LEVELS[L], wet = w._heights(e).wet.some(Boolean);
+      h += `<div class="head"><div class="big">${['', '🟫', '🪨', '⬛'][L]}</div><div><h3>${d.name}</h3><div class="sub">${wet ? 'Road with a bridge' : 'Road'} · ${e.len.toFixed(1)} long · upkeep ${(d.upkeep * e.len).toFixed(2)}/day</div></div></div>`;
+      const dv = e.dress;
       const chip = (D) => (D ? `<span class="chip"><span class="ms">${D.icon}</span> ${D.name}</span>` : '');
-      h += `<div class="chips">${w.connected[w.idx(x, z)] ? '<span class="chip ok">Connected</span>' : '<span class="chip no">Not connected to the entrance</span>'}${lane ? '<span class="chip"><span class="ms">add_road</span> Boulevard</span>' : ''}${w.diag[w.idx(x, z)] & 15 ? '<span class="chip"><span class="ms">north_east</span> Diagonal</span>' : ''}${chip(DRESSINGS[lookPart(dv)])}${chip(DRESSINGS[streetPart(dv)])}</div>`;
-      if (lane) h += boulevardHTML(this.game, x, z);
-      h += buryHTML(this.game, x, z);
+      h += `<div class="chips">${w.edgeConnected(e.id) ? '<span class="chip ok">Connected</span>' : '<span class="chip no">Not connected to the entrance</span>'}${chip(DRESSINGS[lookPart(dv)])}${chip(DRESSINGS[streetPart(dv)])}</div>`;
+      h += buryHTML(this.game, e.id);
+      const del = w.removeCheck(e.id);
       if (L < 3) {
-        const c = w.checkRoad(x, z, L + 1);
-        h += `<div class="actions"><button class="btn primary" data-act="roadup" ${c.ok && w.money >= c.cost ? '' : 'disabled'} title="${esc(c.reason || '')}">⬆ ${ROAD_LEVELS[L + 1].name} · $${c.cost ?? '—'}</button><button class="btn danger" data-act="roaddel">Remove</button></div>`;
+        const c = w.levelCheck([e.id], L + 1);
+        h += `<div class="actions"><button class="btn primary" data-act="roadup" ${c.ok ? '' : 'disabled'} title="${esc(c.reason || '')}">⬆ ${ROAD_LEVELS[L + 1].name} · $${c.cost ?? '—'}</button><button class="btn danger" data-act="roaddel" ${del.ok ? '' : 'disabled'} title="${esc(del.reason || '')}">Remove${del.ok ? ` · +$${del.refund}` : ''}</button></div>`;
         if (!c.ok) h += `<div class="req"><div class="no">${esc(c.reason)}</div></div>`;
-      } else h += `<div class="actions"><button class="btn danger" data-act="roaddel">Remove</button></div>`;
-      const run = roadRun(w, x, z).length;
-      h += `<div class="actions"><button class="btn" data-act="roadrun" title="Pick the stretch of road between junctions to change it all at once"><span class="ms">highlight_alt</span> Select stretch${run > 1 ? ` · ${run} tiles` : ''}</button></div>`;
+      } else h += `<div class="actions"><button class="btn danger" data-act="roaddel" ${del.ok ? '' : 'disabled'} title="${esc(del.reason || '')}">Remove${del.ok ? ` · +$${del.refund}` : ''}</button></div>`;
+      const run = streetOf(w, e.id);
+      h += `<div class="actions"><button class="btn" data-act="roadrun" title="Pick the whole street (on through each junction the way it runs straightest) to change it all at once"><span class="ms">highlight_alt</span> Select the street${run.length > 1 ? ` · ${run.length} stretches` : ''}</button></div>`;
     } else {
       h += `<div class="head"><div class="big">🛤️</div><div><h3>Railway track</h3><div class="sub">upkeep 0.25/day</div></div></div>`;
       h += `<div class="actions"><button class="btn danger" data-act="raildel">Remove</button></div>`;
@@ -845,7 +842,7 @@ export class UI {
       case 'resident': this.inspect({ kind: 'resident', id: Number(data.id) }); break;
       case 'building': {
         const b = w.buildings.get(Number(data.id));
-        if (b) { this.inspect({ kind: 'building', id: b.id }); g.renderer.lookAt(b.x + (b.w ?? b.size) / 2, b.z + (b.d ?? b.size) / 2); }
+        if (b) { this.inspect({ kind: 'building', id: b.id }); g.renderer.lookAt(b.x, b.z); }
         break;
       }
       case 'priority': {
@@ -881,13 +878,13 @@ export class UI {
         break;
       }
       case 'move': g.input.setTool({ kind: 'move', id: sel.id }); break;
-      case 'pose': {
+      case 'turn': {
         const pb = w.buildings.get(sel.id);
         if (!pb) break;
-        const p = pb.pose ? { ...pb.pose } : { a: 0, x: 0, z: 0 }, turn = Math.PI / 12, step = 0.05;
-        const next = { ccw: { a: p.a + turn }, cw: { a: p.a - turn }, left: { x: p.x - step }, right: { x: p.x + step }, fwd: { z: p.z + step }, back: { z: p.z - step } }[data.op];
-        const q = next ? { ...p, ...next } : null;
-        g.cmd({ t: 'pose', id: pb.id, pose: q ? [Math.max(-TURN_MAX, Math.min(TURN_MAX, q.a)), Math.max(-NUDGE, Math.min(NUDGE, q.x)), Math.max(-NUDGE, Math.min(NUDGE, q.z))] : null }, (r) => {
+        const D = Math.PI / 180, by = { ccw15: 15 * D, ccw1: D, cw1: -D, cw15: -15 * D }[data.op];
+        const a = data.op === 'face' ? w.faceRoad(pb.x, pb.z) : pb.a + (by || 0);
+        if (a == null) break;
+        g.cmd({ t: 'turn', id: pb.id, a: Math.round(a * 1000) / 1000 }, (r) => {
           if (!r.ok && r.reason) this.toast(r.reason, 'bad');
           this.renderInspector(true);
         });
@@ -959,31 +956,26 @@ export class UI {
       case 'follow': g.setFollow(g.follow === sel.id ? null : sel.id); this.renderInspector(true); break;
       case 'people': this.showPeople(); break;
       case 'roadup': {
-        const L = w.roadAt(sel.x, sel.z);
-        g.cmd({ t: 'roads', tiles: [[sel.x, sel.z]], level: L + 1 }, (r) => {
-          if (!r.placed) this.toast(r.failed || 'Cannot upgrade', 'bad');
+        const e = w.roads.edges.get(sel.e);
+        if (!e) break;
+        g.cmd({ t: 'roadlevel', ids: [e.id], level: e.level + 1 }, (r) => {
+          if (!r.ok) this.toast(r.reason || 'Cannot upgrade', 'bad');
           if (this.selection) this.renderInspector(true);
         });
         break;
       }
       case 'roaddel':
-        g.cmd({ t: 'unroad', x: sel.x, z: sel.z }, (r) => {
+        g.cmd({ t: 'unroad', e: sel.e }, (r) => {
           if (!r.ok) this.toast(r.reason || 'Cannot remove', 'bad');
           else if (this.selection === sel) this.inspect(null);
         });
         break;
-      case 'raildel': g.cmd({ t: 'unrail', x: sel.x, z: sel.z }); this.inspect(null); break;
-      case 'roadrun': g.input.setTool(roadSelTool(roadRun(w, sel.x, sel.z), w.N)); break;
+      case 'raildel': g.cmd({ t: 'unrail', e: sel.e }); this.inspect(null); break;
+      case 'roadrun': g.input.setTool(roadSelTool(streetOf(w, sel.e))); break;
       case 'rsel': roadSelAct(this, data); break;
-      // a look for the whole boulevard (0: back to a grass median)
-      case 'blvdlook': {
-        const kind = Number(data.kind);
-        dressAct(this, kind, boulevardTiles(w, sel.x, sel.z), true, () => { if (this.selection === sel) this.renderInspector(true); });
-        break;
-      }
       case 'bury': {
-        const tiles = data.scope === 'town' ? townRoadTiles(w) : w.streetTiles(sel.x, sel.z);
-        g.cmd({ t: 'bury', tiles }, (r) => {
+        const ids = data.scope === 'town' ? townRoadTiles(w) : streetOf(w, sel.e);
+        g.cmd({ t: 'bury', ids }, (r) => {
           if (!r.ok) this.toast(r.reason || "Those lines can't be buried", 'bad');
           else { this.toast(`Power lines laid underground along ${r.n} stretch${r.n === 1 ? '' : 'es'} of road`, 'good', '⚡'); this.renderInspector(true); }
         });
@@ -1680,7 +1672,7 @@ export class UI {
         else if (r.homes.length) {
           this._hapCycle = ((this._hapCycle ?? -1) + 1) % r.homes.length;
           const b = w.buildings.get(r.homes[this._hapCycle]);
-          if (b) { this.inspect({ kind: 'building', id: b.id }); g.renderer.lookAt(b.x + (b.w ?? b.size) / 2, b.z + (b.d ?? b.size) / 2); }
+          if (b) { this.inspect({ kind: 'building', id: b.id }); g.renderer.lookAt(b.x, b.z); }
         }
       };
     });
@@ -1722,7 +1714,7 @@ export class UI {
       // each click moves on to the next building involved
       const n = this._issueCycle[i.text] = ((this._issueCycle[i.text] ?? -1) + 1) % a.ids.length;
       const b = this.world.buildings.get(a.ids[n]);
-      if (b) { this.inspect({ kind: 'building', id: b.id }); g.renderer.lookAt(b.x + (b.w ?? b.size) / 2, b.z + (b.d ?? b.size) / 2); }
+      if (b) { this.inspect({ kind: 'building', id: b.id }); g.renderer.lookAt(b.x, b.z); }
     } else if (a.kind === 'tool') this.openFlyout(a.cat);
     else if (a.kind === 'people') { this._ppl = { q: '', f: a.filter, k: 'name', dir: 1 }; this.showPeople(); }
     else if (a.kind === 'research') this.showResearch();

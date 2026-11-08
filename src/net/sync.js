@@ -10,12 +10,13 @@
 
 import { BUILDINGS } from '../defs.js';
 import { serialize, deserialize } from '../save/saves.js';
-import { fw, fd, spareOf, setFloor } from '../world/world.js';
+import { spareOf, setFloor } from '../world/world.js';
+import { Net } from '../world/net.js';
 import { cleanText, cleanColor, hasKey } from '../util/text.js';
-import { cleanPose, poseRec } from '../world/pose.js';
 
-// Bump when the messages change in a way older pages can't read.
-export const PROTOCOL = 2;
+// Bump when the messages change in a way older pages can't read. (100 and
+// up: the town without a grid, which can't play with towns on squares.)
+export const PROTOCOL = 101;
 
 const r2 = (v) => Math.round(v * 100) / 100;
 
@@ -25,12 +26,11 @@ function conRec(c) {
   return o;
 }
 
-// One building as [id, type, level, x, z, variant, rot, built, w, d, flavor,
-// con, leases, look, access, spare, pose] — the save's record plus the
-// entrance in use.
+// One building as [id, type, level, x, z, variant, a, built, w, d, flavor,
+// con, leases, look, spare] — as the save has it.
 export function buildingRec(b) {
-  return [b.id, b.type, b.level, b.x, b.z, b.variant, b.rot, b.built, fw(b), fd(b), b.flavor || null,
-    b.con ? conRec(b.con) : null, b.leases && b.leases.length ? b.leases : null, b.look || null, b.access ? [b.access.x, b.access.z] : null, b.spare ? [b.spare.w, b.spare.d, ...(b.spare.sx != null ? [b.spare.sx, b.spare.sz] : [])] : null, poseRec(b)];
+  return [b.id, b.type, b.level, b.x, b.z, b.variant, b.a, b.built, b.w, b.d, b.flavor || null,
+    b.con ? conRec(b.con) : null, b.leases && b.leases.length ? b.leases : null, b.look || null, b.spare ? [b.spare.w, b.spare.d, ...(b.spare.sx != null ? [b.spare.sx, b.spare.sz] : [])] : null];
 }
 
 // One villager: the save's record plus their school place.
@@ -44,16 +44,20 @@ const moneyRec = (m) => (Number.isFinite(m) ? r2(m) : 'inf');
 const clockRec = (g) => [g.world.day, Math.round(g.world.hours * 1000) / 1000, g.speed, moneyRec(g.world.money), g.world.stats];
 const stateRec = (w) => ({ taxRate: w.taxRate, nextId: w.nextId, titleIdx: w.titleIdx, townName: w.townName, sandbox: { ...w.sandbox }, research: w.research, entry: w.entry });
 
-// Trees grouped by tile: tile index → flat list of [x, z, kind, size, turn].
+// Trees grouped by the unit square they stand in (a way to send fewer of
+// them at a time): its key → flat list of [x, z, kind, size, turn].
+const treeKey = (w, x, z) => Math.floor(z) * w.N + Math.floor(x);
 function treeTiles(w) {
   const out = new Map();
   for (const t of w.trees) {
-    let a = out.get(t.t);
-    if (!a) out.set(t.t, (a = []));
+    const k = treeKey(w, t.x, t.z);
+    let a = out.get(k);
+    if (!a) out.set(k, (a = []));
     a.push(Math.round(t.x * 100), Math.round(t.z * 100), t.k, Math.round(t.s * 100), Math.round(t.r * 100));
   }
   return out;
 }
+const fieldsRec = (w) => [...w.parcels.values()].map(f => [f.id, f.farm, f.x, f.z, f.a]);
 
 const heights = (w) => Int16Array.from(w.terrain.H, (v) => Math.round(v * 1000));
 
@@ -63,7 +67,6 @@ export function makeSnapshot(game) {
   const w = game.world;
   return {
     save: serialize(w),
-    access: [...w.buildings.values()].filter(b => b.access).map(b => [b.id, b.access.x, b.access.z]),
     school: [...w.residents.values()].filter(r => r.school != null).map(r => [r.id, r.school]),
     lines: linesRec(w),
     clock: clockRec(game),
@@ -72,9 +75,6 @@ export function makeSnapshot(game) {
 
 export function worldFromSnapshot(snap) {
   const w = deserialize(snap.save);
-  // the entrance each building uses (Tab when placing) isn't in saves
-  for (const [id, x, z] of snap.access || []) { const b = w.buildings.get(id); if (b) b.access = { x, z }; }
-  w.updateRoadNetwork();
   for (const [id, s] of snap.school || []) { const r = w.residents.get(id); if (r) r.school = s; }
   if (Array.isArray(snap.lines)) w.lines = snap.lines.map(cleanLine);
   const c = snap.clock;
@@ -103,12 +103,10 @@ export class Tracker {
     for (const b of w.buildings.values()) this.b.set(b.id, JSON.stringify(buildingRec(b)));
     this.r = new Map();
     for (const r of w.residents.values()) this.r.set(r.id, JSON.stringify(residentRec(r)));
-    this.roads = w.roads.slice();
-    this.rails = w.rails.slice();
-    this.buried = w.buried.slice();
-    this.dress = w.dress.slice();
-    this.diag = w.diag.slice();
-    this.fields = w.fields.slice();
+    this.roads = JSON.stringify(w.roads.toRec());
+    this.rails = JSON.stringify(w.rails.toRec());
+    this.rv = w.roads.version; this.lv = w.rails.version;
+    this.fields = JSON.stringify(fieldsRec(w));
     this.H = heights(w);
     this.trees = new Map([...treeTiles(w)].map(([t, a]) => [t, a.join()]));
     this.ln = JSON.stringify(linesRec(w));
@@ -154,19 +152,20 @@ export class Tracker {
     }
     this.died.clear();
     if (full) d.ar = [...seenR];
-    // roads, track, land
-    const rd = gridDiff(this.roads, w.roads), rl = gridDiff(this.rails, w.rails);
-    if (rd) d.rd = rd;
-    if (rl) d.rl = rl;
-    const bu = gridDiff(this.buried, w.buried);
-    if (bu) d.bu = bu;
-    const ds = gridDiff(this.dress, w.dress);
-    if (ds) d.ds = ds;
-    // diagonal streets' links
-    const dg = gridDiff(this.diag, w.diag);
-    if (dg) d.dg = dg;
-    const fl = gridDiff(this.fields, w.fields);
-    if (fl) d.fl = fl;
+    // roads and track (the whole network when it has changed: towns have
+    // a few hundred stretches of road at most), farm fields, the land
+    if (full || w.roads.version !== this.rv) {
+      this.rv = w.roads.version;
+      const rec = JSON.stringify(w.roads.toRec());
+      if (full || rec !== this.roads) { d.rd = JSON.parse(rec); this.roads = rec; }
+    }
+    if (full || w.rails.version !== this.lv) {
+      this.lv = w.rails.version;
+      const rec = JSON.stringify(w.rails.toRec());
+      if (full || rec !== this.rails) { d.rl = JSON.parse(rec); this.rails = rec; }
+    }
+    const fl = JSON.stringify(fieldsRec(w));
+    if (full || fl !== this.fields) { d.fl = JSON.parse(fl); this.fields = fl; }
     if (this.hDirty) {
       this.hDirty = false;
       const H = heights(w), out = [];
@@ -195,22 +194,7 @@ export class Tracker {
   }
 }
 
-function gridDiff(shadow, cur) {
-  let out = null;
-  for (let i = 0; i < cur.length; i++) if (shadow[i] !== cur[i]) { (out ||= []).push(i, cur[i]); shadow[i] = cur[i]; }
-  return out;
-}
-
 // ------------------------------------------------------------ guest side
-
-function setFootprint(w, b, id) {
-  for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) {
-    const x = b.x + dx, z = b.z + dz;
-    if (!w.inBounds(x, z)) continue;
-    const i = w.idx(x, z);
-    if (id >= 0 || w.buildingAt[i] === b.id) w.buildingAt[i] = id;
-  }
-}
 
 function plotHeights(w, b) { setFloor(w.terrain, b); }
 
@@ -250,23 +234,35 @@ export function applyDelta(game, d) {
   for (const id of goneB) {
     const b = w.buildings.get(id);
     if (!b) continue;
-    setFootprint(w, b, -1);
+    w.plots.remove(b);
     w.buildings.delete(id);
     w.emit('building:remove', b);
     structural = true;
   }
 
-  // 3. roads, track and the lie of the land
-  const grid = (arr, list) => { for (let i = 0; i < list.length; i += 2) arr[list[i]] = list[i + 1]; return list.length > 0; };
-  const roads = (d.rd ? grid(w.roads, d.rd) : false) | (d.dg ? grid(w.diag, d.dg) : false);
-  const rails = d.rl ? grid(w.rails, d.rl) : false;
-  // power lines laid underground
-  if (d.bu && grid(w.buried, d.bu)) w.emit('lines');
-  // streets dressed with trees, hedges, lamps or a median
-  const dressed = !!(d.ds && grid(w.dress, d.ds));
-  if (dressed) w.emit('dress');
+  // 3. roads, track and the lie of the land (the networks whole; what
+  // changed on them, dressings and buried lines too, is worked out here)
+  let roads = false, dressed = false;
+  if (d.rd) {
+    const before = w.roads, net = Net.fromRec(d.rd, 'road');
+    const dressOf = (n) => JSON.stringify([...n.edges.values()].map(e => [e.id, e.dress || 0]));
+    const buriedOf = (n) => JSON.stringify([...n.edges.values()].map(e => [e.id, e.buried || 0]));
+    dressed = dressOf(before) !== dressOf(net);
+    const buried = buriedOf(before) !== buriedOf(net);
+    w.roads = net;
+    if (w.roads.nodes.has(w.entry.node)) { const n = w.roads.nodes.get(w.entry.node); w.entry = { node: n.id, x: n.x, z: n.z }; }
+    roads = true;
+    if (buried) w.emit('lines');
+    if (dressed) w.emit('dress');
+  }
+  const rails = !!d.rl;
+  if (d.rl) w.rails = Net.fromRec(d.rl, 'rail');
   // farmland
-  if (d.fl && grid(w.fields, d.fl)) { w._countFields(); w.emit('fields'); simDirty = true; }
+  if (d.fl) {
+    for (const f of [...w.parcels.values()]) w._removeField(f);
+    for (const [id, farm, x, z, a] of Array.isArray(d.fl) ? d.fl : []) if ([id, farm, x, z, a].every(Number.isFinite)) w._addField(farm, x, z, a, id);
+    w._countFields(); w.emit('fields'); simDirty = true;
+  }
   let land = null;
   if (d.h) {
     const S = w.N + 1, H = w.terrain.H;
@@ -284,39 +280,36 @@ export function applyDelta(game, d) {
   const added = [], changed = [], refit = [], done = [];
   let railLinks = rails;
   for (const rec of d.b || []) {
-    const [id, type, level, x, z, variant, rot, built, bw, bd, flavor, con, leases, look, acc, sp, ps] = rec;
-    const spare = spareOf(sp, bw, bd), pose = spare ? null : cleanPose(ps);
-    if (!hasKey(BUILDINGS, type)) continue;
+    const [id, type, level, x, z, variant, a, built, bw, bd, flavor, con, leases, look, sp] = rec;
+    const spare = spareOf(sp, bw, bd);
+    if (!hasKey(BUILDINGS, type) || ![x, z, a].every(Number.isFinite)) continue;
     const def = BUILDINGS[type];
     let b = w.buildings.get(id);
     if (!b) {
-      w.restoreBuilding({ id, type, level, x, z, variant, rot, built, w: bw, d: bd, flavor, con, leases, look, spare, pose });
+      w.restoreBuilding({ id, type, level, x, z, variant, a, built, w: bw, d: bd, flavor, con, leases, look, spare });
       b = w.buildings.get(id);
       if (!b) continue;
-      b.access = acc ? { x: acc[0], z: acc[1] } : null;
-      if (def.needsRail) b.rail = w.findRail(b.x, b.z, fw(b), fd(b));
       added.push(b);
+      if (def.needsRail) railLinks = true;
       structural = true;
       continue;
     }
-    const moved = b.x !== x || b.z !== z || fw(b) !== bw || fd(b) !== bd;
+    const moved = b.x !== x || b.z !== z || b.a !== a || b.w !== bw || b.d !== bd;
     const prev = b.con;
     const looks = moved || b.type !== type || b.level !== level || (b.look || null) !== look || (b.flavor || null) !== flavor
-      || b.variant !== variant || b.rot !== rot || conLook(prev) !== conLook(con) || JSON.stringify(b.pose || null) !== JSON.stringify(pose)
+      || b.variant !== variant || conLook(prev) !== conLook(con)
       || JSON.stringify(b.spare || null) !== JSON.stringify(spare || null);
     if (moved) {
-      setFootprint(w, b, -1);
-      b.x = x; b.z = z; b.w = bw; b.d = bd; b.size = Math.max(bw, bd);
-      setFootprint(w, b, b.id);
+      b.x = x; b.z = z; b.a = a; b.w = bw; b.d = bd; b.size = Math.max(bw, bd);
+      w._file(b);
       if (def.needsRail) railLinks = true;
       structural = true;
     }
     if (b.type !== type || b.level !== level) simDirty = true;
     const spared = JSON.stringify(b.spare || null) !== JSON.stringify(spare || null);
     if (spared) simDirty = true;
-    Object.assign(b, { type, level, variant, rot, built, flavor, look });
+    Object.assign(b, { type, level, variant, built, flavor, look });
     if (spare) b.spare = spare; else delete b.spare;
-    if (pose) b.pose = pose; else delete b.pose;
     // the floor, once the plot and the part the building stands on are known
     if (moved || spared) plotHeights(w, b);
     // keep the same site object while it is the same job, so builders keep their place in the queue
@@ -326,11 +319,11 @@ export function applyDelta(game, d) {
     if (!!prev !== !!b.con) simDirty = true;
     if (JSON.stringify(b.leases && b.leases.length ? b.leases : null) !== JSON.stringify(leases)) {
       setLeases(w, b, leases);
+      w._file(b);
       if (!looks) refit.push(b);
+      structural = true;
       simDirty = true;
     }
-    const a = b.access;
-    if (acc ? !a || a.x !== acc[0] || a.z !== acc[1] : a) { b.access = acc ? { x: acc[0], z: acc[1] } : null; structural = true; }
     if (looks) changed.push(b);
     if (prev && !b.con) done.push({ building: b, kind: prev.kind, moved: !!prev.moved });
   }
@@ -348,8 +341,7 @@ export function applyDelta(game, d) {
   // 6. trees
   if (d.tr) {
     const tilesChanged = new Set(d.tr.map(([t]) => t));
-    w.trees = w.trees.filter(t => !tilesChanged.has(t.t));
-    for (const t of tilesChanged) w.treeCount[t] = 0;
+    w._dropTrees(w.trees.filter(t => tilesChanged.has(treeKey(w, t.x, t.z))));
     for (const [, a] of d.tr) for (let i = 0; i + 4 < a.length; i += 5) w.addTree(a[i] / 100, a[i + 1] / 100, a[i + 2], a[i + 3] / 100, a[i + 4] / 100);
     w.emit('trees');
   }

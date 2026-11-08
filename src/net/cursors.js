@@ -1,9 +1,9 @@
-// The other players in a multiplayer town: a ring in their colour on the tile
-// under their pointer and round whatever building they have selected, with a
-// name tag saying what they are doing.
+// The other players in a multiplayer town: a ring in their colour on the
+// ground under their pointer and round whatever building they have
+// selected, with a name tag saying what they are doing.
 
 import * as THREE from 'three';
-import { fw, fd } from '../world/world.js';
+import { plotOf } from '../world/world.js';
 
 const esc = (s) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -41,8 +41,8 @@ export class RemoteCursors {
       const tiles = [];
       for (const c of this.list.values()) {
         const b = c.sel != null ? w.buildings.get(c.sel) : null;
-        if (b) for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) tiles.push({ x: b.x + dx, z: b.z + dz, color: c.color, alpha: 0.1 });
-        if (c.x != null && w.inBounds(c.x, c.z)) tiles.push({ x: c.x, z: c.z, color: c.color, alpha: 0.2 });
+        if (b) tiles.push({ pts: plotOf(b).pts, color: c.color, alpha: 0.1, y: b.baseY + 0.04 });
+        if (c.x != null && w.inBounds(c.x, c.z)) tiles.push({ x: c.x, z: c.z, r: 0.25, color: c.color, alpha: 0.2 });
       }
       view.overlay.setRemote?.(tiles);
     }
@@ -58,9 +58,9 @@ export class RemoteCursors {
       if (!c.el) continue;
       const html = `<i style="background:${esc(c.color)}"></i>${esc(c.name)}${c.act ? `<small>${esc(c.act)}</small>` : ''}`;
       if (c.el._html !== html) { c.el.innerHTML = html; c.el._html = html; c.el.style.borderColor = c.color; }
-      const b = w.buildingOn(c.x, c.z);
-      const y = b ? b.baseY + 0.55 : w.terrain.tileMax(c.x, c.z) + 0.12;
-      const p = g.renderer.worldToScreen(this._v.set(c.x + 0.5, y, c.z + 0.5));
+      const b = w.buildingAt(c.x, c.z);
+      const y = b ? b.baseY + 0.55 : w.terrain.heightAt(c.x, c.z) + 0.12;
+      const p = g.renderer.worldToScreen(this._v.set(c.x, y, c.z));
       c.el.style.display = p.behind ? 'none' : '';
       c.el.style.left = `${p.x}px`;
       c.el.style.top = `${p.y}px`;

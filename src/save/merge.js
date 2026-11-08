@@ -11,7 +11,9 @@
 // sits at (x, z) relative to A's after `rot` clockwise quarter turns (seen
 // from above, x to the right and z down, as in the 2D view).
 
-import { World, fw, fd, capOf, TREE } from '../world/world.js';
+import { World, capOf, TREE } from '../world/world.js';
+// (being made over for the town without a grid: see the gridless notes)
+const fw = (b) => b.w, fd = (b) => b.d;
 import { Terrain } from '../world/terrain.js';
 import { BUILDINGS, TRANSIT, LINE_COLORS } from '../defs.js';
 import { CONFIG } from '../config.js';

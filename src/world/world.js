@@ -855,7 +855,7 @@ export class World {
         const take = this._growLand(b, strips, 1.4);
         if (!take) continue;
         const where = `${cz > 0 ? 'in front of it' : 'behind it'} and to its ${cx > 0 ? 'right' : 'left'}`;
-        out.push({ dir: 20 + (cx > 0 ? 1 : 0) + (cz > 0 ? 2 : 0), grow: { gx0: cx < 0 ? 1 : 0, gx1: cx > 0 ? 1 : 0, gz0: cz < 0 ? 1 : 0, gz1: cz > 0 ? 1 : 0 }, kind: 'grand', where, ...take, label: `Take the land ${where} for ${plotName((n + 1) ** 2)}` });
+        out.push({ rects: strips.map(R => R.pts), dir: 20 + (cx > 0 ? 1 : 0) + (cz > 0 ? 2 : 0), grow: { gx0: cx < 0 ? 1 : 0, gx1: cx > 0 ? 1 : 0, gz0: cz < 0 ? 1 : 0, gz1: cz > 0 ? 1 : 0 }, kind: 'grand', where, ...take, label: `Take the land ${where} for ${plotName((n + 1) ** 2)}` });
       }
       return out;
     }
@@ -868,7 +868,7 @@ export class World {
         const take = this._growLand(b, [R], 1.2);
         if (!take) continue;
         const where = wide ? (s < 0 ? 'behind it' : 'in front of it') : 'beside it';
-        out.push({ dir: 10 + (s + 1), grow: wide ? { gx0: 0, gx1: 0, gz0: s < 0 ? 1 : 0, gz1: s > 0 ? 1 : 0 } : { gx0: s < 0 ? 1 : 0, gx1: s > 0 ? 1 : 0, gz0: 0, gz1: 0 }, kind: 'estate', where, ...take, label: `Take the two plots ${where} for a 2×2 estate` });
+        out.push({ rects: [R.pts], dir: 10 + (s + 1), grow: wide ? { gx0: 0, gx1: 0, gz0: s < 0 ? 1 : 0, gz1: s > 0 ? 1 : 0 } : { gx0: s < 0 ? 1 : 0, gx1: s > 0 ? 1 : 0, gz0: 0, gz1: 0 }, kind: 'estate', where, ...take, label: `Take the two plots ${where} for a 2×2 estate` });
       }
       return out;
     }
@@ -883,7 +883,7 @@ export class World {
     if (def.park && !b.con && b.w === 1 && b.d === 1 && def.size === 1 && growsInto(b.type, 2).length) {
       for (const S of SIDES) {
         const take = this._growLand(b, [S.R()], 1.1, false);
-        if (take) out.push({ dir: S.dir, grow: S.grow, kind: 'land', where: S.where, ...take, label: `Take the empty plot ${S.where}` });
+        if (take) out.push({ rects: [S.R().pts], dir: S.dir, grow: S.grow, kind: 'land', where: S.where, ...take, label: `Take the empty plot ${S.where}` });
       }
       return out;
     }
@@ -896,7 +896,7 @@ export class World {
       const nb = this._besideOn(b, S.side), o = nb ? nb.o : null;
       // empty land: in bounds and clear of everything, not too rough
       const take = !o ? this._growLand(b, [R], 1.1, false) : null;
-      if (take) { out.push({ dir: S.dir, grow: S.grow, kind: 'land', where: S.where, cost: base + take.cost - CONFIG.PLOT_PRICE, label: `Take the empty plot ${S.where}` }); continue; }
+      if (take) { out.push({ rects: [R.pts], dir: S.dir, grow: S.grow, kind: 'land', where: S.where, cost: base + take.cost - CONFIG.PLOT_PRICE, label: `Take the empty plot ${S.where}` }); continue; }
       if (!o || o.con || BUILDINGS[o.type].unique || o.w !== 1 || o.d !== 1) continue;
       // (its own ground must be good enough to build across)
       const lo = Math.min(o.minY, b.minY), hi = Math.max(groundUnder(this.terrain, R).maxH, groundUnder(this.terrain, ownPlot(b)).maxH);
@@ -907,10 +907,10 @@ export class World {
       const be = b.ext || {}, oe = o.ext || {};
       const perp = side[0] === 'x' ? 'z' : 'x';
       if (o.type === 'house' && side !== 'z1' && opp !== 'z1' && !be[side] && !(be[perp + '0'] > 0 || be[perp + '1'] > 0) && !(oe.x0 < 0 || oe.x1 < 0 || oe.z0 < 0 || oe.z1 < 0)) {
-        out.push({ dir: S.dir, grow: S.grow, kind: 'strip', where: S.where, other: o, side, opp, cost: 60 + 40 * b.level, label: `Buy a strip of the ${oname}'s garden ${S.where}`, warn: `The ${oname} next door gets a smaller garden (its owners are paid)` });
+        out.push({ rects: [R.pts], dir: S.dir, grow: S.grow, kind: 'strip', where: S.where, other: o, side, opp, cost: 60 + 40 * b.level, label: `Buy a strip of the ${oname}'s garden ${S.where}`, warn: `The ${oname} next door gets a smaller garden (its owners are paid)` });
       }
       const comp = this.buildValue(o);   // its owners are paid what their building is worth
-      out.push({ dir: S.dir, grow: S.grow, kind: 'takeover', where: S.where, other: o, cost: base + comp, comp, label: `Take over the ${oname} ${S.where}`,
+      out.push({ rects: [R.pts], dir: S.dir, grow: S.grow, kind: 'takeover', where: S.where, other: o, cost: base + comp, comp, label: `Take over the ${oname} ${S.where}`,
         warn: `The ${oname} will be demolished${o.residents.length ? ` and its ${o.residents.length} resident${o.residents.length > 1 ? 's' : ''} rehoused` : ''} ($${comp} to its owners included)` });
     }
     return out;
@@ -1757,6 +1757,29 @@ export class World {
       return { ok: true, what: 'trees', cost };
     }
     return { ok: false };
+  }
+
+  // Everything in a box [x0, z0, x1, z1]: buildings with their middles in
+  // it, stretches of road and track with their middles in it, fields and
+  // trees. { ok, n, reason }.
+  bulldozeBox(box) {
+    const [x0, z0, x1, z1] = box, inBox = (x, z) => x >= x0 && x <= x1 && z >= z0 && z <= z1;
+    let n = 0, reason = null;
+    const did = (r) => { if (r && (r.ok || r === true)) n++; else if (r && r.reason) reason ||= r.reason; else if (typeof r === 'string') reason ||= r; };
+    for (const b of [...this.buildings.values()]) if (inBox(b.x, b.z)) did(this.demolishBuilding(b.id));
+    const mid = (e) => pointAt(e.pts, e.cum, e.len / 2);
+    for (const e of [...this.rails.edges.values()]) { const m = mid(e); if (inBox(m[0], m[1]) && this.rails.edges.has(e.id)) did(this.removeRailEdge(e.id)); }
+    for (const e of [...this.roads.edges.values()]) { if (!this.roads.edges.has(e.id)) continue; const m = mid(e); if (inBox(m[0], m[1])) did(this.removeRoadEdge(e.id)); }
+    const fs = [...this.parcels.values()].filter(f => inBox(f.x, f.z));
+    const byFarm = new Map();
+    for (const f of fs) { if (!byFarm.has(f.farm)) byFarm.set(f.farm, []); byFarm.get(f.farm).push([f.x, f.z, f.a]); }
+    for (const [farm, list] of byFarm) did(this.setFields(farm, list, false));
+    const trees = this.treeIx.query(box).filter(tr => inBox(tr.x, tr.z));
+    if (trees.length) {
+      const cost = trees.length * CLEAR_COST;
+      if (this.money >= cost) { this.money -= cost; this._dropTrees(trees); this.emit('trees'); n++; } else reason ||= 'Not enough money';
+    }
+    return { ok: n > 0, n, reason };
   }
 
   // ------------------------------------------------------------ farmland

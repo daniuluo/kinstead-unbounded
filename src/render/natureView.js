@@ -3,13 +3,12 @@
 import * as THREE from 'three';
 import { mergeGeometries, mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 import { MAT } from './materials.js';
-import { TREE, homeField, farmlandOf, fw, fd } from '../world/world.js';
+import { TREE, homeField, farmlandOf, ownPlot } from '../world/world.js';
 import { hash2 } from '../util/rng.js';
-import { dressSpots } from '../world/roadDress.js';
-import { boulevardSpots } from '../world/boulevard.js';
+import { dressSpots } from '../world/streets.js';
 import { BUILDINGS, produceOf } from '../defs.js';
 import { streetPart } from '../config.js';
-import { spillTile, shapeAt } from '../world/roadShape.js';
+import { inRect, toLocal, toWorld } from '../world/geom.js';
 
 function flat(g) { const n = g.index ? g.toNonIndexed() : g; n.deleteAttribute('uv'); n.computeVertexNormals(); return n; }
 
@@ -184,7 +183,7 @@ export class NatureView {
     // dressed streets: avenue trees, hedges, and shrubs and flowers on a
     // planted median (positions from roadDress.js; they keep clear of front
     // doors, so a building changing replants them: this.dressed)
-    this.dressed = !!(w.dress && w.dress.some(v => streetPart(v)));
+    this.dressed = [...w.roads.edges.values()].some(e => streetPart(e.dress));
     if (this.dressed) {
       const sp = dressSpots(w);
       for (const tr of sp.trees) {
@@ -205,8 +204,8 @@ export class NatureView {
     }
     // boulevards: trees, hedges, clipped balls, shrubs, the flowers in their
     // beds and the grass of their medians (positions from boulevard.js)
-    if (w.blvd && w.blvd.some(Boolean)) {
-      const sp = boulevardSpots(w);
+    if (false) {
+      const sp = { trees: [], hedges: [], balls: [], shrubs: [], blooms: [], tufts: [] };
       for (const tr of sp.trees) {
         const y = t.heightAt(tr.x, tr.z) - 0.01, h = hash2(Math.floor(tr.x * 100), Math.floor(tr.z * 100), 3);
         const k = turn(h), bare = bareOf(k), leaf = (q) => FOLIAGE.round[q][Math.floor(h * Math.min(3, FOLIAGE.round[q].length))];
@@ -249,51 +248,54 @@ export class NatureView {
     // one): rows of crop tufts in the farm's frame (none in winter, or on
     // grazing land) or an orchard's rows of fruit trees, and a post-and-rail
     // fence round the outside, with a gate from the yard
-    const N = w.N;
-    const cropField = new Uint8Array(N * N);
+    const crops = [];   // the rectangles of crops (no tufts of wild grass there)
     for (const farm of w.buildings.values()) {
       const def = BUILDINGS[farm.type];
       if (!def.fields) continue;
       const land = farmlandOf(w, farm);
-      if (!land.size) continue;
-      const id = farm.id, P = produceOf(farm), fruit = P.kind === 'orchard';
+      if (!land.length) continue;
+      const P = produceOf(farm), fruit = P.kind === 'orchard';
       const cols = P.crop && s < 3 ? P.crop[s] : CROP_TUFT[s];
       // the farm's frame: lx across it, lz from back to front (as its model)
-      const th = (farm.rot * Math.PI) / 2, co = Math.cos(th), si = Math.sin(th);
-      const cx = farm.x + fw(farm) / 2, cz = farm.z + fd(farm) / 2;
-      const toWorld = (lx, lz) => [cx + lx * co + lz * si, cz - lx * si + lz * co];
-      const mine = (nx, nz) => w.inBounds(nx, nz) && land.has(nz * N + nx);
-      const yard = (nx, nz) => w.inBounds(nx, nz) && w.buildingAt[nz * N + nx] === id && !land.has(nz * N + nx);
-      // points of a lattice in the farm's frame (start + k * step) that fall
-      // in a tile, so rows run on from one tile to the next
-      const lattice = (x0, z0, x1, z1, ax, sx, az, sz, fn) => {
-        const c0 = [(x0 - cx) * co - (z0 - cz) * si, (x0 - cx) * si + (z0 - cz) * co], c1 = [(x1 - cx) * co - (z1 - cz) * si, (x1 - cx) * si + (z1 - cz) * co];
-        const l0 = Math.min(c0[0], c1[0]), l1 = Math.max(c0[0], c1[0]), m0 = Math.min(c0[1], c1[1]), m1 = Math.max(c0[1], c1[1]);
+      const F = ownPlot(farm), home = homeField(farm);
+      const inLand = (px, pz, pad = 0) => land.some(R => inRect(R, px, pz, pad));
+      // points of a lattice in the farm's frame (start + k * step) over a
+      // rectangle, so rows run on from one field to the next
+      const lattice = (R, ax, sx, az, sz, fn) => {
+        const ls = R.pts.map(([px, pz]) => toLocal(F, px, pz));
+        const l0 = Math.min(...ls.map(p => p[0])), l1 = Math.max(...ls.map(p => p[0])), m0 = Math.min(...ls.map(p => p[1])), m1 = Math.max(...ls.map(p => p[1]));
         for (let lz = az + Math.ceil((m0 - az) / sz) * sz; lz < m1; lz += sz) for (let lx = ax + Math.ceil((l0 - ax) / sx) * sx; lx < l1; lx += sx) fn(lx, lz);
       };
-      const home = new Set(homeField(farm).map(([x, z]) => z * N + x));
       // kept clear of what stands in its own field (see MODELS.farm)
       const clear = (lx, lz) => !((farm.level >= 2 && !fruit && Math.hypot(lx - 0.8, lz + 0.8) < 0.24) || (farm.level >= 3 && lx < -0.72 && lz < 0));
       const fruitCol = FRUIT_COL[farm.variant % FRUIT_COL.length];
-      for (const ti of land) {
-        const x = ti % N, z = (ti / N) | 0, own = home.has(ti);
-        // inside the fence on its outer edges
-        const pad = 0.07, x0 = x + (mine(x - 1, z) ? 0 : pad), x1 = x + 1 - (mine(x + 1, z) ? 0 : pad), z0 = z + (mine(x, z - 1) ? 0 : pad), z1 = z + 1 - (mine(x, z + 1) ? 0 : pad);
+      const seen = new Set();
+      for (let ri = 0; ri < land.length; ri++) {
+        const R = land[ri], own = R === home;
+        // (each point once, inside the fence)
+        const inside = (px, pz) => inRect(R, px, pz, -0.06) || (inRect(R, px, pz) && land.some((Q, qi) => qi !== ri && inRect(Q, px, pz, 0.1)));
         if (fruit) {
-          lattice(x0 + 0.06, z0 + 0.06, x1 - 0.06, z1 - 0.06, -0.82, 0.38, -0.75, 0.42, (lx, lz) => {
-            const [px, pz] = toWorld(lx, lz), h = hash2(Math.floor(px * 100), Math.floor(pz * 100), 13);
+          lattice(R, -0.82, 0.38, -0.75, 0.42, (lx, lz) => {
+            const key = Math.round(lx * 100) + ':' + Math.round(lz * 100);
+            const [px, pz] = toWorld(F, lx, lz);
+            if (seen.has(key) || !inside(px, pz)) return;
+            seen.add(key);
+            const h = hash2(Math.floor(px * 100), Math.floor(pz * 100), 13);
             const y = t.heightAt(px, pz) - 0.01, k = turn(h), bare = bareOf(k);
             const leaf = (q) => (q === 0 && h < 0.4 ? BLOSSOM[h < 0.2 ? 0 : 1] : FOLIAGE.round[q][Math.floor(h * Math.min(3, FOLIAGE.round[q].length))]);
             put('trunk', px, y, pz, 0.45, h * 6, '#6e4d31');
             put('round', px, y + 0.02 + bare * 0.03, pz, 0.36 * (1 - bare * 0.3), h * 6, mixC(leaf(s), leaf(n), k));
-            if (s === 1 || s === 2) for (let q = 0; q < 2; q++) put('bloom', px + (hash2(ti, q * 7 + Math.round(lx * 100), 15) - 0.5) * 0.11, y + 0.06 + hash2(ti, q * 7 + Math.round(lz * 100), 16) * 0.04, pz + (hash2(ti, q * 7 + Math.round(lx * 100), 17) - 0.5) * 0.11, 1.1, 0, fruitCol);
+            if (s === 1 || s === 2) for (let q = 0; q < 2; q++) put('bloom', px + (hash2(ri, q * 7 + Math.round(lx * 100), 15) - 0.5) * 0.11, y + 0.06 + hash2(ri, q * 7 + Math.round(lz * 100), 16) * 0.04, pz + (hash2(ri, q * 7 + Math.round(lx * 100), 17) - 0.5) * 0.11, 1.1, 0, fruitCol);
           });
         } else if (P.kind !== 'livestock') {
-          cropField[ti] = 1;
-          if (s < 3) lattice(x0, z0, x1, z1, 0.055, 0.11, -0.1, 0.4, (lx, lz) => {
-            if (own && !clear(lx, lz)) return;
+          crops.push(R);
+          if (s < 3) lattice(R, 0.055, 0.11, -0.1, 0.4, (lx, lz) => {
+            const key = Math.round(lx * 1000) + ':' + Math.round(lz * 1000);
+            const [qx0, qz0] = toWorld(F, lx, lz);
+            if (seen.has(key) || !inside(qx0, qz0) || (own && !clear(lx, lz))) return;
+            seen.add(key);
             const k = hash2(Math.round(lx * 100) + 977, Math.round(lz * 100) + farm.id * 131, 9);
-            const [qx, qz] = toWorld(lx, lz), px = qx + (k - 0.5) * 0.03, pz = qz + (hash2(Math.round(lx * 100), Math.round(lz * 100), 10) - 0.5) * 0.03;
+            const px = qx0 + (k - 0.5) * 0.03, pz = qz0 + (hash2(Math.round(lx * 100), Math.round(lz * 100), 10) - 0.5) * 0.03;
             put('crop', px, t.heightAt(px, pz), pz, 0.85 + k * 0.35, k * 6, cols[k < 0.5 ? 0 : 1]);
           });
         }
@@ -306,43 +308,52 @@ export class NatureView {
           for (let q = 0; q <= 2; q++) { const fx = x0 + (x1 - x0) * q / 2, fz = z0 + (z1 - z0) * q / 2; put('post', fx, t.heightAt(fx, fz), fz, 1, 0, FENCE_COL); }
         };
         // a fence wherever the farmland ends (an orchard's own plot has its
-        // own fence); where its own field meets the yard, a gate in the middle
+        // own fence), in pieces a field long; where its own field meets the
+        // yard, a gate in the middle
         const e = 0.04, g = 0.1;
-        const side = (dx, dz, x0, z0, x1, z1) => {
-          const nx = x + dx, nz = z + dz;
-          if (mine(nx, nz) || (fruit && w.inBounds(nx, nz) && w.buildingAt[nz * N + nx] === id)) return;
-          if (own && yard(nx, nz)) {
-            if (farm.rot & 1) { if (Math.abs(z0 - cz) < 0.1) z0 = cz + Math.sign(z1 - cz) * g; if (Math.abs(z1 - cz) < 0.1) z1 = cz + Math.sign(z0 - cz) * g; }
-            else { if (Math.abs(x0 - cx) < 0.1) x0 = cx + Math.sign(x1 - cx) * g; if (Math.abs(x1 - cx) < 0.1) x1 = cx + Math.sign(x0 - cx) * g; }
+        for (let k = 0; k < 4; k++) {
+          const [ax, az] = R.pts[k], [bx, bz] = R.pts[(k + 1) & 3], L = Math.hypot(bx - ax, bz - az), n2 = Math.max(1, Math.round(L));
+          const ox = R.cx - (ax + bx) / 2, oz = R.cz - (az + bz) / 2, ol = Math.hypot(ox, oz) || 1;
+          for (let q = 0; q < n2; q++) {
+            let x0 = ax + ((bx - ax) * q) / n2, z0 = az + ((bz - az) * q) / n2, x1 = ax + ((bx - ax) * (q + 1)) / n2, z1 = az + ((bz - az) * (q + 1)) / n2;
+            const mx = (x0 + x1) / 2 - (ox / ol) * 0.08, mz = (z0 + z1) / 2 - (oz / ol) * 0.08;
+            if (land.some((Q, qi) => qi !== ri && inRect(Q, mx, mz))) continue;
+            const yardSide = own && inRect(F, mx, mz) && !inRect(R, mx, mz);
+            if (fruit && inRect(F, mx, mz)) continue;
+            // (inset a little from the field's edge)
+            const ix = (ox / ol) * e, iz = (oz / ol) * e;
+            x0 += ix; z0 += iz; x1 += ix; z1 += iz;
+            if (yardSide) {
+              // a gate in the middle of the side the yard is on
+              const [cx2, cz2] = [(x0 + x1) / 2, (z0 + z1) / 2], dx = (x1 - x0) / (L / n2), dz = (z1 - z0) / (L / n2);
+              rail(x0, z0, cx2 - dx * g, cz2 - dz * g);
+              rail(cx2 + dx * g, cz2 + dz * g, x1, z1);
+              continue;
+            }
+            rail(x0, z0, x1, z1);
           }
-          rail(x0, z0, x1, z1);
-        };
-        side(0, -1, x + e, z + e, x + 1 - e, z + e);
-        side(0, 1, x + e, z + 1 - e, x + 1 - e, z + 1 - e);
-        side(-1, 0, x + e, z + e, x + e, z + 1 - e);
-        side(1, 0, x + 1 - e, z + e, x + 1 - e, z + 1 - e);
+        }
       }
     }
     // grass tufts and wildflowers on open land (not in fields of crops)
+    const N = w.N;
+    const open = (px, pz) => !w.roadAt(px, pz, 0.04) && !w.railAt(px, pz, 0.06) && !w.buildingAt(px, pz) && !crops.some(R => inRect(R, px, pz)) && !w.waterAt(px, pz);
     for (let z = 0; z < N; z++) {
       for (let x = 0; x < N; x++) {
-        const i = w.idx(x, z);
-        if (w.roads[i] || w.rails[i] || w.buildingAt[i] >= 0 || cropField[i] || t.isWater(x, z) || t.slope(x, z) > 0.6) continue;
+        if (t.isWater(x, z) || t.slope(x, z) > 0.6) continue;
         const avg = t.tileAvg(x, z);
         if (avg < 0.2 || avg > 2.4) continue;
-        const n = Math.floor(hash2(x, z, 41) * 3);
-        // (not on a diagonal street spilling over the tile's corner)
-        const sp = w.diagN ? spillTile(w, x, z) : null, road = (px, pz) => !!sp && !!shapeAt(sp, px, pz, 0);
-        for (let k = 0; k < n; k++) {
+        const nt = Math.floor(hash2(x, z, 41) * 3);
+        for (let k = 0; k < nt; k++) {
           const px = x + hash2(x, z, 50 + k), pz = z + hash2(x, z, 60 + k);
-          if (road(px, pz)) continue;
+          if (!open(px, pz)) continue;
           put('tuft', px, t.heightAt(px, pz), pz, 0.8 + hash2(x, z, 70 + k) * 0.6, hash2(x, z, 80 + k) * 6, mixC(TUFT[s], TUFT[n], sw));
         }
         if (hash2(x, z, 43) < 0.18 * flowering) {
           const fc = BLOOMS[Math.floor(hash2(x, z, 44) * BLOOMS.length)];
           for (let k = 0; k < 3; k++) {
             const px = x + 0.15 + hash2(x, z, 90 + k) * 0.7, pz = z + 0.15 + hash2(x, z, 95 + k) * 0.7;
-            if (road(px, pz)) continue;
+            if (!open(px, pz)) continue;
             put('bloom', px, t.heightAt(px, pz), pz, 1, 0, fc);
           }
         }
