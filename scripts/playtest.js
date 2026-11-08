@@ -9,7 +9,8 @@
 //   ready-grown town, to measure how the simulation copes) · chaos (like
 //   stress, with instant construction, so far more upgrades / joins / moves)
 
-import { World, fw, fd, isOpen, capOf, seatOf, civicQuarter } from '../src/world/world.js';
+import { World, isOpen, capOf, seatOf, civicQuarter, findPlot, ownPlot } from '../src/world/world.js';
+import { pointAt, toWorld } from '../src/world/geom.js';
 import { PathFinder } from '../src/sim/path.js';
 import { Sim } from '../src/sim/sim.js';
 import { Agents, visitorCap } from '../src/sim/agents.js';
@@ -22,11 +23,7 @@ import { serialize, deserialize } from '../src/save/saves.js';
 import { computeIssues } from '../src/ui/issues.js';
 import { RNG } from '../src/util/rng.js';
 import { growDemoTown } from '../src/world/demo.js';
-import { roadRun, applyRoadEdit } from '../src/world/roadEdit.js';
-import { applyDress } from '../src/world/roadDress.js';
-import { boulevardTiles } from '../src/world/boulevard.js';
-import { strokeTiles } from '../src/world/diagonal.js';
-import { CORNERS } from '../src/world/roadShape.js';
+import { applyRoadEdit, applyDress, streetOf } from '../src/world/streets.js';
 import { DRESSINGS } from '../src/config.js';
 import { makeAudit } from './audit.js';
 
@@ -62,51 +59,60 @@ game.on('graduated', () => { counts.grads++; });
 w.on('research:done', () => { counts.research++; });
 
 // ------------------------------------------------------------ bot helpers
-const center = (() => { const th = [...w.buildings.values()].find(b => BUILDINGS[b.type].seat); return { x: th.x + th.size / 2, z: th.z + th.size / 2 }; })();
-// the tile just beyond the end of a street: kept free so the street can grow
-const streetEnd = (x, z) => [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dz]) => w.roadAt(x - dx, z - dz) && w.roadAt(x - 2 * dx, z - 2 * dz) && !w.roadAt(x - dx + dz, z - dz + dx) && !w.roadAt(x - dx - dz, z - dz - dx));
-function spots(type, near = center, max = 14) {
-  const out = [];
-  for (let r = 1; r <= max; r++) for (let dz = -r; dz <= r; dz++) for (let dx = -r; dx <= r; dx++) {
-    if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
-    const x = near.x + dx, z = near.z + dz;
-    if (streetEnd(x, z)) continue;
-    const c = w.checkBuild(type, x, z);
-    if (c.ok && c.access.some(a => a.conn)) out.push({ x, z });
-    if (out.length >= 3) return out;
+const center = (() => { const th = seatOf(w); return { x: th.x, z: th.z }; })();
+// the ground just beyond the end of a street: kept free so the street can grow
+const blocksEnd = (x, z) => {
+  for (const n of w.roads.nodes.values()) {
+    if (n.edges.length !== 1 || Math.abs(n.x - x) > 3 || Math.abs(n.z - z) > 3) continue;
+    const e = w.roads.edges.get(n.edges[0]), a = w.roads.dirAt(e, n.id) + Math.PI, ux = Math.sin(a), uz = Math.cos(a);
+    for (const t of [0.6, 1.2, 1.8, 2.4]) if (Math.hypot(n.x + ux * t - x, n.z + uz * t - z) < 0.95) return true;
   }
-  return out;
-}
+  return false;
+};
+// somewhere for a building along the town's streets near a point, on the
+// roads to the way out: { x, z, a }, or null
+const spot = (type, near = center, r = 14) => findPlot(w, type, near, { r, test: (x, z, a, chk) => !blocksEnd(x, z) && (!chk || !!(chk.access && chk.access.conn)) });
 function place(type, near) {
   if (MODE === 'economy' && [...w.buildings.values()].some(b => b.type === type && b.con && b.con.kind === 'build') && type !== 'house') return null;
   // near the middle if there's room, else further out
-  const s = spots(type, near)[0] || spots(type, near, 22)[0];
+  const s = spot(type, near) || spot(type, near, 22);
   if (!s) return null;
   // a planting or monument is half the time built as a kind of the bot's choosing
   const kinds = KINDS[type] && Object.keys(KINDS[type]).filter(k => w.hasTech(KINDS[type][k].tech));
   const flavor = kinds && kinds.length && rng.chance(0.5) ? rng.pick(kinds) : undefined;
-  const r = w.placeBuilding(type, s.x, s.z, { variant: (rng.next() * 1e9) | 0, flavor });
+  const r = w.placeBuilding(type, s.x, s.z, { a: s.a, variant: (rng.next() * 1e9) | 0, flavor });
   if (r.ok) counts.placed++;
   return r.ok ? r.building : null;
 }
+// A street out from one of the town's (from a dead end on, or off the side
+// of a stretch), len long, bending by bend: the points to lay, or null.
+function streetOut(len, bend) {
+  const es = [...w.roads.edges.values()].filter(e => w.connected.has(e.a));
+  for (let t = 0; t < 40 && es.length; t++) {
+    const e = rng.pick(es);
+    let x, z, ux, uz;
+    const end = [e.a, e.b].find(n => w.roads.nodes.get(n).edges.length === 1 && n !== w.entry.node);
+    if (end != null && rng.chance(0.5)) {
+      const n = w.roads.nodes.get(end), a = w.roads.dirAt(e, end) + Math.PI;
+      x = n.x; z = n.z; ux = Math.sin(a); uz = Math.cos(a);
+    } else {
+      if (e.len < 2.2) continue;
+      const p = pointAt(e.pts, e.cum, rng.float(1, e.len - 1)), sd = rng.chance(0.5) ? 1 : -1;
+      x = p[0]; z = p[1]; ux = -p[4] * sd; uz = p[3] * sd;
+    }
+    // (the bend: the far end swung round, the middle half as much)
+    const c = Math.cos(bend), si = Math.sin(bend), vx = ux * c + uz * si, vz = -ux * si + uz * c;
+    const pts = [[x, z], [x + (ux + vx) * len / 4, z + (uz + vz) * len / 4], [x + vx * len, z + vz * len]];
+    if (w.checkRoad(pts, 1).ok) return pts;
+  }
+  return null;
+}
 // lay a new street off an existing one, heading out of town
 function growRoads() {
-  // start from a street with open ground beside it
-  const starts = [];
-  for (let z = 0; z < N; z++) for (let x = 0; x < N; x++) {
-    if (!w.roadAt(x, z) || !w.connected[w.idx(x, z)]) continue;
-    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) if (!w.roadAt(x + dx, z + dz) && w.checkRoad(x + dx, z + dz, 1).ok && !w.buildingOn(x + dx, z + dz)) starts.push([x, z, dx, dz]);
-  }
   // a proper street if there's room for one, else a short spur
-  for (let t = 0; t < 60 && starts.length; t++) {
-    const [sx, sz, dx, dz] = rng.pick(starts);
-    const tiles = [];
-    for (let k = 1; k <= 6; k++) {
-      const x = sx + dx * k, z = sz + dz * k;
-      if (w.roadAt(x, z) || !w.checkRoad(x, z, 1).ok || w.buildingOn(x, z)) break;
-      tiles.push([x, z]);
-    }
-    if (tiles.length >= (t < 40 ? 3 : 1)) { const r = w.placeRoads(tiles, 1); if (r.placed) { counts.roads += r.placed; return true; } }
+  for (const len of [6, 4.5, 3, 2]) {
+    const pts = streetOut(len, rng.float(-0.4, 0.4));
+    if (pts) { const r = w.placeRoad(pts, 1); if (r.placed) { counts.roads += r.placed; return true; } }
   }
   return false;
 }
@@ -200,8 +206,9 @@ function botDay() {
     const farms = [...w.buildings.values()].filter(b => BUILDINGS[b.type].fields && !b.con && (b.fields || 0) < w.fieldMax(b));
     const b = farms.length && rng.pick(farms);
     if (b && (MODE !== 'economy' || w.money > 200)) {
-      const tiles = [];
-      for (let z = b.z - 3; z < b.z + fd(b) + 3; z++) for (let x = b.x - 3; x < b.x + fw(b) + 3; x++) tiles.push([x, z]);
+      // (squares of land beside it and behind it, lined up with it)
+      const R = ownPlot(b), tiles = [];
+      for (let j = -4; j <= 2; j++) for (let i = -4; i <= 4; i++) tiles.push([...toWorld(R, i + 0.5 * ((b.w + 1) % 2), j - 0.5 + 0.5 * (b.d % 2)), b.a]);
       const r = w.setFields(b.id, tiles, true);
       if (r.ok) counts.fields = (counts.fields || 0) + r.n;
     }
@@ -231,98 +238,54 @@ function botDay() {
   if (rng.chance(MODE !== 'economy' ? 0.5 : 0.06)) {
     const cands = [...w.buildings.values()].filter(b => !b.con && BUILDINGS[b.type].size === 1 && !BUILDINGS[b.type].seat);
     const b = cands.length && rng.pick(cands);
-    const s = b && spots(b.type, { x: b.x, z: b.z }, 8)[0];
-    if (s && w.moveBuilding(b.id, s.x, s.z).ok) counts.moves++;
+    const s = b && spot(b.type, { x: b.x, z: b.z }, 8);
+    if (s && w.moveBuilding(b.id, s.x, s.z, { a: s.a }).ok) counts.moves++;
   }
   if (rng.chance(MODE !== 'economy' ? 0.3 : 0.04)) {
     const cands = [...w.buildings.values()].filter(b => !b.con && !BUILDINGS[b.type].seat && b.type !== 'builder');
     const b = cands.length && rng.pick(cands);
     if (b && w.demolishBuilding(b.id).ok) counts.demolish++;
   }
-  // the busy modes make boulevards: a second road laid beside a straight
-  // stretch, given a look, and now and then a lane tile taken up again
-  if (MODE !== 'economy' && rng.chance(0.4)) boulevard();
-  // and diagonal streets out of town, with homes facing them
-  if (MODE !== 'economy' && rng.chance(0.3)) diagonal();
-  // and buildings turned and nudged on their plots, or squared up again
-  if (MODE !== 'economy' && rng.chance(0.4)) {
-    const b = rng.pick([...w.buildings.values()]);
-    if (b && w.setPose(b.id, rng.chance(0.2) ? null : [rng.float(-0.785, 0.785), rng.float(-0.2, 0.2), rng.float(-0.2, 0.2)]).ok && b.pose) counts.posed = (counts.posed || 0) + 1;
+  // the busy modes lay curving streets out of town with homes facing them
+  // (and take a stretch up now and then), dress streets, and turn buildings
+  // on their plots
+  if (MODE !== 'economy' && rng.chance(0.4)) curve();
+  if (MODE !== 'economy' && rng.chance(0.3)) dress();
+  if (MODE !== 'economy' && rng.chance(0.4)) turn();
+}
+
+// a curving street out of town off one of its streets, homes along it
+function curve() {
+  // a stretch taken up now and then (its homes left to find another street)
+  if (rng.chance(0.15)) {
+    const ends = [...w.roads.edges.values()].filter(e => [e.a, e.b].some(n => w.roads.nodes.get(n).edges.length === 1) && e.a !== w.entry.node && e.b !== w.entry.node);
+    if (ends.length && applyRoadEdit(w, [rng.pick(ends).id], 'remove').ok) counts.curveGone = (counts.curveGone || 0) + 1;
+    return;
+  }
+  const pts = streetOut(rng.float(4, 8), rng.float(-0.6, 0.6));
+  if (!pts || !w.placeRoad(pts, rng.pick([1, 2, 3])).placed) return;
+  counts.curves = (counts.curves || 0) + 1;
+  for (let i = 1; i < pts.length; i++) {
+    const s2 = findPlot(w, rng.pick(['house', 'house', 'bakery', 'grocer']), { x: pts[i][0], z: pts[i][1] }, { r: 1.5, opts: { ignoreUnlock: true } });
+    if (s2 && rng.chance(0.6) && w.placeBuilding(s2.chk ? rng.pick(['house', 'house']) : 'house', s2.x, s2.z, { a: s2.a, ignoreUnlock: true }).ok) counts.facing = (counts.facing || 0) + 1;
   }
 }
 
-function diagonal() {
-  // a tile taken up now and then (the homes beside turn back to the grid)
-  if (w.diagN && rng.chance(0.2)) {
-    const on = [];
-    for (let i = 0; i < w.diag.length; i++) if ((w.diag[i] & 15) && w.roads[i]) on.push(i);
-    const i = rng.pick(on);
-    if (w.removeRoad(i % N, (i / N) | 0) === true) counts.diagGone = (counts.diagGone || 0) + 1;
-    return;
-  }
-  for (let t = 0; t < 60; t++) {
-    const x = rng.int(1, N - 2), z = rng.int(1, N - 2), [dx, dz] = rng.pick(CORNERS), len = rng.int(4, 8);
-    if (!w.roadAt(x, z) || !w.connected[w.idx(x, z)]) continue;
-    const tiles = strokeTiles({ x, z }, { x: x + dx * len, z: z + dz * len });
-    if (!tiles.every(([tx, tz]) => w.inBounds(tx, tz)) || !w.checkStroke(tiles, 1).slice(1).every(c => c.ok && !c.noop)) continue;
-    if (!w.placeRoads(tiles, rng.pick([1, 2, 3]), { stroke: true }).placed) continue;
-    counts.diagonals = (counts.diagonals || 0) + 1;
-    for (let i = 1; i < tiles.length - 1; i++) for (const [hx, hz] of [[tiles[i + 1][0], tiles[i][1]], [tiles[i][0], tiles[i + 1][1]]]) {
-      if (rng.chance(0.5) && w.placeBuilding(rng.pick(['house', 'house', 'bakery', 'grocer']), hx, hz, { ignoreUnlock: true }).ok) counts.facing = (counts.facing || 0) + 1;
-    }
-    return;
-  }
+// a street dressed (trees, hedges, lamps, a median), or a dressing taken off
+function dress() {
+  const es = [...w.roads.edges.values()];
+  if (!es.length) return;
+  const e = rng.pick(es), kinds = DRESSINGS.map((D, k) => (D && !D.blvd ? k : -1)).filter(k => k >= 0);
+  if (applyDress(w, streetOf(w, e.id), rng.pick(kinds)).ok) counts.dressed = (counts.dressed || 0) + 1;
 }
 
-function boulevard() {
-  // every straight stretch of four tiles or more, in a random order
-  const runs = [], seen = new Set();
-  for (let z = 1; z < N - 1; z++) for (let x = 1; x < N - 1; x++) {
-    if (!w.roadAt(x, z) || w.blvd[w.idx(x, z)] || seen.has(w.idx(x, z))) continue;
-    const run = roadRun(w, x, z);
-    for (const [rx, rz] of run) seen.add(w.idx(rx, rz));
-    const row = run.every(([, rz]) => rz === run[0][1]), col = run.every(([rx]) => rx === run[0][0]);
-    if (run.length >= 4 && (row || col)) runs.push({ run, row });
-  }
-  runs.sort(() => rng.next() - 0.5);
-  // or a new one, two roads wide, heading out of town off a street
-  if (!runs.length || rng.chance(0.5)) {
-    const free = (x, z) => w.inBounds(x, z) && !w.roadAt(x, z) && !w.buildingOn(x, z) && w.checkRoad(x, z, 1).ok;
-    for (let t = 0; t < 80; t++) {
-      const x = rng.int(1, N - 2), z = rng.int(1, N - 2), [dx, dz] = rng.pick([[1, 0], [-1, 0], [0, 1], [0, -1]]);
-      if (!w.roadAt(x, z) || !w.connected[w.idx(x, z)]) continue;
-      const a = [], b = [];
-      for (let k = 1; k <= 7; k++) {
-        const ax = x + dx * k, az = z + dz * k;
-        if (!free(ax, az) || !free(ax + dz, az + dx)) break;
-        a.push([ax, az]); b.push([ax + dz, az + dx]);
-      }
-      if (a.length < 4) continue;
-      const L = rng.pick([1, 2, 3]);
-      if (!w.placeRoads([...a, ...b], L).placed) continue;
-      counts.boulevards = (counts.boulevards || 0) + 1;
-      const lanes = boulevardTiles(w, ...a[2]), looks = DRESSINGS.map((D, k) => (D && D.blvd ? k : 0)).filter(Boolean);
-      if (lanes.length && applyDress(w, lanes, rng.pick(looks)).ok) counts.looks = (counts.looks || 0) + 1;
-      return;
-    }
-  }
-  for (const { run, row } of runs) {
-    for (const s of [-1, 1]) {
-      const side = run.map(([x, z]) => (row ? [x, z + s] : [x + s, z]));
-      if (!side.every(([x, z]) => w.inBounds(x, z) && !w.roadAt(x, z) && !w.buildingOn(x, z) && w.checkRoad(x, z, 1).ok)) continue;
-      const r = w.placeRoads(side, w.roadAt(...run[0]));
-      if (!r.placed) continue;
-      counts.boulevards = (counts.boulevards || 0) + 1;
-      const lanes = boulevardTiles(w, ...side[1]);
-      const looks = DRESSINGS.map((D, k) => (D && D.blvd ? k : 0)).filter(Boolean);
-      if (lanes.length && rng.chance(0.7) && applyDress(w, lanes, rng.pick(looks)).ok) counts.looks = (counts.looks || 0) + 1;
-      return;
-    }
-  }
-  // a lane tile taken up (the boulevard's look goes from the other lane)
-  const lanes = [];
-  for (let i = 0; i < w.blvd.length; i++) if (w.blvd[i] && w.roads[i]) lanes.push([i % N, (i / N) | 0]);
-  if (lanes.length && rng.chance(0.3)) { const t = rng.pick(lanes); if (applyRoadEdit(w, [t], 'remove').ok) counts.laneGone = (counts.laneGone || 0) + 1; }
+// a building turned a little on its plot (a park any way at all)
+function turn() {
+  const cands = [...w.buildings.values()].filter(b => !b.con && !b.spare && !(b.leases && b.leases.length));
+  const b = cands.length && rng.pick(cands);
+  if (!b) return;
+  const a = BUILDINGS[b.type].park ? rng.float(-Math.PI, Math.PI) : b.a + rng.float(-0.35, 0.35);
+  if (w.turnBuilding(b.id, a).ok) counts.turned = (counts.turned || 0) + 1;
 }
 
 // ------------------------------------------------------------ invariants
@@ -399,19 +362,19 @@ console.log('buildings:', Object.entries(types).sort((a, b) => b[1] - a[1]).map(
 {
   // double plots grown into 2×2 estates, and the estate buildings standing on them
   const est = [...w.buildings.values()].filter(b => BUILDINGS[b.type].estate);
-  const on = [...w.buildings.values()].filter(b => fw(b) * fd(b) === 4 && BUILDINGS[b.type].merged).length;
+  const on = [...w.buildings.values()].filter(b => b.w * b.d === 4 && BUILDINGS[b.type].merged).length;
   console.log(`2×2 estates: ${counts.estates} grown, ${counts.estateBuilt} rebuilt as estate buildings · standing: ${est.map(b => `${BUILDINGS[b.type].levels[b.level].name}${b.con ? ' (building)' : ''}`).join(', ') || 'none'} · ${on} double-plot buildings on grown estates`);
   // 2×2 parks grown into bigger grounds, and the grand parks standing on them
   const big = [...w.buildings.values()].filter(b => BUILDINGS[b.type].grand && BUILDINGS[b.type].park);
   const parkTypes = new Set([...w.buildings.values()].filter(b => BUILDINGS[b.type].park).map(b => b.type));
-  console.log(`park grounds: ${counts.grounds} grown, ${counts.groundsBuilt} laid out · standing: ${big.map(b => `${BUILDINGS[b.type].levels[b.level].name} ${fw(b)}×${fd(b)}`).join(', ') || 'none'} · ${parkTypes.size} kinds of park in town`);
+  console.log(`park grounds: ${counts.grounds} grown, ${counts.groundsBuilt} laid out · standing: ${big.map(b => `${BUILDINGS[b.type].levels[b.level].name} ${b.w}×${b.d}`).join(', ') || 'none'} · ${parkTypes.size} kinds of park in town`);
   // plantings and monuments by kind and level, and how many were reworked
   const kinds = {};
   for (const b of w.buildings.values()) if (KINDS[b.type] && !BUILDINGS[b.type].seat) { const k = `${KINDS[b.type][kindOf(b)].name} L${b.level}`; kinds[k] = (kinds[k] || 0) + 1; }
   console.log(`plantings and monuments: ${Object.entries(kinds).sort().map(([k, v]) => `${k} ×${v}`).join(', ') || 'none'} · ${counts.rekinds} reworked`);
   // the seat of government, and the civic quarter round it
   const seat = seatOf(w), q = civicQuarter(w), civic = [...w.buildings.values()].filter(b => BUILDINGS[b.type].civic);
-  console.log(`seat: ${seat ? `${BUILDINGS[seat.type].levels[seat.level].name} on ${fw(seat)}×${fd(seat)} (${KINDS[seat.type][kindOf(seat)].name.toLowerCase()})` : 'none'} · civic buildings: ${civic.map(b => BUILDINGS[b.type].levels[b.level].name).join(', ') || 'none'} · quarter: ${q.kinds.length} kinds, +${Math.round(q.tax * 100)}% tax`);
+  console.log(`seat: ${seat ? `${BUILDINGS[seat.type].levels[seat.level].name} on ${seat.w}×${seat.d} (${KINDS[seat.type][kindOf(seat)].name.toLowerCase()})` : 'none'} · civic buildings: ${civic.map(b => BUILDINGS[b.type].levels[b.level].name).join(', ') || 'none'} · quarter: ${q.kinds.length} kinds, +${Math.round(q.tax * 100)}% tax`);
 }
 console.log('issues now:', computeIssues(game).map(i => i.text).join(' | ') || 'none');
 {

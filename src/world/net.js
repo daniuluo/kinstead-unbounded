@@ -15,6 +15,7 @@
 import { Index, segDist, lastT, segCross, cumulative, pointAt, nearestOn, slice, angleOf, angDiff, polyLength } from './geom.js';
 
 // how near a road's end must come to another road to join it
+const r3 = (v) => Math.round(v * 1000) / 1000;
 export const SNAP = 0.4;
 // a junction this near one already there is that one
 const MERGE = 0.3;
@@ -37,7 +38,10 @@ export class Net {
   }
 
   // --------------------------------------------------------------- basics
+  // (points are kept to a thousandth, as a save keeps them, so a town and
+  // its save, and a guest's copy of it, have the very same roads)
   addNode(x, z, id = null) {
+    x = r3(x); z = r3(z);
     const n = { id: id ?? this.nextId++, x, z, edges: [] };
     if (n.id >= this.nextId) this.nextId = n.id + 1;
     this.nodes.set(n.id, n);
@@ -50,8 +54,13 @@ export class Net {
   // An edge from node a to node b along pts (pts[0] at a, the last at b).
   addEdge(a, b, pts, props = {}, id = null) {
     const A = this.nodes.get(a), B = this.nodes.get(b);
-    const P = pts.map(p => [p[0], p[1]]);
+    const P = [];
+    for (const p of pts) { const q = [r3(p[0]), r3(p[1])], l = P[P.length - 1]; if (!l || l[0] !== q[0] || l[1] !== q[1]) P.push(q); }
+    if (P.length < 2) P.push([B.x, B.z]);
     P[0] = [A.x, A.z]; P[P.length - 1] = [B.x, B.z];
+    // (and no point twice in a row where the ends were put on their nodes)
+    for (let i = P.length - 2; i > 0; i--) if (P[i][0] === P[i + 1][0] && P[i][1] === P[i + 1][1]) P.splice(i, 1);
+    if (P.length > 2 && P[1][0] === P[0][0] && P[1][1] === P[0][1]) P.splice(1, 1);
     const e = { id: id ?? this.nextId++, a, b, level: props.level || 1, dress: props.dress || 0, buried: props.buried || 0, pts: P, cum: null, len: 0, segs: [], hy: null };
     if (e.id >= this.nextId) this.nextId = e.id + 1;
     e.cum = cumulative(P); e.len = e.cum[e.cum.length - 1];
@@ -133,13 +142,17 @@ export class Net {
   // ------------------------------------------------------------- finding
   // The nearest point on any edge to (x, z) within r: { e, d, s, x, z, i,
   // dx, dz (the edge's way there) }, or null. filter(e) may rule edges out.
+  // (Two as near, a corner both segments share, say: the one on the lower
+  // edge id, the earlier along it, whatever order the index holds them in,
+  // so every copy of a town finds the same.)
   nearest(x, z, r = 1, filter = null) {
     let best = null;
     for (const sg of this.segs.near(x, z, r)) {
       const e = sg.e;
       if (filter && !filter(e)) continue;
       const p = e.pts[sg.i], q = e.pts[sg.i + 1], d = segDist(x, z, p[0], p[1], q[0], q[1]);
-      if (d > r || (best && d >= best.d)) continue;
+      if (d > r) continue;
+      if (best && (d > best.d + 1e-12 || (d > best.d - 1e-12 && (e.id > best.e.id || (e.id === best.e.id && sg.i > best.i))))) continue;
       const t = lastT(), L = e.cum[sg.i + 1] - e.cum[sg.i] || 1;
       best = { e, d, s: e.cum[sg.i] + (e.cum[sg.i + 1] - e.cum[sg.i]) * t, x: p[0] + (q[0] - p[0]) * t, z: p[1] + (q[1] - p[1]) * t, i: sg.i, dx: (q[0] - p[0]) / L, dz: (q[1] - p[1]) / L };
     }

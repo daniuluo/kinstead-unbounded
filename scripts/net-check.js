@@ -3,7 +3,8 @@
 // side in this process, joined by in-memory links instead of WebRTC.
 // Usage: npm install three@0.170.0 --no-save && node scripts/net-check.js
 
-import { World, fw, fd } from '../src/world/world.js';
+import { World, findPlot, seatOf, ownPlot } from '../src/world/world.js';
+import { rect, toWorld, pointAt } from '../src/world/geom.js';
 import { growDemoTown } from '../src/world/demo.js';
 import { PathFinder } from '../src/sim/path.js';
 import { Sim } from '../src/sim/sim.js';
@@ -100,18 +101,18 @@ function differences(a, b) {
   for (const x of A.buildings.values()) {
     const y = B.buildings.get(x.id);
     if (!y) { add(`building ${x.id} (${x.type}) missing`); continue; }
-    const k = (o) => JSON.stringify([o.type, o.level, o.x, o.z, fw(o), fd(o), o.rot, o.diag || 0, o.pose || null, o.curve || 0, o.look || null, o.flavor || null, o.variant, o.access, !!o.connected, o.front || 0, o.leases && o.leases.length ? o.leases : null,
+    const k = (o) => JSON.stringify([o.type, o.level, o.x, o.z, o.a, o.w, o.d, o.look || null, o.flavor || null, o.variant, o.access, !!o.connected, o.front || 0, o.leases && o.leases.length ? o.leases : null,
       o.con ? [o.con.kind, o.con.to, o.con.toType, o.con.wait || null] : null]);
     if (k(x) !== k(y)) add(`building ${x.id} differs: ${k(x)} vs ${k(y)}`);
     else if (x.con && Math.abs(x.con.done - y.con.done) > 0.02) add(`site ${x.id} progress ${x.con.done} vs ${y.con.done}`);
   }
-  for (let i = 0; i < A.roads.length; i++) {
-    if (A.roads[i] !== B.roads[i]) { add(`road at ${i}`); break; }
-    if (A.diag[i] !== B.diag[i]) { add(`diagonal at ${i}: ${A.diag[i]} vs ${B.diag[i]}`); break; }
-    if (A.rails[i] !== B.rails[i]) { add(`rail at ${i}`); break; }
-    if (A.treeCount[i] !== B.treeCount[i]) { add(`trees at ${i}: ${A.treeCount[i]} vs ${B.treeCount[i]}`); break; }
-    if (A.buildingAt[i] !== B.buildingAt[i]) { add(`plot at ${i}: ${A.buildingAt[i]} vs ${B.buildingAt[i]}`); break; }
-  }
+  // the roads and track (as curves: every stretch, junction and end, level and dressing)
+  if (JSON.stringify(A.roads.toRec()) !== JSON.stringify(B.roads.toRec())) add(`roads ${A.roads.edges.size} vs ${B.roads.edges.size} stretches`);
+  if (JSON.stringify(A.rails.toRec()) !== JSON.stringify(B.rails.toRec())) add('track differs');
+  const trees = (w) => w.trees.map(t => `${t.x.toFixed(2)},${t.z.toFixed(2)}`).sort().join(' ');
+  if (trees(A) !== trees(B)) add(`trees ${A.trees.length} vs ${B.trees.length}`);
+  const fields = (w) => [...w.parcels.values()].map(f => `${f.farm}:${f.x},${f.z},${f.a}`).sort().join(' ');
+  if (fields(A) !== fields(B)) add(`fields ${A.parcels.size} vs ${B.parcels.size}`);
   for (let i = 0; i < A.terrain.H.length; i++) if (Math.abs(A.terrain.H[i] - B.terrain.H[i]) > 0.0011) { add(`height at ${i}`); break; }
   if (A.residents.size !== B.residents.size) add(`villagers ${A.residents.size} vs ${B.residents.size}`);
   for (const r of A.residents.values()) {
@@ -128,7 +129,23 @@ function differences(a, b) {
 }
 
 const find = (w, pred) => { for (let z = 2; z < w.N - 3; z++) for (let x = 2; x < w.N - 3; x++) { const r = pred(x, z); if (r) return r; } return null; };
-const freeSpot = (w, type = 'house') => find(w, (x, z) => { const c = w.checkBuild(type, x, z, { ignoreMoney: true, ignoreUnlock: true }); return c.ok && c.access.some(a => a.conn) ? { x, z } : null; });
+// somewhere free along the town's streets, on the roads to the way out: { x, z, a }
+const freeSpot = (w, type = 'house', o = {}) => findPlot(w, type, o.near || seatOf(w), { r: o.r ?? 24, opts: { ignoreMoney: true, ignoreUnlock: true, ignoreUnique: true }, test: (x, z, a, chk) => (!o.test || o.test(x, z, a, chk)) && (!chk || !!(chk.access && chk.access.conn)) });
+// every free spot for a type along the streets (up to max): [{ x, z, a }]
+const spotsFor = (w, type, max = 80) => { const out = []; findPlot(w, type, { x: w.N / 2, z: w.N / 2 }, { r: w.N, step: 0.5, opts: { ignoreMoney: true, ignoreUnlock: true }, test: (x, z, a, chk) => { if (!chk) return out.length < max; if (chk.access && chk.access.conn) out.push({ x, z, a }); return false; } }); return out; };
+// A street off one of the town's (len long, bending by bend), from a point
+// along a stretch out to one side: its points, or null.
+const spur = (w, len = 3, bend = 0.4, level = 1) => {
+  for (const e of w.roads.edges.values()) {
+    if (!w.connected.has(e.a) || e.len < 3) continue;
+    for (const s of [e.len / 2, e.len / 3, (2 * e.len) / 3]) for (const sd of [1, -1]) {
+      const p = pointAt(e.pts, e.cum, s), ux = -p[4] * sd, uz = p[3] * sd, c = Math.cos(bend), si = Math.sin(bend), vx = ux * c + uz * si, vz = -ux * si + uz * c;
+      const pts = [[p[0], p[1]], [p[0] + ((ux + vx) * len) / 4, p[1] + ((uz + vz) * len) / 4], [p[0] + vx * len, p[1] + vz * len]];
+      if (w.checkRoad(pts, level).ok) return pts;
+    }
+  }
+  return null;
+};
 // a command from a guest, answered after the messages have gone round
 const ask = async (g, c) => { let res = null; g.cmd(c, (r) => { res = r; }); await until(() => res); return res; };
 
@@ -144,7 +161,8 @@ hw.money = 50000;
   ok(runCommand(host, { t: 'nope' }).ok === false, 'unknown commands are refused');
   ok(/valid/.test(runCommand(host, { t: 'place', type: 'house', x: 'a', z: 1 }).reason), 'malformed commands are refused');
   ok(/valid/.test(runCommand(host, { t: 'place', type: 'villa', x: 5, z: 5 }).reason), 'hidden building types cannot be placed directly');
-  ok(/valid/.test(runCommand(host, { t: 'roads', tiles: [[0, 0], [999, 3]], level: 1 }).reason), 'tiles off the map are refused');
+  ok(/valid/.test(runCommand(host, { t: 'roads', ctrl: [[1, 1], [999, 3]], level: 1 }).reason), 'a road off the map is refused');
+  ok(/valid/.test(runCommand(host, { t: 'place', type: 'house', x: 5, z: 5, a: 'north' }).reason), 'a place command turned by no angle at all is refused');
   ok(/valid/.test(runCommand(host, { t: 'upgrade', id: 1, look: '<script>' }).reason), 'unknown styles are refused');
   ok(/host/.test(runCommand(host, { t: 'sandbox', opts: { infiniteMoney: true } }, { id: 5, name: 'X', role: 'builder' }).reason), 'only the host may flip sandbox switches');
   ok(runCommand(host, { t: 'tax', rate: 3 }, { id: 5, name: 'V', role: 'visitor' }).reason === VISITOR_REASON && hw.taxRate !== 3, 'a visitor\'s commands are refused, with the reason');
@@ -152,12 +170,12 @@ hw.money = 50000;
   ok(!hw.sandbox.infiniteMoney, '…and a refused switch stays off');
   const spot = freeSpot(hw);
   const before = hw.money;
-  const r = host.cmd({ t: 'place', type: 'house', x: spot.x, z: spot.z, variant: 7, accessIndex: 0, free: true, instant: true });
+  const r = host.cmd({ t: 'place', type: 'house', x: spot.x, z: spot.z, a: spot.a, variant: 7, accessIndex: 0, free: true, instant: true });
   ok(r.ok && r.building.con && hw.money < before, 'a placed house is a paid-for building site (extra options are ignored)');
   const p = packResult(r);
   ok(p.ok === true && p.building === r.building.id && typeof p.cost === 'number' && Object.values(p).every(v => typeof v !== 'object' || v === null), `results pack to plain data (${JSON.stringify(p)})`);
-  const again = host.cmd({ t: 'place', type: 'house', x: spot.x, z: spot.z });
-  ok(!again.ok && again.reason === 'Occupied', `the World rules still apply ("${again.reason}")`);
+  const again = host.cmd({ t: 'place', type: 'house', x: spot.x, z: spot.z, a: spot.a });
+  ok(!again.ok && /in the way/.test(again.reason), `the World rules still apply ("${again.reason}")`);
 }
 
 // ------------------------------------------------------------ 3. joining
@@ -180,21 +198,23 @@ let ended = null;
   ok(joined && guest.replica && guest.net === gs, 'the guest joined and loaded the town');
   ok(gs.players.length === 2 && gs.players.some(p => p.name === 'Ada' && p.host) && gs.me.name === 'Bo', `both players listed (${gs.players.map(p => p.name).join(', ')})`);
   const diff = differences(host, guest);
-  ok(!diff.length, `the guest's copy matches the host's town (${hw.buildings.size} buildings, ${hw.residents.size} villagers)${diff.length ? ': ' + diff.join('; ') : ''}`);
+  ok(!diff.length, `the guest's copy matches the host's town (${hw.buildings.size} buildings, ${hw.roads.edges.size} stretches of road, ${hw.residents.size} villagers)${diff.length ? ': ' + diff.join('; ') : ''}`);
 }
 
 // ------------------------------------------------- 4. guests' commands
 {
   const gw = () => guest.world;
   let spot = freeSpot(gw());
-  const r = await ask(guest, { t: 'place', type: 'house', x: spot.x, z: spot.z, variant: 1234 });
-  ok(r.ok && r.building && r.building.con && hw.buildings.get(r.building.id)?.variant === 1234, `a guest builds a cottage (site ${r.building?.id} on both)`);
-  const bad = await ask(guest, { t: 'place', type: 'house', x: spot.x, z: spot.z });
-  ok(!bad.ok && bad.reason === 'Occupied', `the host refuses an occupied plot ("${bad.reason}")`);
-  // roads
-  const roadSpot = find(hw, (x, z) => (hw.checkRoad(x, z, 1).ok && !hw.roadAt(x, z) && hw.checkRoad(x + 1, z, 1).ok && !hw.roadAt(x + 1, z) ? { x, z } : null));
-  const rr = await ask(guest, { t: 'roads', tiles: [[roadSpot.x, roadSpot.z], [roadSpot.x + 1, roadSpot.z]], level: 1 });
-  ok(rr.placed === 2 && gw().roadAt(roadSpot.x, roadSpot.z) === 1, 'a guest lays a road');
+  const r = await ask(guest, { t: 'place', type: 'house', x: spot.x, z: spot.z, a: spot.a, variant: 1234 });
+  ok(r.ok && r.building && r.building.con && hw.buildings.get(r.building.id)?.variant === 1234 && gw().buildings.get(r.building.id)?.a === hw.buildings.get(r.building.id).a, `a guest builds a cottage, at its angle to the street (site ${r.building?.id} on both)`);
+  const bad = await ask(guest, { t: 'place', type: 'house', x: spot.x, z: spot.z, a: spot.a });
+  ok(!bad.ok && /in the way/.test(bad.reason), `the host refuses a plot that's taken ("${bad.reason}")`);
+  // roads: a curving street off one of the town's
+  const ctrl = spur(hw, 3, 0.4);
+  const e0 = hw.roads.edges.size;
+  const rr = ctrl && await ask(guest, { t: 'roads', ctrl, level: 1 });
+  await until(() => gw().roads.edges.size === hw.roads.edges.size);
+  ok(rr && rr.placed >= 1 && hw.roads.edges.size >= e0 + 2 && JSON.stringify(gw().roads.toRec()) === JSON.stringify(hw.roads.toRec()), `a guest lays a curving street off another, and everyone has the same curve and junction (${hw.roads.edges.size - e0} more stretches)`);
   // research
   // (the demo town has researched everything: forget one project nothing else needs)
   let tech = Object.keys(TECHS).find(id => hw.canResearch(id) && hw.research.current !== id);
@@ -235,56 +255,57 @@ let ended = null;
   for (const b of hw.buildings.values()) { const o = b.type === 'house' && !b.con && hw.expandOptions(b).find(o => o.kind === 'land'); if (o) { grow = [b.id, o]; break; } }
   if (grow) {
     const er = await ask(guest, { t: 'expand', id: grow[0], dir: grow[1].dir, kind: 'land' });
-    const gb = gw().buildings.get(grow[0]);
-    ok(er.ok && fw(gb) * fd(gb) === 2 && gw().buildingOn(grow[1].x, grow[1].z) === gb, 'a guest expands a house onto the next plot');
+    const gb = gw().buildings.get(grow[0]), m = grow[1].rects[0];
+    const mx = m.reduce((s, p) => s + p[0], 0) / m.length, mz = m.reduce((s, p) => s + p[1], 0) / m.length;
+    ok(er.ok && gb.w * gb.d === 2 && gw().buildingAt(mx, mz) === gb, 'a guest expands a house onto the next plot');
   } else ok(false, 'no house could expand');
-  // a guest ploughs fields for a farm and changes what it grows
+  // a guest ploughs fields for a farm (squares at its own angle) and changes what it grows
   {
     let farm = null;
     for (const b of hw.buildings.values()) if (b.type === 'farm' && !b.con) { farm = b; break; }
     if (!farm) {
       const s = freeSpot(hw, 'farm');
-      if (s) { const p = hw.placeBuilding('farm', s.x, s.z, { instant: true, ignoreUnlock: true }); if (p.ok) farm = p.building; }
+      if (s) { const p = hw.placeBuilding('farm', s.x, s.z, { a: s.a, instant: true, ignoreUnlock: true }); if (p.ok) farm = p.building; }
     }
     if (farm) {
-      const tiles = [];
-      for (let z = farm.z - 2; z < farm.z + 4; z++) for (let x = farm.x - 2; x < farm.x + 4; x++) tiles.push([x, z]);
-      const fr = await ask(guest, { t: 'fields', id: farm.id, tiles, add: true });
+      const R = ownPlot(farm), fields = [];
+      for (let j = -3; j <= 1; j++) for (let i = -3; i <= 3; i++) { const [x, z] = toWorld(R, i + 0.5 * ((farm.w + 1) % 2), j - 0.5 + 0.5 * (farm.d % 2)); fields.push([x, z, farm.a]); }
+      const fr = await ask(guest, { t: 'fields', id: farm.id, fields, add: true });
       const pr = await ask(guest, { t: 'produce', id: farm.id, produce: 'cattle' });
       await until(() => { const g2 = gw().buildings.get(farm.id); return g2 && g2.fields === farm.fields && g2.flavor === 'cattle'; });
       const gf = gw().buildings.get(farm.id);
-      ok(fr.ok && fr.n > 0 && pr.ok && gf && gf.fields === farm.fields && gf.flavor === 'cattle' && gw().fields.every((v, i) => v === hw.fields[i]), `a guest ploughs ${fr.n} fields and turns the farm to cattle, and the guest sees it`);
-      ok(!(await ask(guest, { t: 'fields', id: farm.id, tiles: 'lots', add: true })).ok, 'a malformed fields command is refused');
+      const sig = (w) => [...w.parcels.values()].map(f => `${f.farm}:${f.x},${f.z},${f.a}`).sort().join(' ');
+      ok(fr.ok && fr.n > 0 && pr.ok && gf && gf.fields === farm.fields && gf.flavor === 'cattle' && sig(gw()) === sig(hw), `a guest ploughs ${fr.n} fields and turns the farm to cattle, and the guest sees them where they lie`);
+      ok(!(await ask(guest, { t: 'fields', id: farm.id, fields: 'lots', add: true })).ok, 'a malformed fields command is refused');
     } else ok(false, 'no farm for the fields check');
   }
   // a guest grows a 2×2 park onto the land round it and lays it out as a
   // Grand Park: the guest's copy has the same 3×3 grounds and what it grew from
   {
     let park = null, opt = null;
-    for (let z = 2; z < hw.N - 5 && !opt; z++) for (let x = 2; x < hw.N - 5 && !opt; x++) {
-      const c = hw.checkBuild('landscapepark', x, z, { ignoreMoney: true, ignoreUnlock: true });
-      if (!c.ok || !c.access.some(a => a.conn)) continue;
-      const p = hw.placeBuilding('landscapepark', x, z, { instant: true, ignoreUnlock: true });
+    for (const s of spotsFor(hw, 'landscapepark')) {
+      const p = hw.placeBuilding('landscapepark', s.x, s.z, { a: s.a, instant: true, ignoreUnlock: true });
       if (!p.ok) continue;
       const o = hw.expandOptions(p.building).find(o => o.kind === 'grand');
-      if (o) { park = p.building; opt = o; } else hw.removeBuilding(p.building.id, 0);
+      if (o) { park = p.building; opt = o; break; }
+      hw.removeBuilding(p.building.id, 0);
     }
     if (opt) {
       const er = await ask(guest, { t: 'expand', id: park.id, dir: opt.dir, kind: 'grand' });
       const ur = await ask(guest, { t: 'upgrade', id: park.id, to: 'grandpark' });
-      await until(() => { const g2 = gw().buildings.get(park.id); return g2 && g2.type === 'grandpark' && fw(g2) === 3; });
+      await until(() => { const g2 = gw().buildings.get(park.id); return g2 && g2.type === 'grandpark' && g2.w === 3; });
       const g2 = gw().buildings.get(park.id);
-      ok(er.ok && ur.ok && hw.buildings.get(park.id).type === 'grandpark' && g2 && fw(g2) === 3 && fd(g2) === 3 && g2.flavor === hw.buildings.get(park.id).flavor && /^landscapepark#/.test(g2.flavor),
+      ok(er.ok && ur.ok && hw.buildings.get(park.id).type === 'grandpark' && g2 && g2.w === 3 && g2.d === 3 && g2.flavor === hw.buildings.get(park.id).flavor && /^landscapepark#/.test(g2.flavor),
         `a guest grows a landscape park into 3×3 grounds and lays out a Grand Park, and sees it (${g2 && g2.flavor})`);
     } else ok(false, 'no room to grow a 2×2 park into bigger grounds');
   }
   // a guest builds a planting of a kind of their choosing, and has a
   // monument reworked as another kind; the guest's copy follows
   {
-    const s = find(hw, (x, z) => (hw.checkBuild('flowers', x, z, { ignoreMoney: true, ignoreUnlock: true }).ok ? { x, z } : null));
-    const pr = await ask(guest, { t: 'place', type: 'flowers', x: s.x, z: s.z, flavor: 'topiary' });
-    const s2 = find(hw, (x, z) => (hw.checkBuild('statue', x, z, { ignoreMoney: true, ignoreUnlock: true }).ok ? { x, z } : null));
-    const mr = await ask(guest, { t: 'place', type: 'statue', x: s2.x, z: s2.z });
+    const s = freeSpot(hw, 'flowers');
+    const pr = await ask(guest, { t: 'place', type: 'flowers', x: s.x, z: s.z, a: s.a, flavor: 'topiary' });
+    const s2 = freeSpot(hw, 'statue');
+    const mr = await ask(guest, { t: 'place', type: 'statue', x: s2.x, z: s2.z, a: s2.a });
     const kr = mr.ok && await ask(guest, { t: 'kind', id: mr.building.id, kind: 'clock' });
     await until(() => { const a = pr.ok && gw().buildings.get(pr.building.id), b = mr.ok && gw().buildings.get(mr.building.id); return a && a.flavor === 'topiary' && b && b.flavor === 'clock'; });
     const ga = pr.ok && gw().buildings.get(pr.building.id), gm = mr.ok && gw().buildings.get(mr.building.id);
@@ -301,113 +322,64 @@ let ended = null;
     await until(() => { const g1 = gw().buildings.get(th.id); return g1 && g1.flavor === 'gothic' && g1.level === 4; });
     const g1 = gw().buildings.get(th.id);
     ok(kr.ok && th.flavor === 'gothic' && th.level === 4 && g1 && g1.flavor === 'gothic' && g1.level === 4, 'a guest has the town hall rebuilt in the Gothic style and made a Civic Palace, and sees it');
-    // somewhere it could grow: open land round one of its corners
-    const open = (x, z) => hw.inBounds(x, z) && !hw.buildingOn(x, z) && !hw.roadAt(x, z) && !hw.railAt(x, z) && !hw.terrain.isWater(x, z) && hw.fields[hw.idx(x, z)] < 0;
-    const to = find(hw, (x, z) => {
-      const c = hw.moveCheck(th, x, z);
-      if (!c.ok || !c.access.some(a => a.conn)) return null;
-      for (const [cx, cz] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) {
-        const x0 = cx < 0 ? x - 1 : x, z0 = cz < 0 ? z - 1 : z;
-        let free = true;
-        for (let tz = z0; tz <= z0 + 2; tz++) for (let tx = x0; tx <= x0 + 2; tx++) if ((tx < x || tx > x + 1 || tz < z || tz > z + 1) && !open(tx, tz)) free = false;
-        if (free) return { x, z };
-      }
-      return null;
-    });
-    const mv = to && await ask(guest, { t: 'move', id: th.id, x: to.x, z: to.z });
+    // somewhere it could grow: open land round one of its back corners
+    const roomy = (x, z, a) => {
+      const R = rect(x, z, a, 1, 1);
+      return [-1, 1].some(cx => [toWorld(R, cx * 1.5, -1.5), toWorld(R, cx * 1.5, -0.5), toWorld(R, cx * 1.5, 0.5), toWorld(R, -0.5, -1.5), toWorld(R, 0.5, -1.5)]
+        .every(([px, pz]) => !hw._plotBlock(rect(px, pz, a, 0.48, 0.48), { except: [th] }) && !hw.waterAt(px, pz)));
+    };
+    const to = freeSpot(hw, 'townhall', { r: 30, test: (x, z, a, chk) => roomy(x, z, a) && (!chk || hw.moveCheck(th, x, z, a).ok) });
+    const mv = to && await ask(guest, { t: 'move', id: th.id, x: to.x, z: to.z, a: to.a });
     const seat = mv && mv.ok ? mv.building : th;
     const o = hw.expandOptions(seat).find(e => e.kind === 'grand');
     const er = o && await ask(guest, { t: 'expand', id: seat.id, dir: o.dir, kind: 'grand' });
     const ur = o && await ask(guest, { t: 'upgrade', id: seat.id, to: 'capitol' });
     await until(() => { const g2 = gw().buildings.get(seat.id); return g2 && g2.type === 'capitol'; });
     const g2 = gw().buildings.get(seat.id);
-    ok(o && er.ok && ur.ok && seat.type === 'capitol' && g2 && g2.type === 'capitol' && fw(g2) === 3 && fd(g2) === 3 && g2.flavor === 'gothic',
-      `a guest grows the Civic Palace onto the land round it and rebuilds it as the Civic Centre, and sees it (${o ? o.where : 'no land to grow onto'})`);
+    ok(o && er.ok && ur.ok && seat.type === 'capitol' && g2 && g2.type === 'capitol' && g2.w === 3 && g2.d === 3 && g2.flavor === 'gothic',
+      `a guest moves the Civic Palace, grows it onto the land round it and rebuilds it as the Civic Centre, and sees it (${o ? o.where : 'no land to grow onto'})`);
   }
-  // move a building
-  const mover = [...hw.buildings.values()].find(b => b.type === 'house' && !b.con && fw(b) === 1 && fd(b) === 1);
+  // move a building, to a new spot at a new angle
+  const mover = [...hw.buildings.values()].find(b => b.type === 'house' && !b.con && b.w === 1 && b.d === 1);
   spot = freeSpot(hw);
-  const mv = await ask(guest, { t: 'move', id: mover.id, x: spot.x, z: spot.z });
-  ok(mv.ok && mv.building && !gw().buildings.has(mover.id) && gw().buildings.get(mv.building.id)?.x === spot.x, 'a guest moves a house (instantly, in sandbox)');
+  const mv = await ask(guest, { t: 'move', id: mover.id, x: spot.x, z: spot.z, a: spot.a });
+  ok(mv.ok && mv.building && !gw().buildings.has(mover.id) && gw().buildings.get(mv.building.id)?.x === spot.x && gw().buildings.get(mv.building.id)?.a === hw.buildings.get(mv.building.id).a, 'a guest moves a house (instantly, in sandbox), at its new angle');
   // terraform, trees, bulldoze
-  const land = find(hw, (x, z) => (hw.checkTerraform(x, z).ok && !hw.roadAt(x, z) && hw.checkPlant(x + 3, z).ok ? { x, z } : null));
+  const land = find(hw, (x, z) => (hw.checkTerraform(x, z).ok && !hw.roadAt(x, z, 0.5) && hw.checkPlant(x + 3, z).ok ? { x, z } : null));
   const tf = await ask(guest, { t: 'terraform', x: land.x, z: land.z, mode: 'raise' });
   const pl = await ask(guest, { t: 'plant', x: land.x + 3, z: land.z });
-  ok(tf.ok && pl.ok && Math.abs(gw().terrain.ch(land.x, land.z) - hw.terrain.ch(land.x, land.z)) < 0.002 && gw().treeCount[gw().idx(land.x + 3, land.z)] === hw.treeCount[hw.idx(land.x + 3, land.z)], 'a guest raises land and plants a tree');
-  const bd = await ask(guest, { t: 'bulldoze', tiles: [[land.x + 3, land.z]] });
-  ok(bd.ok && gw().treeCount[gw().idx(land.x + 3, land.z)] === 0, 'a guest clears the tree again');
-  // dress a street with hedges, then upgrade that stretch of road
-  const { planDress } = await import('../src/world/roadDress.js');
-  const street = [];
-  for (let i = 0; i < hw.N * hw.N && street.length < 4; i++) {
-    const x = i % hw.N, z = (i / hw.N) | 0;
-    if (hw.roads[i] && hw.roads[i] < 3 && planDress(hw, [[x, z]], 2).n) street.push([x, z]);
-  }
-  const dr = await ask(guest, { t: 'dress', kind: 2, tiles: street });
-  ok(dr.ok && dr.n === street.length && street.every(([x, z]) => gw().dress[gw().idx(x, z)] === 2 && hw.dress[hw.idx(x, z)] === 2), 'a guest plants hedges along a street, and everyone sees them');
-  const re = await ask(guest, { t: 'roadedit', op: 'up', tiles: street });
-  ok(re.ok && street.every(([x, z]) => gw().roadAt(x, z) === hw.roadAt(x, z) && hw.roadAt(x, z) >= 2), 'a guest upgrades that stretch of road in one go');
-  // two roads side by side: a guest lays a boulevard and gives it a look,
-  // and everyone works out the same boulevard and sees the same look
+  const treesAt = (w) => w.treesNear(land.x + 3, land.z, 0.45).length;
+  ok(tf.ok && pl.ok && Math.abs(gw().terrain.ch(land.x, land.z) - hw.terrain.ch(land.x, land.z)) < 0.002 && treesAt(gw()) === treesAt(hw) && treesAt(hw) > 0, 'a guest raises land and plants a tree');
+  const bd = await ask(guest, { t: 'bulldoze', x: land.x + 3, z: land.z });
+  ok(bd.ok && treesAt(gw()) === 0 && treesAt(hw) === 0, 'a guest clears the tree again');
+  // dress a street with hedges, then upgrade it
+  const { planDress } = await import('../src/world/streets.js');
+  const street = [...hw.roads.edges.values()].filter(e => e.level < 3 && planDress(hw, [e.id], 2).n).slice(0, 3).map(e => e.id);
+  const dr = await ask(guest, { t: 'dress', kind: 2, ids: street });
+  ok(dr.ok && dr.n === street.length && street.every(id => gw().roads.edges.get(id).dress === 2 && hw.roads.edges.get(id).dress === 2), `a guest plants hedges along ${street.length} stretches of street, and everyone sees them`);
+  const re = await ask(guest, { t: 'roadedit', op: 'up', ids: street });
+  ok(re.ok && street.every(id => gw().roads.edges.get(id).level === hw.roads.edges.get(id).level && hw.roads.edges.get(id).level >= 2), 'a guest upgrades those stretches in one go');
+  // a curving street out of town, a house along it at whatever angle the
+  // curve gives, turned a little further: everyone sees the same
   {
-    const { DRESSINGS, lookPart } = await import('../src/config.js');
-    const { boulevardTiles } = await import('../src/world/boulevard.js');
-    const free = (x, z) => hw.inBounds(x, z) && !hw.roadAt(x, z) && !hw.buildingOn(x, z) && hw.checkRoad(x, z, 2).ok && !hw.terrain.isWater(x, z);
-    let pair = null;
-    for (let z = 2; z < hw.N - 3 && !pair; z++) for (let x = 2; x < hw.N - 8 && !pair; x++) {
-      const a = [0, 1, 2, 3, 4, 5].map(k => [x + k, z]), b = a.map(([ax, az]) => [ax, az + 1]);
-      if ([...a, ...b].every(([ax, az]) => free(ax, az)) && (hw.roadAt(x - 1, z) || hw.roadAt(x - 1, z + 1))) pair = [a, b];
-    }
-    if (pair) {
-      const lr = await ask(guest, { t: 'roads', tiles: [...pair[0], ...pair[1]], level: 2 });
-      const lanes = boulevardTiles(hw, ...pair[0][2]), look = DRESSINGS.findIndex(d => d && d.key === 'bhedge');
-      const lk = await ask(guest, { t: 'dress', kind: look, tiles: lanes });
-      await until(() => lanes.every(([x, z]) => lookPart(gw().dress[gw().idx(x, z)]) === look));
-      ok(lr.placed > 0 && lanes.length >= 4 && lk.ok && gw().blvd.every((v, i) => v === hw.blvd[i]) && lanes.every(([x, z]) => lookPart(gw().dress[gw().idx(x, z)]) === look),
-        `a guest lays two roads side by side and gives the boulevard a hedge; everyone has the same boulevard (${lanes.length} lane tiles) and sees its look`);
-      const rm = await ask(guest, { t: 'roadedit', op: 'remove', tiles: pair[1] });
-      await until(() => pair[1].every(([x, z]) => !gw().roadAt(x, z)));
-      ok(rm.ok && gw().blvd.every((v, i) => v === hw.blvd[i]) && pair[0].every(([x, z]) => !lookPart(gw().dress[gw().idx(x, z)]) && !gw().blvd[gw().idx(x, z)]), 'taking one road up again ends the boulevard and its look for everyone');
-    } else ok(false, 'no room for a boulevard');
-  }
-  // a guest drags a diagonal street out of the town and puts a house beside
-  // it: everyone has the same links, and sees the house turned to face it
-  {
-    const { strokeTiles } = await import('../src/world/diagonal.js');
-    const { CORNERS } = await import('../src/world/roadShape.js');
-    let line = null;
-    for (let z = 2; z < hw.N - 8 && !line; z++) for (let x = 2; x < hw.N - 8 && !line; x++) {
-      if (!hw.connected[hw.idx(x, z)]) continue;
-      for (let k = 0; k < 4 && !line; k++) {
-        const tiles = strokeTiles({ x, z }, { x: x + CORNERS[k][0] * 5, z: z + CORNERS[k][1] * 5 });
-        if (tiles.every(([tx, tz]) => hw.inBounds(tx, tz)) && hw.checkStroke(tiles, 1).slice(1).every(c => c.ok && !c.noop)) line = tiles;
-      }
-    }
-    if (line) {
-      const lr = await ask(guest, { t: 'roads', tiles: line, level: 1, stroke: true });
-      await until(() => line.every(([x, z]) => gw().roadAt(x, z)) && gw().diag.every((v, i) => v === hw.diag[i]));
-      ok(lr.placed === 5 && hw.diagN === gw().diagN && hw.diagN >= 5 && gw().diag.every((v, i) => v === hw.diag[i]), `a guest drags a diagonal street, and everyone has it linked corner to corner (${hw.diagN} links)`);
-      let house = null;
-      for (const n of [2, 3]) for (const [x, z] of [[line[n + 1][0], line[n][1]], [line[n][0], line[n + 1][1]]]) {
-        if (house || !hw.checkBuild('house', x, z, { ignoreMoney: true }).ok) continue;
-        const r = await ask(guest, { t: 'place', type: 'house', x, z });
-        if (r.ok) house = r.building;
-      }
-      await until(() => house && gw().buildings.has(house.id) && hw.buildings.get(house.id).diag && gw().buildings.get(house.id).diag);
-      ok(house && hw.buildings.get(house.id).diag && gw().buildings.get(house.id).diag === hw.buildings.get(house.id).diag, 'a house the guest puts beside it faces it for everyone');
-      // and turns it a little more, and nudges it, on its plot
-      const pr = house && await ask(guest, { t: 'pose', id: house.id, pose: [0.3, -0.1, 0.05] });
-      await until(() => house && JSON.stringify(gw().buildings.get(house.id).pose || null) === JSON.stringify(hw.buildings.get(house.id).pose || null) && hw.buildings.get(house.id).pose);
-      ok(pr && pr.ok && JSON.stringify(hw.buildings.get(house.id).pose) === '{"a":0.3,"x":-0.1,"z":0.05}' && JSON.stringify(gw().buildings.get(house.id).pose) === JSON.stringify(hw.buildings.get(house.id).pose), 'the guest turns and nudges it on its plot, and everyone sees it so');
-    } else ok(false, 'no room for a diagonal street');
+    const ctrl2 = spur(hw, 5, -0.7, 2);
+    const lr = ctrl2 && await ask(guest, { t: 'roads', ctrl: ctrl2, level: 2 });
+    await until(() => JSON.stringify(gw().roads.toRec()) === JSON.stringify(hw.roads.toRec()));
+    const mid = ctrl2 && { x: (ctrl2[1][0] + ctrl2[2][0]) / 2, z: (ctrl2[1][1] + ctrl2[2][1]) / 2 };
+    const hs = mid && findPlot(hw, 'house', mid, { r: 1.5, opts: { ignoreMoney: true } });
+    const hr = hs && await ask(guest, { t: 'place', type: 'house', x: hs.x, z: hs.z, a: hs.a });
+    const house = hr && hr.ok ? hr.building : null;
+    const tr = house && await ask(guest, { t: 'turn', id: house.id, a: house.a + 0.2 });
+    await until(() => house && gw().buildings.get(house.id) && gw().buildings.get(house.id).a === hw.buildings.get(house.id).a);
+    ok(lr && lr.placed && house && Math.abs(Math.sin(2 * hs.a)) > 0.05 && tr && tr.ok && gw().buildings.get(house.id).a === hw.buildings.get(house.id).a && Math.abs(hw.buildings.get(house.id).a - hs.a - 0.2) < 0.002,
+      `a guest lays a curving street, puts a house along it at its angle (${hs ? hs.a : '-'}) and turns it a little more, and everyone sees it so`);
   }
   // a coach line between two stops
   const stops = [];
-  for (let z = 1; z < hw.N - 1 && stops.length < 2; z++) for (let x = 1; x < hw.N - 1 && stops.length < 2; x++) {
-    if (stops.some(s => Math.abs(s.x - x) + Math.abs(s.z - z) < 8)) continue;
-    const c = hw.checkBuild('coachstop', x, z);
-    if (!c.ok || !c.access.some(a => a.conn)) continue;
-    const r2 = await ask(guest, { t: 'place', type: 'coachstop', x, z });
+  for (let k = 0; k < 2; k++) {
+    const s = freeSpot(hw, 'coachstop', { test: (x, z) => stops.every(t => Math.hypot(t.x - x, t.z - z) >= 8) });
+    if (!s) break;
+    const r2 = await ask(guest, { t: 'place', type: 'coachstop', x: s.x, z: s.z, a: s.a });
     if (r2.ok) stops.push(r2.building);
   }
   const ln = await ask(guest, { t: 'line', mode: 'coach', stops: stops.map(s => s.id) });
@@ -423,7 +395,7 @@ let ended = null;
   host.cmd({ t: 'sandbox', opts: { instantBuild: false } });
   // and something real to build while the clock runs
   spot = freeSpot(hw);
-  const site = await ask(guest, { t: 'place', type: 'house', x: spot.x, z: spot.z });
+  const site = await ask(guest, { t: 'place', type: 'house', x: spot.x, z: spot.z, a: spot.a });
   globalThis.__site = site.building && site.building.id;
   // and puts it first for the builders
   const pr = await ask(guest, { t: 'priority', id: site.building.id, on: true });

@@ -17,10 +17,11 @@
 // across its busiest part first.
 // Usage: node scripts/collide.js [towns=all] [days=2] [--verbose] [--probe=id,x,z] [--seed=n] [--everyone]
 //   towns: starter ids, comma-separated ('all': every starter but the heavy
-//   Metropolis, and 'diagonal'; 'scale': a big town grown by the demo bot;
-//   'diagonal': the market town with diagonal streets laid out of it, lined
-//   with buildings turned to face them; 'freeform': the market town with
-//   every building turned and nudged on its plot)
+//   Metropolis, and 'curves' and 'freeform'; 'scale': a big town grown by
+//   the demo bot; 'curves': the market town with curving streets laid out
+//   of it, lined with buildings facing them at whatever angle; 'freeform':
+//   the market town with every building turned on its plot as far as it
+//   will go)
 //   --probe: the solid parts of building id over point (x, z), its door, and
 //   the way villagers walk in to it
 //   --seed: the same run every time; --everyone: every villager drawn, not
@@ -30,10 +31,8 @@ import * as THREE from 'three';
 import { GeoBuilder } from '../src/render/geo.js';
 import { buildModel, workArea } from '../src/render/buildings.js';
 import { STARTERS, loadStarter } from '../src/world/starters.js';
-import { World, fw, fd, isOpen, doorPoint } from '../src/world/world.js';
-import { facingAngle, strokeTiles } from '../src/world/diagonal.js';
-import { surfaceAt, CORNERS } from '../src/world/roadShape.js';
-import { TURN_MAX, NUDGE } from '../src/world/pose.js';
+import { World, isOpen, doorPoint, plotOf, ownPlot, findPlot } from '../src/world/world.js';
+import { toLocal, toWorld, pointAt } from '../src/world/geom.js';
 import { plotPath } from '../src/sim/plotNav.js';
 import { growDemoTown } from '../src/world/demo.js';
 import { PathFinder } from '../src/sim/path.js';
@@ -92,13 +91,13 @@ function outside(h, x, z) {
   return s;
 }
 
-// The solid parts of every building, filed by tile, and what the game's
+// The solid parts of every building, filed by unit square, and what the game's
 // WorldView would set on each building from its model (door, spots, open).
 class Solids {
   constructor(w, game) {
     this.w = w; this.game = game;
     this.byB = new Map();      // building id → its parts
-    this.tiles = new Map();    // tile index → parts over it
+    this.tiles = new Map();    // unit square (its index) → parts over it
     this.items = new Map();    // stands in for game.view.items (transit asks how tall a building is)
     for (const b of w.buildings.values()) this.add(b);
     w.on('building:add', (b) => this.add(b));
@@ -111,13 +110,13 @@ class Solids {
     const w = this.w, t = w.terrain;
     const ground = (x, z) => t.heightAt(x, z);
     // as WorldView.takenFn: another building's plot or a road (a pier stops short of it)
-    const taken = (x, z, id) => { const tx = Math.floor(x), tz = Math.floor(z); if (!w.inBounds(tx, tz)) return false; const o = w.buildingAt[w.idx(tx, tz)]; return (o >= 0 && o !== id) || !!w.roadAt(tx, tz); };
+    const taken = (x, z, id) => { if (!w.inBounds(x, z)) return false; const o = w.buildingAt(x, z); return (!!o && o.id !== id) || !!w.roadAt(x, z); };
     const up = b.con && b.con.kind === 'upgrade';
     const target = b.con ? buildModel(up ? { ...b, type: b.con.toType || b.type, level: b.con.to, look: b.con.look !== undefined ? b.con.look : b.look, flavor: b.con.flavor !== undefined ? b.con.flavor : b.flavor } : b, { ground, taken }) : null;
     const model = b.con ? (up ? buildModel(b, { ground, taken }) : target) : buildModel(b, { ground, taken });
     const jit = model.jitter;
-    const th = facingAngle(b) + jit.yaw, co = Math.cos(th), si = Math.sin(th);
-    const cx = b.x + fw(b) / 2 + jit.ox, cz = b.z + fd(b) / 2 + jit.oz;
+    const th = b.a + jit.yaw, co = Math.cos(th), si = Math.sin(th);
+    const cx = b.x + jit.ox, cz = b.z + jit.oz;
     const toW = (x, z) => [cx + x * co + z * si, cz - x * si + z * co];
     // as WorldView.addBuilding / _addSite
     b.work = workArea(b);
@@ -158,7 +157,7 @@ class Solids {
     for (const p of parts) {
       for (let tz = Math.floor(p.z0); tz <= Math.floor(p.z1); tz++) for (let tx = Math.floor(p.x0); tx <= Math.floor(p.x1); tx++) {
         if (!w.inBounds(tx, tz)) continue;
-        const k = w.idx(tx, tz);
+        const k = tz * w.N + tx;
         let l = this.tiles.get(k);
         if (!l) this.tiles.set(k, l = []);
         l.push(p);
@@ -174,7 +173,7 @@ class Solids {
     const gone = new Set(parts);
     for (const p of parts) for (let tz = Math.floor(p.z0); tz <= Math.floor(p.z1); tz++) for (let tx = Math.floor(p.x0); tx <= Math.floor(p.x1); tx++) {
       if (!this.w.inBounds(tx, tz)) continue;
-      const k = this.w.idx(tx, tz), l = this.tiles.get(k);
+      const k = tz * this.w.N + tx, l = this.tiles.get(k);
       if (l) this.tiles.set(k, l.filter(q => !gone.has(q)));
     }
   }
@@ -184,8 +183,8 @@ class Solids {
   // low (a fence, a bench, a low wall, a hedge), or null. r: how far inside
   // it they must be; skip: a building whose parts don't count.
   hit(x, z, y, r = 0.015, skip = null) {
-    if (!this.w.inBounds(Math.floor(x), Math.floor(z))) return null;
-    const l = this.tiles.get(this.w.idx(Math.floor(x), Math.floor(z)));
+    if (!this.w.inBounds(x, z)) return null;
+    const l = this.tiles.get(Math.floor(z) * this.w.N + Math.floor(x));
     if (!l) return null;
     let low = null;
     for (const p of l) {
@@ -207,7 +206,7 @@ class Solids {
     const out = [];
     for (let tz = Math.floor(z - r); tz <= Math.floor(z + r); tz++) for (let tx = Math.floor(x - r); tx <= Math.floor(x + r); tx++) {
       if (!this.w.inBounds(tx, tz)) continue;
-      for (const p of this.tiles.get(this.w.idx(tx, tz)) || []) {
+      for (const p of this.tiles.get(tz * this.w.N + tx) || []) {
         if (p.y1 < ya || p.y0 > yb || x < p.x0 - r || x > p.x1 + r || z < p.z0 - r || z > p.z1 + r) continue;
         if (p.a < 0.0016) continue;   // a lamp post, a flagpole: not worth a swerve
         if (outside(p.h, x, z) < r - 0.005 && !out.includes(p)) out.push(p);
@@ -247,15 +246,17 @@ function sweepDoors(game, S, F, lanes) {
     if (!B.access || !isOpen(B) || !B.door || B.open) continue;
     const def = BUILDINGS[B.type];
     if (def.stop || def.outdoor) continue;
-    // a short walk in from the next tile along the street
-    const a = B.access;
-    const from = [[1, 0], [-1, 0], [0, 1], [0, -1]].map(([dx, dz]) => [a.x + dx, a.z + dz]).find(([x, z]) => w.roadAt(x, z));
-    if (!from) continue;
-    const tiles = game.paths.road(from[0], from[1], a.x, a.z);
+    // a short walk in along its street, from a unit along it either way
+    const a = B.access, e = w.roads.edges.get(a.e);
+    if (!e) continue;
+    const s0 = a.s + 1 <= e.len ? a.s + 1 : a.s - 1;
+    if (s0 < 0) continue;
+    const fp = pointAt(e.pts, e.cum, s0), from = [fp[0], fp[1]];
+    const tiles = game.paths.road({ e: e.id, s: s0 }, a);
     if (!tiles) continue;
     for (const lane of lanes) {
       const r = { lk: { lane, speed: 1, scale: 1 }, school: null, at: B.id };
-      const wk = ag._walk(r, B, B, tiles, { x: from[0] + 0.5, z: from[1] + 0.5 }, () => {});
+      const wk = ag._walk(r, B, B, tiles, { x: from[0], z: from[1] }, () => {});
       ag._drop(wk);
       const pts = wk.pts, n = pts.length - 1;   // the last leg (door → inside) is the way in through the wall
       if (TRACE === B.id) {
@@ -304,9 +305,10 @@ function sweepGrounds(game, S, F) {
     let goals;
     if (strolls) goals = B.spots;
     else {
-      const area = B.work || workArea(B) || [B.x + 0.15, B.z + 0.15, B.x + fw(B) - 0.15, B.z + fd(B) - 0.15];
+      // (an area in the plot's own frame: [x0, z0, x1, z1, its rectangle])
+      const R = ownPlot(B), area = B.work || workArea(B) || [-R.hw + 0.15, -R.hd + 0.15, R.hw - 0.15, R.hd - 0.15, R];
       goals = [];
-      for (let i = 0; i <= 4; i++) for (let j = 0; j <= 4; j++) goals.push([area[0] + ((area[2] - area[0]) * i) / 4, area[1] + ((area[3] - area[1]) * j) / 4]);
+      for (let i = 0; i <= 4; i++) for (let j = 0; j <= 4; j++) goals.push(toWorld(area[4] || R, area[0] + ((area[2] - area[0]) * i) / 4, area[1] + ((area[3] - area[1]) * j) / 4));
     }
     const g = ag._gridOf(B), gate = doorPoint(B);
     // a stroller sets off again from where they stopped: the spot, or the
@@ -343,29 +345,24 @@ function sweepGrounds(game, S, F) {
 }
 
 // Every part of every model inside its own plot (or its frontage, or the land
-// it took on), but for what reaches out on purpose (a pier over the water).
-// A building facing a diagonal street stands turned on its plot, and may use
-// the verge of the two road tiles the street links beside it, never the road.
+// it took on), but for what reaches out on purpose (a pier over the water):
+// in the plot's own frame, whatever its angle, its front forward into the
+// verge as far as it may come.
 function sweepPlots(game, S, F) {
-  const w = game.world, DIR = [[0, 1], [1, 0], [0, -1], [-1, 0]];
+  const w = game.world;
   for (const B of w.buildings.values()) {
-    const e = { x0: 0, x1: 0, z0: 0, z1: 0, ...(B.ext || {}) };
-    const [dx, dz] = DIR[B.rot], f = Math.max(B.front || 0, B.ownFront || 0);
-    if (dx > 0) e.x1 += f; if (dx < 0) e.x0 += f; if (dz > 0) e.z1 += f; if (dz < 0) e.z0 += f;
-    const X0 = B.x - e.x0, Z0 = B.z - e.z0, X1 = B.x + fw(B) + e.x1, Z1 = B.z + fd(B) + e.z1;
+    const R = plotOf(B), f = Math.max(B.front || 0, B.ownFront || 0);
     let worst = 0, ex = null;
-    const verge = B.diag ? w._diagPair(B, B.diag - 1) : [];
     for (const p of S.byB.get(B.id) || []) {
       if (p.y1 - p.y0 < 0.01 && p.y1 < B.baseY + 0.03) continue;   // flat on the ground (a path, a shadow)
       for (const [x, z] of p.h) {
-        if (verge.some(([vx, vz]) => vx === Math.floor(x) && vz === Math.floor(z)) && !surfaceAt(w, x, z)) continue;
-        const out = Math.max(X0 - x, x - X1, Z0 - z, z - Z1);
+        const [lx, lz] = toLocal(R, x, z), out = Math.max(Math.abs(lx) - R.hw, -lz - R.hd, lz - R.hd - f);
         if (out > worst) { worst = out; ex = [x, z]; }
       }
     }
     if (worst > 0.03) {
-      const tx = Math.floor(ex[0]), tz = Math.floor(ex[1]), o = w.inBounds(tx, tz) ? w.buildingOn(tx, tz) : null;
-      const onto = o && o !== B ? `into the ${name(o)}` : w.inBounds(tx, tz) && w.roadAt(tx, tz) ? 'onto the road' : w.inBounds(tx, tz) && w.terrain.isWater(tx, tz) ? 'over the water' : 'onto open ground';
+      const o = w.inBounds(ex[0], ex[1]) ? w.buildingAt(ex[0], ex[1]) : null;
+      const onto = o && o !== B ? `into the ${name(o)}` : w.roadAt(ex[0], ex[1]) ? 'onto the road' : w.waterAt(ex[0], ex[1]) ? 'over the water' : 'onto open ground';
       F.add('model reaches out of its plot', `${name(B)} ${onto}`, `${worst.toFixed(2)} at ${at(ex[0], ex[1])} #${B.id}`, onto !== 'over the water' && onto !== 'onto open ground');
     }
   }
@@ -486,20 +483,19 @@ function crowdCheck(game, bump) {
 function gondolas(game) {
   const w = game.world, rng = mulberry(w.N * 7919 + w.buildings.size);
   w.setSandbox({ infiniteMoney: true, unlockAll: true });
+  // (spots for a station along the streets: [x, z, a])
   const open = [];
-  for (let z = 2; z < w.N - 2; z++) for (let x = 2; x < w.N - 2; x++) {
-    if (!w.buildingOn(x, z) && !w.roadAt(x, z) && !w.terrain.isWater(x, z) && [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dz]) => w.roadAt(x + dx, z + dz)) && w.checkBuild('gondola', x, z).ok) open.push([x, z]);
-  }
+  findPlot(w, 'gondola', { x: w.N / 2, z: w.N / 2 }, { r: w.N, step: 0.5, test: (x, z, a, chk) => { if (chk && chk.access && open.length < 400) open.push([x, z, a]); return !chk; } });
   const under = (a, b) => {
     const seen = new Set(), L = Math.hypot(b[0] - a[0], b[1] - a[1]);
     for (let u = 0; u <= L; u += 0.25) {
-      const o = w.buildingOn(Math.floor(a[0] + 0.5 + ((b[0] - a[0]) * u) / L), Math.floor(a[1] + 0.5 + ((b[1] - a[1]) * u) / L));
+      const o = w.buildingAt(a[0] + ((b[0] - a[0]) * u) / L, a[1] + ((b[1] - a[1]) * u) / L);
       if (o) seen.add(o.id);
     }
     return seen.size;
   };
-  const station = ([x, z]) => {
-    const r = w.placeBuilding('gondola', x, z, { instant: true });
+  const station = ([x, z, a]) => {
+    const r = w.placeBuilding('gondola', x, z, { a, instant: true });
     if (r.ok && r.building.access) return r.building;
     if (r.ok) w.removeBuilding(r.building.id, 0);
     return null;
@@ -527,12 +523,12 @@ function gondolas(game) {
   // and an interchange where two more lines meet, out from berths of their
   // own to a station each
   const hubs = [];
-  for (let z = 2; z < w.N - 3; z++) for (let x = 2; x < w.N - 3; x++) if (w.checkBuild('gondolahub', x, z).ok) hubs.push([x, z]);
+  findPlot(w, 'gondolahub', { x: w.N / 2, z: w.N / 2 }, { r: w.N, step: 0.5, test: (x, z, a, chk) => { if (chk && chk.access && hubs.length < 200) hubs.push([x, z, a]); return !chk; } });
   for (let k = 0; k < 30 && hubs.length; k++) {
-    const [hx, hz] = hubs.splice((rng() * hubs.length) | 0, 1)[0];
-    const r = w.placeBuilding('gondolahub', hx, hz, { instant: true });
+    const [hx, hz, ha] = hubs.splice((rng() * hubs.length) | 0, 1)[0];
+    const r = w.placeBuilding('gondolahub', hx, hz, { a: ha, instant: true });
     if (!r.ok || !r.building.access) { if (r.ok) w.removeBuilding(r.building.id, 0); continue; }
-    const H = r.building, ends = open.filter(([x, z]) => { const L = Math.hypot(x - hx - 0.5, z - hz - 0.5); return L >= 8 && L <= 20; });
+    const H = r.building, ends = open.filter(([x, z]) => { const L = Math.hypot(x - hx, z - hz); return L >= 8 && L <= 20; });
     const mine = [];
     for (let t = 0; t < 40 && mine.length < 2 && ends.length; t++) {
       const s = station(ends[(rng() * ends.length) | 0]);
@@ -547,7 +543,7 @@ function gondolas(game) {
   // each line, how long its spans are and the pylons holding them up
   return made.map(l => {
     const R = game.transit.routes.get(l.id);
-    const legs = (R && R.legs || []).map(g => `${g.L.toFixed(1)} tiles, ${g.pylons.length} pylon${g.pylons.length === 1 ? '' : 's'}${g.pylons.length ? ' up to ' + Math.max(...g.pylons.map(p => p.h - p.g)).toFixed(2) : ''}`);
+    const legs = (R && R.legs || []).map(g => `${g.L.toFixed(1)} units, ${g.pylons.length} pylon${g.pylons.length === 1 ? '' : 's'}${g.pylons.length ? ' up to ' + Math.max(...g.pylons.map(p => p.h - p.g)).toFixed(2) : ''}`);
     return `${l.name} (${l.stops.length} stations; ${legs.join(' · ')})`;
   });
 }
@@ -590,7 +586,7 @@ function play(label, w) {
   if (probe) {
     const [id, x, z] = probe.slice(8).split(',').map(Number), B = w.buildings.get(id);
     if (B) {
-      console.log(`  probe ${name(B)} #${id} at ${at(x, z)}: plot ${B.x},${B.z} ${fw(B)}×${fd(B)} rot ${B.rot} base ${B.baseY.toFixed(3)} door`, B.door && { x: +B.door.x.toFixed(3), z: +B.door.z.toFixed(3), dx: +B.door.dx.toFixed(2), dz: +B.door.dz.toFixed(2) });
+      console.log(`  probe ${name(B)} #${id} at ${at(x, z)}: plot ${B.x},${B.z} ${B.w}×${B.d} turned ${B.a} base ${B.baseY.toFixed(3)} door`, B.door && { x: +B.door.x.toFixed(3), z: +B.door.z.toFixed(3), dx: +B.door.dx.toFixed(2), dz: +B.door.dz.toFixed(2) });
       for (const p of S.byB.get(id) || []) if (outside(p.h, x, z) < 0.03) console.log(`    part y ${(p.y0 - B.baseY).toFixed(3)}–${(p.y1 - B.baseY).toFixed(3)} x ${p.x0.toFixed(3)}–${p.x1.toFixed(3)} z ${p.z0.toFixed(3)}–${p.z1.toFixed(3)} area ${p.a.toFixed(4)} out ${outside(p.h, x, z).toFixed(3)}`);
     }
   }
@@ -642,8 +638,7 @@ function play(label, w) {
         if (wk.doorIn && (wk.seg >= n - 2 || near(wk.pts[n - 2]))) continue;
         if (wk.doorOut && (wk.seg === 0 || near(wk.pts[1]))) continue;
         where = wk.doorIn && wk.seg >= n - wk.doorIn - 2 ? 'going in a door' : wk.doorOut && wk.seg < wk.doorOut ? 'coming out of a door' : 'on the street';
-        const tx = Math.floor(wk.x), tz = Math.floor(wk.z);
-        if (w.inBounds(tx, tz) && w.terrain.isWater(tx, tz) && !w.roadAt(tx, tz) && !w.buildingOn(tx, tz) && once(wk, { id: 'water' + w.idx(tx, tz) })) F.add('villager walks on the water', where, at(wk.x, wk.z));
+        if (w.inBounds(wk.x, wk.z) && w.waterAt(wk.x, wk.z) && !w.roadAt(wk.x, wk.z, 0.05) && !w.buildingAt(wk.x, wk.z) && once(wk, { id: 'water' + Math.floor(wk.x) + ',' + Math.floor(wk.z) })) F.add('villager walks on the water', where, at(wk.x, wk.z));
       } else if (wk.mode === 'wander') {
         const B = wk.r && w.buildings.get(wk.r.at);
         where = B ? `${wk.working ? 'working' : 'strolling'} at the ${name(B)}` : 'wandering';
@@ -695,6 +690,7 @@ function play(label, w) {
   // (and nobody kept waiting at a lift's door: its car comes for them)
   if (bump.liftWait > 60) F.add('villager kept waiting for a lift', `${bump.liftWait.toFixed(0)} s`, at(bump.liftAt[0], bump.liftAt[1]));
   if (bump.maxWait > 60) F.add('vehicles held up in traffic', `the longest ${bump.maxWait.toFixed(0)} s (${bump.maxWaitAt.line ? bump.maxWaitAt.line.name : 'a cart'}), ${bump.longWaits || 0} vehicle-moments over 20 s`, '-', false);
+  if (VERBOSE) for (const l of w.lines) if (l.mode === 'gondola') { const st = game.transit.stats[l.id] || {}; console.log(`      ${l.name}: ${l.stops.length} stations, ${st.trips || 0} trips planned on it, ${st.riders || 0} riders`); }
   if (VERBOSE) console.log(`      a step takes: the villagers ${(cost.agents / steps).toFixed(2)} ms, the vehicles ${(cost.transit / steps).toFixed(2)} ms`);
   if (VERBOSE && bump.whys) console.log('      held up over 20 s, waiting for: ' + [...bump.whys].sort((x, y) => y[1] - x[1]).map(([k, n]) => k + ' ' + n).join(' · '));
   if (VERBOSE && bump.feetKinds) console.log('      villagers inside vehicles: ' + [...bump.feetKinds].sort((x, y) => y[1] - x[1]).map(([k, n]) => k + ' ' + n).join(' · '));
@@ -710,46 +706,60 @@ function play(label, w) {
   return F.serious;
 }
 
-// A few diagonal streets out of a town, lined with homes and shops turned to
-// face them (see world/diagonal.js), for the 'diagonal' town.
-function diagonalStreets(w) {
+// A few curving streets out of a town, lined with homes and shops facing
+// them at whatever angle the curve gives, for the 'curves' town.
+function curvingStreets(w) {
   w.setSandbox({ ...w.sandbox, infiniteMoney: true, unlockAll: true });
   const kinds = ['house', 'bakery', 'house', 'grocer', 'house', 'tavern', 'house', 'coffeehouse', 'playground', 'house', 'garden'];
+  const rnd = mulberry(4242 + Number(process.env.COLLIDE_SEED || 0));
   let laid = 0, n = 0, t = 0;
-  for (let z = 2; z < w.N - 2 && laid < 4; z++) for (let x = 2; x < w.N - 2 && laid < 4; x++) {
-    if (!w.roadAt(x, z) || !w.connected[w.idx(x, z)] || (x * 7 + z * 3) % 5) continue;
-    for (const [dx, dz] of CORNERS) {
-      const tiles = strokeTiles({ x, z }, { x: x + dx * 8, z: z + dz * 8 });
-      if (!tiles.every(([tx, tz]) => w.inBounds(tx, tz)) || !w.checkStroke(tiles, 2).slice(1).every(c => c.ok && !c.noop)) continue;
-      if (!w.placeRoads(tiles, 1 + (laid % 3), { stroke: true }).placed) continue;
-      laid++;
-      for (let i = 1; i < tiles.length - 1; i++) for (const [hx, hz] of [[tiles[i + 1][0], tiles[i][1]], [tiles[i][0], tiles[i + 1][1]]]) {
-        if (w.placeBuilding(kinds[n % kinds.length], hx, hz, { instant: true, variant: 1000 + n * 7919 + t * 31 + Number(process.env.COLLIDE_SEED || 0) * 104729 }).ok) n++;
-        t++;
-      }
-      break;
+  const ends = [...w.roads.nodes.values()].filter(nd => nd.edges.length === 1 && nd.id !== w.entry.node);
+  const sides = [...w.roads.edges.values()].filter(e => e.len > 3 && w.connected.has(e.a));
+  for (let k = 0; k < 80 && laid < 4; k++) {
+    // from a dead end on, or off the side of a street
+    let x, z, ux, uz;
+    if (ends.length && rnd() < 0.5) {
+      const nd = ends[(rnd() * ends.length) | 0], e = w.roads.edges.get(nd.edges[0]), a = w.roads.dirAt(e, nd.id) + Math.PI;
+      x = nd.x; z = nd.z; ux = Math.sin(a); uz = Math.cos(a);
+    } else {
+      const e = sides[(rnd() * sides.length) | 0], p = pointAt(e.pts, e.cum, 1 + rnd() * (e.len - 2)), sd = rnd() < 0.5 ? 1 : -1;
+      x = p[0]; z = p[1]; ux = -p[4] * sd; uz = p[3] * sd;
+    }
+    const bend = (rnd() - 0.5) * 1.6, c = Math.cos(bend), si = Math.sin(bend), vx = ux * c + uz * si, vz = -ux * si + uz * c, L = 7;
+    const pts = [[x, z], [x + (ux + vx) * L / 4, z + (uz + vz) * L / 4], [x + vx * L, z + vz * L]];
+    if (!w.placeRoad(pts, 1 + (laid % 3)).placed) continue;
+    laid++;
+    for (let i = 1; i <= 6; i++) for (const sd of [1, -1]) {
+      const q = [x + (ux * (6 - i) / 6 + vx * i / 6) * L * i / 6, z + (uz * (6 - i) / 6 + vz * i / 6) * L * i / 6];
+      const s2 = findPlot(w, kinds[n % kinds.length], { x: q[0] - uz * sd * 0.9, z: q[1] + ux * sd * 0.9 }, { r: 1.2 });
+      if (s2 && w.placeBuilding(kinds[n % kinds.length], s2.x, s2.z, { a: s2.a, instant: true, variant: 1000 + n * 7919 + t * 31 + Number(process.env.COLLIDE_SEED || 0) * 104729 }).ok) n++;
+      t++;
     }
   }
-  console.log(`     (${laid} diagonal streets, ${n} buildings facing them)`);
+  console.log(`     (${laid} curving streets, ${n} buildings facing them)`);
 }
 
 let failed = 0;
-const towns = which.includes('all') ? [...STARTERS.filter(d => !d.heavy).map(d => d.id), 'diagonal', 'freeform'] : which;
+const towns = which.includes('all') ? [...STARTERS.filter(d => !d.heavy).map(d => d.id), 'curves', 'freeform'] : which;
 for (const id of towns) {
   if (id === 'freeform') {
     const w = loadStarter('market', { name: 'Askew' });
-    // every building turned up to 45 degrees either way and nudged (see world/pose.js)
+    // every building turned on its plot, as far either way as it will go
+    // (and still face its street, or anything at all for a park)
     let n = 0, seed = 7;
     const rnd = () => { seed = (seed * 1103515245 + 12345) >>> 0; return seed / 2 ** 32; };
-    for (const b of w.buildings.values()) if (w.setPose(b.id, [(rnd() * 2 - 1) * TURN_MAX, (rnd() * 2 - 1) * NUDGE, (rnd() * 2 - 1) * NUDGE]).ok && b.pose) n++;
-    console.log(`     (${n} buildings turned and nudged)`);
+    for (const b of w.buildings.values()) {
+      const want = (rnd() * 2 - 1) * 0.7;
+      for (const k of [1, 0.6, 0.3, 0.1]) if (w.turnBuilding(b.id, b.a + want * k).ok) { n++; break; }
+    }
+    console.log(`     (${n} buildings turned)`);
     failed += play('market town, every building askew', w) ? 1 : 0;
     continue;
   }
-  if (id === 'diagonal') {
-    const w = loadStarter('market', { name: 'Slantham' });
-    diagonalStreets(w);
-    failed += play('market town with diagonal streets', w) ? 1 : 0;
+  if (id === 'curves') {
+    const w = loadStarter('market', { name: 'Bendham' });
+    curvingStreets(w);
+    failed += play('market town with curving streets', w) ? 1 : 0;
     continue;
   }
   if (id === 'scale') {

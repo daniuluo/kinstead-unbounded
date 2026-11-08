@@ -1065,7 +1065,8 @@ export class World {
   moveCheck(b, x, z, a = null) {
     if (b.con) return { ok: false, reason: 'Construction under way', access: null, cost: 0 };
     if (!this.hasTech('relocation')) return { ok: false, reason: 'Research House Moving first', access: null, cost: 0 };
-    return this.checkBuild(b.type, x, z, { w: b.w, d: b.d, a: a ?? undefined, ignoreUnlock: true, ignoreUnique: true, baseCost: this.moveCost(b), except: [b] });
+    // (not over its own plot: the old one stands until it is taken down)
+    return this.checkBuild(b.type, x, z, { w: b.w, d: b.d, a: a ?? undefined, ignoreUnlock: true, ignoreUnique: true, baseCost: this.moveCost(b) });
   }
 
   // Moving = builders take the building down, a cart hauls the materials
@@ -1134,7 +1135,8 @@ export class World {
     // the double plot: side by side, facing the way a faces; one behind the
     // other, facing the way the one in front faces
     const side = opt.side, front = side === 'z1' ? o : a;
-    const cx = (a.x + o.x) / 2, cz = (a.z + o.z) / 2, along = side[0] === 'x';
+    // (where it will be kept: rounded, as a save keeps it)
+    const cx = Math.round(((a.x + o.x) / 2) * 1000) / 1000, cz = Math.round(((a.z + o.z) / 2) * 1000) / 1000, along = side[0] === 'x';
     const R = rect(cx, cz, front.a, along ? 1 : 0.5, along ? 0.5 : 1);
     const g = groundUnder(this.terrain, R);
     if (g.maxH - g.minH > 1.1) return { ok: false, reason: 'The ground is too uneven to join them' };
@@ -1490,7 +1492,9 @@ export class World {
       const [ax, az] = all[i], [bx, bz] = all[i + 1];
       const box = [Math.min(ax, bx) - 0.6, Math.min(az, bz) - 0.6, Math.max(ax, bx) + 0.6, Math.max(az, bz) + 0.6];
       for (const o of this.plots.query(box)) {
-        if (segRectDist(plotOf(o), ax, az, bx, bz) < hw + VERGE - 0.02) { out.reason = `The ${BUILDINGS[o.type].levels[o.level].name.toLowerCase()} is in the way`; return out; }
+        // (as near as a plot may stand to a road: the points a tenth apart
+        // cut a bend's corners by a hair, hence the 0.005)
+        if (segRectDist(plotOf(o), ax, az, bx, bz) < hw + VERGE - 0.005) { out.reason = `The ${BUILDINGS[o.type].levels[o.level].name.toLowerCase()} is in the way`; return out; }
       }
       for (const f of this.fieldIx.query(box)) if (segRectDist(f.rect, ax, az, bx, bz) < hw) { out.reason = 'Farm fields are in the way: take them out of the farm first'; return out; }
     }

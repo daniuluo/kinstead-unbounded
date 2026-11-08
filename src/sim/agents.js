@@ -10,7 +10,7 @@ import { toLocal, toWorld } from '../world/geom.js';
 import { workArea, LIFT } from '../render/buildings.js';
 import { VillagerView, lookOf, dressOf, carryFrom, strideLen } from '../render/villagers.js';
 import { traitsOf } from './people.js';
-import { plotGrid, plotPath, stepsGrid, stepAt, openAt } from './plotNav.js';
+import { plotGrid, plotPath, stepsGrid, stepAt, openAt, reachFrom } from './plotNav.js';
 import { GeoBuilder } from '../render/geo.js';
 import { MAT } from '../render/materials.js';
 
@@ -723,7 +723,14 @@ export class Agents {
     const mesh = it && it.mesh;
     if (!mesh || !mesh.geometry) return null;
     let g = this._grids.get(mesh);
-    if (g === undefined) { g = plotGrid(B, mesh, plotRect(B)); this._grids.set(mesh, g); }
+    if (g === undefined) {
+      g = plotGrid(B, mesh, plotRect(B));
+      // (a place whose way in reaches under half of it, its stalls packed wall
+      // to wall, say: its visitors keep to the ground they can reach, spread
+      // over it, rather than all stand where they came in)
+      if (g) { const d = doorPoint(B), r = reachFrom(g, d.x, d.z); if (r.share < 0.5) g.reach = r.pts; }
+      this._grids.set(mesh, g);
+    }
     return g;
   }
 
@@ -1146,6 +1153,8 @@ export class Agents {
               const p = wk.spots[(Math.random() * wk.spots.length) | 0];
               return [p[0] + (Math.random() - 0.5) * 0.08, p[1] + (Math.random() - 0.5) * 0.08];
             }
+            const gr = !wk.working && this._gridOf(wk.r && w.buildings.get(wk.r.at));
+            if (gr && gr.reach && gr.reach.length) return gr.reach[(Math.random() * gr.reach.length) | 0];
             return inArea(A, x0 + Math.random() * (x1 - x0), z0 + Math.random() * (z1 - z0));
           };
           // (not where someone stands already, if there's anywhere else)

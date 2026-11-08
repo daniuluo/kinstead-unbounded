@@ -300,6 +300,10 @@ export function growCity(def, { onDay } = {}) {
   putBest('teagarden', ring(6, 14));
   for (let i = 0; i < 4; i++) putBest('offices', ring(6, 13));
   for (let i = 0; i < 6; i++) putBest('shophouse', ring(7, 14), { flavor: trades[i % 8] });
+  // (and a second ring of every trade further out: the curving rows hold
+  // fewer lots along the middle than squares did, and a city's shoppers
+  // would crowd the few)
+  if (!dense) for (const t of trades) putBest(t, ring(10, 17));
 
   // ---- homes, services and shops, a few homes at a time until the jobs are taken
   const jobs = () => { let n = 0; for (const b of w.buildings.values()) n += capOf(b, 'jobs'); return n; };

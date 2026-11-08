@@ -152,6 +152,29 @@ function nearestFree(g, x, z) {
   return null;
 }
 
+// How much of the plot's open ground can be reached from (x, z): { share
+// (of its open cells: 1 with none to reach), pts (the middles of the cells
+// reached, [x, z] in the world) }, the ways about it as walked.
+export function reachFrom(g, x, z) {
+  const s = nearestFree(g, x, z);
+  let all = 0;
+  for (let c = 0; c < g.nx * g.nz; c++) if (!g.blocked[c]) all++;
+  if (!all) return { share: 1, pts: [] };
+  if (!s) return { share: 0, pts: [] };
+  const seen = new Uint8Array(g.nx * g.nz), q = [s[1] * g.nx + s[0]];
+  seen[q[0]] = 1;
+  for (let h = 0; h < q.length; h++) {
+    const c = q[h], i = c % g.nx, k = (c / g.nx) | 0;
+    for (let dk = -1; dk <= 1; dk++) for (let di = -1; di <= 1; di++) {
+      if ((!di && !dk) || !free(g, i + di, k + dk)) continue;
+      if (di && dk && (!free(g, i + di, k) || !free(g, i, k + dk))) continue;
+      const nc = (k + dk) * g.nx + i + di;
+      if (!seen[nc]) { seen[nc] = 1; q.push(nc); }
+    }
+  }
+  return { share: q.length / all, pts: q.map(c => cellXZ(g, c % g.nx, (c / g.nx) | 0)) };
+}
+
 // Is (x, z) open ground on the grid?
 export function openAt(g, x, z) { return free(g, ...cellOf(g, x, z)); }
 
