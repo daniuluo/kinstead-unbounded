@@ -10,8 +10,9 @@
 // saved and loaded back (serialize → deserialize), so a game starts from
 // exactly what a save of it would load.
 
-import { World } from './world.js';
-import { generateTerrain } from './terrain.js';
+import { World, findPlot, HALF } from './world.js';
+import { angleOf, angDiff } from './geom.js';
+import { cellOf } from '../sim/sim.js';
 import { Sim } from '../sim/sim.js';
 import { PathFinder } from '../sim/path.js';
 import { Transit } from '../sim/transit.js';
@@ -21,8 +22,10 @@ import { serialize, deserialize } from '../save/saves.js';
 import { growCity } from './city.js';
 
 // Places in a starter's build script are given in the town's own frame:
-// [a, b] is a steps along the main road (towards the way out of the valley)
-// and b steps across it, from the founding crossroads.
+// [a, b] is a units along the main road (towards the way out of the valley)
+// and b units across it, from the founding crossroads. (A street is laid
+// as a straight run from there, joining the roads it meets; the town's own
+// builders set each building along the nearest street, facing it.)
 //
 // known: research the founders bring with them (what a town a few weeks along
 // has behind it). Its points are banked on the first day, so each project is
@@ -124,12 +127,13 @@ export const STARTERS = [
       { day: 18, build: 'watch', near: 'need:safety' },
       { day: 19, build: 'garden', near: [-1, -3] },
       { day: 20, upgrade: 'farm', n: 2 },
+      { day: 21, build: 'house', n: 2, near: [[-3, 2], [2, -4]] },
       { day: 22, upgrade: 'builder', look: 'timber', tech: 'carpentry' },
       { day: 23, build: 'house', n: 2, near: [[2, -7], [1, 6]] },
       { day: 24, build: 'watch', near: 'need:safety' },
       { day: 24, build: 'well', near: 'need:water' },
       { day: 25, build: 'flowers', n: 2, near: [[1, -1], [-1, 1]] },
-      { day: 26, build: 'house', n: 2, near: [[-2, -7], [3, 3]] },
+      { day: 26, build: 'house', n: 2, near: [[5, -1], [6, 1]] },
     ],
   },
   {
@@ -225,11 +229,10 @@ export function growStarter(def, { onDay } = {}) {
   const rng = new RNG(seed ^ 0x2f6b1d3);
   // the founding buildings were given random looks: make them fixed
   for (const b of w.buildings.values()) b.variant = (rng.next() * 1e9) | 0;
-  const { start, entryPath } = generateTerrain(N, seed);
-  const first = entryPath[1] || [start.x + 1, start.z];
-  const dir = [Math.sign(first[0] - start.x), Math.sign(first[1] - start.z)];
-  const perp = [dir[1], dir[0]];
-  const at = ([a, b]) => ({ x: start.x + dir[0] * a + perp[0] * b, z: start.z + dir[1] * a + perp[1] * b });
+  // the town's frame: from the founding crossroads, the way out of the
+  // valley along the road in, and across it
+  const F = w._frame, dir = F.out, perp = F.across;
+  const at = ([a, b]) => ({ x: F.x + dir[0] * a + perp[0] * b, z: F.z + dir[1] * a + perp[1] * b });
   const step = (go) => { const [a, b] = FRAME[go]; return [dir[0] * a + perp[0] * b, dir[1] * a + perp[1] * b]; };
 
   const game = headlessGame(w);
@@ -237,15 +240,11 @@ export function growStarter(def, { onDay } = {}) {
   sim.rng = new RNG(seed ^ 0x5eed);
   sim.seedFounders();
 
-  let centre = { x: start.x, z: start.z };
-  for (const b of w.buildings.values()) if (BUILDINGS[b.type].seat) centre = { x: b.x + b.size / 2, z: b.z + b.size / 2 };
+  let centre = { x: F.x, z: F.z };
+  for (const b of w.buildings.values()) if (BUILDINGS[b.type].seat) centre = { x: b.x, z: b.z };
 
   // ---- where to put things
-  const treesNear = (x, z, r) => {
-    let n = 0;
-    for (let tz = z - r; tz <= z + r; tz++) for (let tx = x - r; tx <= x + r; tx++) if (w.inBounds(tx, tz)) n += w.treeCount[w.idx(tx, tz)];
-    return n;
-  };
+  const treesNear = (x, z, r) => w.treesNear(x, z, r).length;
   // homes out of reach of a service (as the Sim last worked it out)
   const lacking = (service) => [...w.buildings.values()].filter(b => b.factors && BUILDINGS[b.type].levels[b.level].housing && !b.factors[service]);
   const anchorOf = (near, k) => {
@@ -254,36 +253,52 @@ export function growStarter(def, { onDay } = {}) {
     if (typeof near === 'string' && near.startsWith('need:')) {
       // the middle of the homes that go without
       const homes = lacking(near.slice(5));
-      return { x: Math.round(homes.reduce((a, b) => a + b.x, 0) / homes.length), z: Math.round(homes.reduce((a, b) => a + b.z, 0) / homes.length) };
+      return { x: homes.reduce((a, b) => a + b.x, 0) / homes.length, z: homes.reduce((a, b) => a + b.z, 0) / homes.length };
     }
     return centre;
   };
+  // the best spot along the streets near the anchor: by how far from it
+  // (with a little noise, the same every time), by the water or the woods,
+  // and homes away from smoke
   const findSpot = (type, near, k) => {
     const A = anchorOf(near, k);
     const def = BUILDINGS[type];
-    const R = 16;
-    const cands = [];
-    for (let z = A.z - R; z <= A.z + R; z++) for (let x = A.x - R; x <= A.x + R; x++) {
-      if (!w.inBounds(x, z)) continue;
-      let s = Math.hypot(x - A.x, z - A.z) + hash2(x, z, seed) * 1.5;
-      if (near === 'water') s = Math.hypot(x - centre.x, z - centre.z) + hash2(x, z, seed);
+    const pre = w.checkBuild(type, A.x, A.z);
+    // (what doesn't depend on the spot)
+    if (!pre.ok && /Unlocks|Research|money|Only one/.test(pre.reason)) return { reason: pre.reason };
+    const hn = (x, z) => hash2(Math.floor(x * 4), Math.floor(z * 4), seed);
+    const score = (x, z) => {
+      let s = Math.hypot(x - A.x, z - A.z) + hn(x, z) * 1.5;
+      if (near === 'water') s = Math.hypot(x - centre.x, z - centre.z) + hn(x, z);
       if (near === 'trees') s = Math.hypot(x - centre.x, z - centre.z) - Math.min(24, treesNear(x, z, 3)) * 0.4;
-      if (def.levels[0].housing) s += sim.pollution[w.idx(x, z)] * 0.4;
-      cands.push([s, x, z]);
+      if (def.levels[0].housing) s += sim.pollution[cellOf(w.N, x, z)] * 0.4;
+      return s;
+    };
+    const anchor = near === 'water' || near === 'trees' ? centre : A;
+    const spot = findPlot(w, type, anchor, { r: 18, score, test: (x, z, a, chk) => !chk || !!(chk.access && chk.access.conn) });
+    return spot ? { x: spot.x, z: spot.z, a: spot.a } : { reason: 'No room' };
+  };
+  // A straight street from p (a road's end or side there, if one is near)
+  // for len units along d, as far as the ground allows: the points to lay it
+  // through, or null. Over water only with bridge.
+  const streetLine = (p, d, len, level, bridge) => {
+    let a = [p.x - d[0] * 0.5, p.z - d[1] * 0.5];
+    const end0 = [a[0] + d[0] * len, a[1] + d[1] * len];
+    // on from the end of a road it carries on from; or out from the side of one
+    const n = w.roads.nodeNear(a[0], a[1], 1.2, nd => nd.edges.length === 1 && angDiff(w.roads.dirAt(w.roads.edges.get(nd.edges[0]), nd.id) + Math.PI, angleOf(d[0], d[1])) < 0.5);
+    if (n) a = [n.x, n.z];
+    else {
+      const h = w.roads.nearest(a[0], a[1], HALF[3] + 0.6);
+      if (h && Math.abs(h.dx * d[0] + h.dz * d[1]) < 0.7) a = [h.x, h.z];
     }
-    cands.sort((p, q) => p[0] - q[0]);
-    let reason = 'No room';
-    for (const [, x, z] of cands) {
-      const c = w.checkBuild(type, x, z);
-      if (!c.ok) {
-        // these don't depend on the spot
-        if (/Unlocks|Research|money|Only one/.test(c.reason)) return { reason: c.reason };
-        continue;
-      }
-      if (!c.access.some(a => a.conn)) continue;
-      return { x, z };
+    for (let k = 0; k <= 8; k++) {
+      const f = 1 - k * 0.1, e = [a[0] + (end0[0] - a[0]) * f, a[1] + (end0[1] - a[1]) * f];
+      if (Math.hypot(e[0] - a[0], e[1] - a[1]) < 0.8) break;
+      const c = w.checkRoad([a, e], level);
+      if (c.ok && (bridge || !c.water)) return [a, e];
+      if (c.reason && /money/.test(c.reason)) return null;
     }
-    return { reason };
+    return null;
   };
 
   // ---- the script
@@ -294,19 +309,11 @@ export function growStarter(def, { onDay } = {}) {
   };
   const actions = {
     street(s) {
-      const p = at(s.street), [dx, dz] = step(s.go), level = s.level || 1;
-      const tiles = [];
-      for (let k = 0; k < s.len; k++) {
-        const x = p.x + dx * k, z = p.z + dz * k;
-        const c = w.checkRoad(x, z, level);
-        if (!c.ok || (c.water && !s.bridge)) break;
-        tiles.push([x, z]);
-      }
-      if (!tiles.length) return 'blocked';
-      const cost = tiles.reduce((n, [x, z]) => n + (w.checkRoad(x, z, level).cost || 0), 0);
-      if (w.money < cost) return 'Not enough money';
-      w.placeRoads(tiles, level);
-      return true;
+      const level = s.level || 1;
+      const ctrl = streetLine(at(s.street), step(s.go), s.len, level, s.bridge);
+      if (!ctrl) return 'blocked';
+      const r = w.placeRoad(ctrl, level);
+      return r.placed ? true : r.failed || 'blocked';
     },
     build(s, st) {
       const n = s.n || 1;
@@ -315,7 +322,7 @@ export function growStarter(def, { onDay } = {}) {
         if (typeof s.near === 'string' && s.near.startsWith('need:') && !lacking(s.near.slice(5)).length) return true;
         const spot = findSpot(s.build, s.near, st.count);
         if (spot.reason) return spot.reason;
-        const r = w.placeBuilding(s.build, spot.x, spot.z, { instant: true, variant: (rng.next() * 1e9) | 0, look: s.look || null });
+        const r = w.placeBuilding(s.build, spot.x, spot.z, { instant: true, a: spot.a, variant: (rng.next() * 1e9) | 0, look: s.look || null });
         if (!r.ok) return r.reason;
         st.count++;
         sim.recompute();
@@ -337,16 +344,11 @@ export function growStarter(def, { onDay } = {}) {
       return st.count >= n ? true : last;
     },
     cobble(s) {
-      const tiles = [];
-      for (let z = centre.z - s.cobble; z <= centre.z + s.cobble; z++) for (let x = centre.x - s.cobble; x <= centre.x + s.cobble; x++) {
-        if (w.roadAt(x, z) === 1 && !w.terrain.isWater(x, z) && Math.hypot(x - centre.x, z - centre.z) <= s.cobble) tiles.push([x, z]);
-      }
-      const blocked = tiles.map(([x, z]) => w.checkRoad(x, z, 2)).find(c => !c.ok);
-      if (blocked) return blocked.reason;
-      const cost = tiles.reduce((n, [x, z]) => n + (w.checkRoad(x, z, 2).cost || 0), 0);
-      if (w.money < cost) return 'Not enough money';
-      w.placeRoads(tiles, 2);
-      return true;
+      // the dirt roads whose middles are within the radius of the centre
+      const ids = [...w.roads.edges.values()].filter(e => e.level === 1 && e.pts.some(p => Math.hypot(p[0] - centre.x, p[1] - centre.z) <= s.cobble)).map(e => e.id);
+      if (!ids.length) return true;
+      const r = w.setLevel(ids, 2);
+      return r.ok ? true : r.reason;
     },
     line(s) {
       const stops = [...w.buildings.values()].filter(b => b.type === 'coachstop')

@@ -426,7 +426,7 @@ export class World {
     const access = reason ? null : this.accessFor(R);
     if (!reason && !def.park && !access) reason = this.faceRoad(x, z, 1.5) == null ? 'Needs a road in front of it' : 'Turn it to face the street (Z / C), close enough to reach it';
     if (!reason && def.needsWater) {
-      const ring = rectSamples(grow(R, 0.45), 0.3).filter(([px, pz]) => !inRect(R, px, pz, 0.2));
+      const ring = rectSamples(grow(R, 0.6), 0.2).filter(([px, pz]) => !inRect(R, px, pz, 0.15));
       if (!ring.some(([px, pz]) => this.waterAt(px, pz))) reason = 'Must be next to water';
     }
     const rail = !reason && def.needsRail ? this.findRail(R) : null;
@@ -571,9 +571,13 @@ export class World {
   // allows, as it did before the plot grew (b.ownFront). A shop on a corner
   // turns its shopfront round it (b.corner). All of these come from the
   // roads, so none is saved or sent.
-  _updateFronts(except = null) {
+  // Only the buildings near a plot that came or went can change (near: that
+  // plot, as a rectangle); after the roads change, every one.
+  _updateFronts(except = null, near = null) {
     const refit = [];
-    for (const b of this.buildings.values()) {
+    if (!near && except && this.buildings.has(except.id) && !this._roadsChanging) near = plotOf(except);
+    const list = near ? this.plots.query(aabbOf(near, 2)) : this.buildings.values();
+    for (const b of list) {
       const f = this._frontOf(b), r = spareRect(b), own = r ? this._frontOf(b, r) : undefined;
       const cn = this._cornerOf(b), sd = this._sidesOf(b);
       if (f !== (b.front || 0) || own !== b.ownFront || cn !== (b.corner || 0) || sd !== (b.sides || 0)) {
@@ -613,9 +617,10 @@ export class World {
     b.connected = !!(chk.access && chk.access.conn);
     if (BUILDINGS[b.type].needsRail) b.rail = this.findRail(chk.rect);
     b.baseY = floorHeight(this.terrain, b.type, chk.rect, chk.g.minH, chk.g.maxH); b.minY = chk.g.minH;
+    const was = plotOf(b);
     this._file(b);
     this._clearTreesIn(grow(chk.rect, 0.22));
-    this._updateFronts();
+    this._updateFronts(null, grow(was, Math.max(b.w, b.d)));
     this.emit('building:refit', b);
     this.emit('trees');
     return { ok: true, building: b };
@@ -633,10 +638,11 @@ export class World {
   _detach(b) {
     this._dissolveLeases(b);
     this._dropFields(b);
+    const R = plotOf(b);
     this.plots.remove(b);
     this.buildings.delete(b.id);
     this.emit('building:remove', b);
-    this._updateFronts();
+    this._updateFronts(null, R);
   }
 
   // Point everyone and everything that refers to one building at another.
@@ -1396,7 +1402,7 @@ export class World {
     for (let l = 0; l <= b.level; l++) value += def.levels[l].cost;
     this.money += Math.round(value * sizeK(b) * refund);
     this.emit('building:remove', b);
-    this._updateFronts();
+    this._updateFronts(null, plotOf(b));
     if (def.stop) {
       let changed = false;
       for (const line of this.lines) {
@@ -1642,7 +1648,9 @@ export class World {
     }
     for (const e of this.roads.edges.values()) e.hy = null;
     this.emit('roads');
+    this._roadsChanging = true;
     this._updateFronts();
+    this._roadsChanging = false;
   }
   // Whether a road edge reaches the way out of the valley.
   edgeConnected(id) { const e = this.roads.edges.get(id); return !!e && this.connected.has(e.a); }
@@ -1973,13 +1981,23 @@ export class World {
     this.roads.addEdge(a.id, b.id, pts, { level: 1 });
     this.entry = { node: a.id, x: a.x, z: a.z };
     this._founding = { at: b, path: pts };
+    // the town's own frame (for the founding streets and the starters'
+    // build scripts): from the founding crossroads, the way out along the
+    // road in, and across it (across: to the side the scripts call right,
+    // as they did when towns were laid out on squares: the main road's
+    // square direction (dx, dz) had (dz, dx) on its right)
+    const [px, pz] = pts[Math.max(0, pts.length - 6)], dl = Math.hypot(px - b.x, pz - b.z) || 1;
+    const out = [(px - b.x) / dl, (pz - b.z) / dl];
+    const sq = Math.abs(out[0]) > Math.abs(out[1]) ? [Math.sign(out[0]), 0] : [0, Math.sign(out[1])];
+    const r1 = [-out[1], out[0]], want = [sq[1], sq[0]];
+    const across = r1[0] * want[0] + r1[1] * want[1] > 0 ? r1 : [out[1], -out[0]];
+    this._frame = { x: b.x, z: b.z, out, across };
   }
 
   // The first streets: across the road in at the town's start, and on from it.
   _layFoundingStreets(start) {
-    const f = this._founding, n = f.at, P = f.path;
-    const [px, pz] = P[Math.max(0, P.length - 6)], dl = Math.hypot(n.x - px, n.z - pz) || 1;
-    const dir = [(n.x - px) / dl, (n.z - pz) / dl], perp = [-dir[1], dir[0]];
+    const n = this._founding.at, F = this._frame;
+    const dir = [-F.out[0], -F.out[1]], perp = F.across;
     const lay = (d, len) => {
       // as far as the ground allows, a unit at a time
       let k = len;
@@ -2090,9 +2108,11 @@ export function civicQuarter(w, seat = seatOf(w)) {
 // Somewhere for a building of this type near a point, its front SETBACK
 // from the middle of a street and facing it (as the town's own builders lay
 // out a street): the free spot nearest `near` along the roads within
-// opts.r of it, { x, z, a }, or null. opts.opts: what checkBuild is told
-// (free, ignoreMoney...); opts.w, opts.d: the plot's size; opts.step: how
-// finely the roads are searched along; opts.test(x, z, a): a further say.
+// opts.r of it (or the best by opts.score(x, z), lower first), { x, z, a,
+// chk }, or null. opts.opts: what checkBuild is told (free, ignoreMoney...);
+// opts.w, opts.d: the plot's size; opts.step: how finely the roads are
+// searched along; opts.test(x, z, a, chk): a further say (before the check,
+// chk null; and after it).
 export function findPlot(w, type, near, opts = {}) {
   const [w0, d0] = sizeOf(type);
   const W = opts.w ?? w0, D = opts.d ?? d0, r = opts.r ?? 9, step = opts.step ?? 0.125;
@@ -2102,23 +2122,41 @@ export function findPlot(w, type, near, opts = {}) {
     let close = false;
     for (const p of e.pts) if (Math.hypot(p[0] - near.x, p[1] - near.z) < r + 1) { close = true; break; }
     if (!close && !(e.pts.length === 2 && segDist(near.x, near.z, e.pts[0][0], e.pts[0][1], e.pts[1][0], e.pts[1][1]) < r)) continue;
-    const off = SETBACK + D / 2;
+    // (a building that must stand by the water may stand further back, as
+    // far as it can and still reach the street, and turned a little: the
+    // bank seldom runs along the road)
+    const wet = BUILDINGS[type].needsWater;
+    const offs = wet ? [0, 0.12, 0.24, 0.36] : [0], turns = wet ? [0, 0.35, -0.35] : [0];
     for (let s = Math.min(W / 2 + 0.3, e.len / 2); s <= e.len - Math.min(W / 2 + 0.3, e.len / 2) + 1e-9; s += step) {
       const p = pointAt(e.pts, e.cum, s), nx = -p[4], nz = p[3];
-      for (const sd of [1, -1]) {
+      for (const sd of [1, -1]) for (const extra of offs) for (const t of turns) {
+        const off = SETBACK + D / 2 + extra;
         const x = p[0] + nx * sd * off, z = p[1] + nz * sd * off;
         const dd = Math.hypot(x - near.x, z - near.z);
         if (dd > r) continue;
-        cands.push({ x, z, a: angleOf(-nx * sd, -nz * sd), d: dd });
+        cands.push({ x, z, a: angleOf(-nx * sd, -nz * sd) + t, d: (opts.score ? opts.score(x, z) : dd) + Math.abs(t) + extra });
       }
+    }
+  }
+  // and past the end of a road, facing back up it (a cul-de-sac's end: only
+  // for a building that must stand by the water, or when asked, opts.ends,
+  // as it would stop the road going on)
+  if (BUILDINGS[type].needsWater || opts.ends) for (const n of w.roads.nodes.values()) {
+    if (n.edges.length !== 1 || n.id === w.entry.node) continue;
+    const e = w.roads.edges.get(n.edges[0]), a = w.roads.dirAt(e, n.id) + Math.PI, ux = Math.sin(a), uz = Math.cos(a);
+    for (const extra of BUILDINGS[type].needsWater ? [0, 0.12, 0.24, 0.36] : [0]) {
+      const off = SETBACK + D / 2 + extra, x = n.x + ux * off, z = n.z + uz * off, dd = Math.hypot(x - near.x, z - near.z);
+      if (dd <= r) cands.push({ x, z, a: angleOf(-ux, -uz), d: (opts.score ? opts.score(x, z) : dd) + extra });
     }
   }
   cands.sort((p, q) => p.d - q.d);
   const o = { ...(opts.opts || {}), w: W, d: D };
   for (const c of cands) {
-    if (opts.test && !opts.test(c.x, c.z, c.a)) continue;
+    if (opts.test && !opts.test(c.x, c.z, c.a, null)) continue;
+    // (quickly: not on a plot there already)
+    if (w.buildingAt(c.x, c.z)) continue;
     const chk = w.checkBuild(type, c.x, c.z, { ...o, a: c.a });
-    if (chk.ok) return { x: Math.round(c.x * 1000) / 1000, z: Math.round(c.z * 1000) / 1000, a: Math.round(c.a * 1000) / 1000, chk };
+    if (chk.ok && (!opts.test || opts.test(c.x, c.z, c.a, chk))) return { x: Math.round(c.x * 1000) / 1000, z: Math.round(c.z * 1000) / 1000, a: Math.round(c.a * 1000) / 1000, chk };
   }
   return null;
 }

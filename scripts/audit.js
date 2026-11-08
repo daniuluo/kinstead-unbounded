@@ -1,42 +1,77 @@
 // Town invariants checked by the headless tests (playtest.js, starters.js,
 // merge-test.js): plots never overlap (land deals and street fronts
-// included) and the tile map agrees with them, villagers, transit lines and
+// included) or reach onto a road or track, the index of plots agrees with
+// them, the road network is in order (every edge runs from its node to its
+// node, the way out of the valley is a node), villagers, transit lines and
 // land deals point at real buildings, capacities hold, building sites keep
 // moving, nothing turns into NaN; there is one seat of government.
 
-import { fw, fd, isOpen, capOf, spareRect } from '../src/world/world.js';
+import { isOpen, capOf, spareRect, plotOf, HALF, RAIL_HALF, VERGE } from '../src/world/world.js';
+import { rect, toWorld, rectsOverlap, segRectDist, inRect, aabbOf, grow } from '../src/world/geom.js';
 import { BUILDINGS } from '../src/defs.js';
-import { findBoulevards, dressFits } from '../src/world/boulevard.js';
-import { streetPart, lookPart } from '../src/config.js';
-import { tidyDiag, diagCapable } from '../src/world/diagonal.js';
-import { spillsOf } from '../src/world/roadShape.js';
+import { DRESSINGS, streetPart } from '../src/config.js';
 
-const DIR = [[0, 1], [1, 0], [0, -1], [-1, 0]];
+// A building's plot with the verge of the street it may come forward into
+// (b.front), as a rectangle.
+function standing(b) {
+  const R = plotOf(b), f = b.front || 0;
+  if (!f) return R;
+  const [cx, cz] = toWorld(R, 0, f / 2);
+  return rect(cx, cz, R.a, R.hw, R.hd + f / 2);
+}
 
 // The invariants of a town at rest; calls problem(msg) per fault.
 export function auditTown(w, problem) {
-  // plots never overlap and the tile map agrees
+  // plots never overlap, nor reach onto roads or track; the index agrees
   const rects = [];
   for (const b of w.buildings.values()) {
-    for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) if (w.buildingAt[w.idx(b.x + dx, b.z + dz)] !== b.id) problem(`tile map disagrees with ${b.type} #${b.id}`);
-    const e = { x0: 0, x1: 0, z0: 0, z1: 0, ...(b.ext || {}) };
-    const [dx, dz] = DIR[b.rot], f = b.front || 0;
-    if (dx > 0) e.x1 += f; if (dx < 0) e.x0 += f; if (dz > 0) e.z1 += f; if (dz < 0) e.z0 += f;
-    rects.push([b.x - e.x0, b.z - e.z0, b.x + fw(b) + e.x1, b.z + fd(b) + e.z1, b]);
+    if (![b.x, b.z, b.a, b.w, b.d].every(Number.isFinite)) { problem(`${b.type} #${b.id} has no proper plot`); continue; }
+    rects.push([standing(b), b]);
     // a building on part of a grown plot may stand forward of the plot
     const r = spareRect(b), o = b.ownFront || 0;
-    if (r && o > f) rects.push([r.x - (dx < 0 ? o : 0), r.z - (dz < 0 ? o : 0), r.x + r.w + (dx > 0 ? o : 0), r.z + r.d + (dz > 0 ? o : 0), b]);
-    for (let dz2 = 0; dz2 < fd(b); dz2++) for (let dx2 = 0; dx2 < fw(b); dx2++) if (w.roadAt(b.x + dx2, b.z + dz2) || w.railAt(b.x + dx2, b.z + dz2)) problem(`${b.type} #${b.id} sits on a road or track`);
+    if (r && o > (b.front || 0)) { const [cx, cz] = toWorld(r, 0, o / 2); rects.push([rect(cx, cz, r.a, r.hw, r.hd + o / 2), b]); }
+    const R = plotOf(b);
+    if (!w.plots.of.has(b) || !w.plots.query(aabbOf(R)).includes(b)) problem(`the index of plots has lost ${b.type} #${b.id}`);
+    for (const sg of w.roads.segsIn(aabbOf(R, 0.4))) {
+      const p = sg.e.pts[sg.i], q = sg.e.pts[sg.i + 1];
+      if (segRectDist(R, p[0], p[1], q[0], q[1]) < HALF[sg.e.level] + VERGE - 0.01) { problem(`${b.type} #${b.id} sits on a road`); break; }
+    }
+    for (const sg of w.rails.segsIn(aabbOf(R, 0.3))) {
+      const p = sg.e.pts[sg.i], q = sg.e.pts[sg.i + 1];
+      if (segRectDist(R, p[0], p[1], q[0], q[1]) < RAIL_HALF) { problem(`${b.type} #${b.id} sits on track`); break; }
+    }
   }
-  for (let i = 0; i < rects.length; i++) for (let j = i + 1; j < rects.length; j++) {
-    const a = rects[i], c = rects[j];
-    if (a[4] !== c[4] && a[0] < c[2] - 1e-6 && c[0] < a[2] - 1e-6 && a[1] < c[3] - 1e-6 && c[1] < a[3] - 1e-6) problem(`plots overlap: ${a[4].type} #${a[4].id} and ${c[4].type} #${c[4].id}`);
+  // (each against those near it: a town can hold thousands of plots)
+  const byB = new Map();
+  for (const [R, b] of rects) { if (!byB.has(b)) byB.set(b, []); byB.get(b).push(R); }
+  for (const [R, a] of rects) {
+    for (const c of w.plots.query(aabbOf(R, 0.3))) {
+      if (c === a || c.id < a.id || !byB.has(c)) continue;
+      if (byB.get(c).some(C => rectsOverlap(R, C, 0.004))) { problem(`plots overlap: ${a.type} #${a.id} and ${c.type} #${c.id}`); break; }
+    }
   }
-  for (const i in w.buildingAt) if (w.buildingAt[i] >= 0 && !w.buildings.has(w.buildingAt[i])) { problem(`tile ${i} points at a missing building`); break; }
+  for (const b of w.plots.of.keys()) if (!w.buildings.has(b.id) || w.buildings.get(b.id) !== b) { problem(`the index of plots holds a missing ${b.type} #${b.id}`); break; }
+  // the road network is in order
+  for (const net of [w.roads, w.rails]) {
+    for (const e of net.edges.values()) {
+      const A = net.nodes.get(e.a), B = net.nodes.get(e.b);
+      if (!A || !B) { problem(`${net.kind} edge ${e.id} runs to a missing node`); continue; }
+      if (Math.hypot(e.pts[0][0] - A.x, e.pts[0][1] - A.z) > 1e-6 || Math.hypot(e.pts[e.pts.length - 1][0] - B.x, e.pts[e.pts.length - 1][1] - B.z) > 1e-6) problem(`${net.kind} edge ${e.id} doesn't run from its node to its node`);
+      if (!A.edges.includes(e.id) || !B.edges.includes(e.id)) problem(`${net.kind} edge ${e.id} isn't known to its nodes`);
+      if (!e.pts.every(p => p.every(Number.isFinite))) problem(`${net.kind} edge ${e.id} has no proper curve`);
+    }
+    for (const n of net.nodes.values()) for (const id of n.edges) if (!net.edges.has(id)) { problem(`${net.kind} node ${n.id} lists a missing edge`); break; }
+  }
+  if (!w.roads.nodes.has(w.entry.node)) problem('the road out of the valley is gone');
+  // every dressing suits its street
+  for (const e of w.roads.edges.values()) {
+    const D = DRESSINGS[streetPart(e.dress)];
+    if (D && D.minLevel && e.level < D.minLevel) problem(`a ${D.name.toLowerCase()} on a road it doesn't suit (edge ${e.id})`);
+  }
   // one seat of government, on grounds of its own size once rebuilt
   const seats = [...w.buildings.values()].filter(b => BUILDINGS[b.type].seat);
   if (seats.length > 1) problem(`${seats.length} seats of government: ${seats.map(b => `${b.type} #${b.id}`).join(', ')}`);
-  for (const b of seats) if (!b.spare && fw(b) * fd(b) !== BUILDINGS[b.type].size ** 2) problem(`${b.type} #${b.id} stands on ${fw(b)}×${fd(b)} grounds`);
+  for (const b of seats) if (!b.spare && b.w * b.d !== BUILDINGS[b.type].size ** 2) problem(`${b.type} #${b.id} stands on ${b.w}×${b.d} grounds`);
   // people, lines and land deals point at real places
   for (const r of w.residents.values()) {
     if (r.home != null && !w.buildings.has(r.home)) problem(`${r.first} ${r.last} lives in a missing building`);
@@ -50,47 +85,21 @@ export function auditTown(w, problem) {
     if (!o || !(o.leases || []).some(m => m.with === b.id)) problem(`${b.type} #${b.id} has a land deal with a missing or unaware neighbour`);
   }
   // farmland belongs to a farm, on open ground, within its limit, counted right
-  if (w.fields) {
-    const per = new Map();
-    let stray = 0, under = null;
-    for (let i = 0; i < w.fields.length; i++) {
-      const f = w.fields[i];
-      if (f < 0) continue;
-      const b = w.buildings.get(f);
-      if (!b || !BUILDINGS[b.type].fields) { stray++; continue; }
-      if (!under && (w.buildingAt[i] >= 0 || w.roads[i] || w.rails[i])) under = b;
-      per.set(f, (per.get(f) || 0) + 1);
-    }
-    if (stray) problem(`${stray} field(s) belong to no farm`);
-    if (under) problem(`a field of ${under.type} #${under.id} is under a building, road or track`);
-    for (const b of w.buildings.values()) {
-      if (!BUILDINGS[b.type].fields) continue;
-      const n = per.get(b.id) || 0;
-      if ((b.fields || 0) !== n) problem(`${b.type} #${b.id} thinks it has ${b.fields || 0} fields, but has ${n}`);
-      if (n > w.fieldMax(b)) problem(`${b.type} #${b.id} works ${n} fields, more than its ${w.fieldMax(b)}`);
-    }
+  const per = new Map();
+  let stray = 0, under = null;
+  for (const f of w.parcels.values()) {
+    const b = w.buildings.get(f.farm);
+    if (!b || !BUILDINGS[b.type].fields) { stray++; continue; }
+    if (!under && w._plotBlock(grow(f.rect, -0.01), { fields: true })) under = b;
+    per.set(f.farm, (per.get(f.farm) || 0) + 1);
   }
-  // boulevards are what the roads make them now, and every look and
-  // dressing suits its tile
-  if (w.blvd) {
-    const now = findBoulevards(w);
-    if (now.some((v, i) => v !== w.blvd[i])) problem('the boulevards are out of date with the roads');
-    const bad = w.dress.findIndex((v, i) => v && (!w.roads[i] || [streetPart(v), lookPart(v)].some(k => k && !dressFits(w, i, k))));
-    if (bad >= 0) problem(`a street dressing or boulevard look at tile ${bad} doesn't suit it`);
-  }
-  // diagonal streets are in order (links only between roads, both ways, and
-  // cuts only beside them), and where one passes a plot's corner the building
-  // there can face it, and does
-  if (w.diag && w.diagN) {
-    const was = w.diag.slice(), n = w.diagN;
-    tidyDiag(w);
-    if (w.diagN !== n || w.diag.some((v, i) => v !== was[i])) problem('the diagonal streets are out of order');
-    for (const b of w.buildings.values()) {
-      let sp = 0;
-      for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) sp |= spillsOf(w, b.x + dx, b.z + dz);
-      if (sp && !diagCapable(b)) problem(`${b.type} #${b.id} stands where a diagonal street passes its corner`);
-      else if (sp && !b.diag) problem(`${b.type} #${b.id} doesn't face the diagonal street past its corner`);
-    }
+  if (stray) problem(`${stray} field(s) belong to no farm`);
+  if (under) problem(`a field of ${under.type} #${under.id} is under a building, road or track`);
+  for (const b of w.buildings.values()) {
+    if (!BUILDINGS[b.type].fields) continue;
+    const n = per.get(b.id) || 0;
+    if ((b.fields || 0) !== n) problem(`${b.type} #${b.id} thinks it has ${b.fields || 0} fields, but has ${n}`);
+    if (n > w.fieldMax(b)) problem(`${b.type} #${b.id} works ${n} fields, more than its ${w.fieldMax(b)}`);
   }
   // nobody is over capacity
   for (const b of w.buildings.values()) {
@@ -100,6 +109,7 @@ export function auditTown(w, problem) {
     if (b.workers.length > capOf(b, 'jobs')) problem(`${L.name} #${b.id} has too many workers`);
     if (L.seats && (b.pupils || []).length > capOf(b, 'seats')) problem(`${L.name} #${b.id} has too many pupils`);
   }
+  void inRect;
 }
 
 // Returns audit(day) for a running game, which reports each broken invariant

@@ -1,6 +1,10 @@
 // The City starter: a town decades along, laid out whole rather than grown
-// from a short build script like the villages. A grid of streets round the
-// town hall (paved avenues, cobbled side streets); a civic core with the
+// from a short build script like the villages. Streets in long gentle
+// curves round the town hall, a crescent of rows (each one an arc about a
+// point far off beyond the town, on the side away from the way out) with
+// cross streets running out from that point between them (paved avenues,
+// cobbled side streets), so every street bends a little and big buildings
+// still fit along them; a civic core with the
 // seat (the Civic Palace, or grown into a Capitol or a Parliament across a
 // civic block: def.seat) and the law courts, museum and opera house of its
 // civic quarter, a market hall, the exchange, a department store and a
@@ -25,9 +29,10 @@
 // comes from steam. Its options: radius (null: the whole valley), xEvery (the
 // cross streets), workforce, skilled, parks, fill, stopGap.
 
-import { World, capOf, householdCap, isOpen } from './world.js';
-const fw = (b) => b.w, fd = (b) => b.d;
+import { World, capOf, householdCap, isOpen, sizeOf, ownPlot, SETBACK, HALF } from './world.js';
 import { BUILDINGS, TECHS, GRAND, servicesOf } from '../defs.js';
+import { pointAt, angleOf, toWorld, wrapAngle } from './geom.js';
+import { cellOf } from '../sim/sim.js';
 import { stageForAge } from '../sim/people.js';
 import { RNG, hash2 } from '../util/rng.js';
 import { headlessGame } from './starters.js';
@@ -56,55 +61,112 @@ export function growCity(def, { onDay } = {}) {
   const sim = game.sim;
   sim.rng = new RNG(seed ^ 0x5eed);
 
-  const th = [...w.buildings.values()].find(b => b.type === 'townhall');
-  const cx = th.x + 1, cz = th.z + 1;
+  // the town's middle: the founding crossroads, where the road in arrives
+  const F = w._frame, cx = F.x, cz = F.z;
   // the Metropolis reaches every corner of the valley
   if (dense && !R) R = Math.hypot(Math.max(cx - 3, N - 3 - cx), Math.max(cz - 3, N - 3 - cz)) + 0.5;
-  // the founders' cottages, well and stall make way for the city
-  for (const b of [...w.buildings.values()]) if (b !== th) w.removeBuilding(b.id, 0);
-  th.level = TOP('townhall');
-  th.variant = (rng.next() * 1e9) | 0;
-  th.look = 'stone';
+  // the founders' cottages, well, stall and lanes make way for the city (the
+  // town hall goes up again in its civic block, once the streets are laid)
+  for (const b of [...w.buildings.values()]) w.removeBuilding(b.id, 0);
+  for (const e of [...w.roads.edges.values()]) if (e.a !== w.entry.node && e.b !== w.entry.node) w.removeRoadEdge(e.id);
 
-  const dist = (x, z) => Math.hypot(x + 0.5 - cx, z + 0.5 - cz);
+  const dist = (x, z) => Math.hypot(x - cx, z - cz);
   const inside = (x, z) => x >= 3 && z >= 3 && x < N - 3 && z < N - 3 && dist(x, z) <= R;
   // the streets (and the works) carry on a little past the town on the side the road leaves by
   const OUT = 6;
   // the works go on the side the road leaves the valley by
   const out = Math.atan2(w.entry.z - cz, w.entry.x - cx);
-  const away = (x, z) => { const a = Math.atan2(z + 0.5 - cz, x + 0.5 - cx); return Math.abs(((a - out + Math.PI * 3) % (Math.PI * 2)) - Math.PI); };
+  const away = (x, z) => { const a = Math.atan2(z - cz, x - cx); return Math.abs(((a - out + Math.PI * 3) % (Math.PI * 2)) - Math.PI); };
   // (in the Metropolis: a strip along the edge of the valley the road comes in by)
   const ex = w.entry.x, ez = w.entry.z;
-  const edgeD = (x, z) => (ex <= 0 ? x : ex >= N - 1 ? N - 1 - x : ez <= 0 ? z : N - 1 - z);
+  const edgeD = (x, z) => (ex <= 0.5 ? x : ex >= N - 0.5 ? N - x : ez <= 0.5 ? z : N - z);
   const BAND = def.worksBand || 12;
   const works = dense ? (x, z) => edgeD(x, z) < BAND : (x, z) => dist(x, z) >= R * 0.55 && away(x, z) < 0.62;
 
-  // ---- streets: along x every third row, across every ninth column (or xEvery)
-  // A city with a grander seat (def.seat) leaves out the street between the
-  // town hall's block and the next for eight plots, a civic block the seat
-  // grows across, with the civic buildings beside it
-  const CB = def.seat ? { x0: th.x, x1: th.x + 7, z0: th.z, z1: th.z + 4 } : null;
-  const civicBlock = (x, z) => !!CB && x >= CB.x0 && x <= CB.x1 && z >= CB.z0 && z <= CB.z1;
-  const XE = def.xEvery || 9;
-  const zStreet = (z) => (((z - (th.z - 1)) % 3) + 3) % 3 === 0;
-  const xStreet = (x) => (((x - (th.x - 1)) % XE) + XE) % XE === 0;
-  const avenue = (x, z) => (zStreet(z) && ((((z - (th.z - 1)) / 3) % 3) + 3) % 3 === 0) || (xStreet(x) && ((((x - (th.x - 1)) / XE) % 2) + 2) % 2 === 0);
-  const paved = [], cobbled = [];
-  for (let z = 0; z < N; z++) for (let x = 0; x < N; x++) {
-    const beyond = x >= 3 && z >= 3 && x < N - 3 && z < N - 3 && dist(x, z) <= R + OUT && away(x, z) < 0.75;
-    if (!(inside(x, z) || beyond) || !(zStreet(z) || xStreet(x)) || w.terrain.isWater(x, z) || civicBlock(x, z)) continue;
-    (avenue(x, z) ? paved : cobbled).push([x, z]);
+  // ---- streets: rows three apart, each an arc about O (far off on the side
+  // away from the way out), and cross streets out from O between them,
+  // every XE along the middle row. A city with a grander seat (def.seat)
+  // leaves out the row between the seat's block and the next for two blocks
+  // (a civic block the seat grows across, with the civic buildings beside it)
+  const RC = 36, XE = def.xEvery || 9, ROW = 3;
+  const Ox = cx - F.out[0] * RC, Oz = cz - F.out[1] * RC, A0 = Math.atan2(cz - Oz, cx - Ox);
+  const polar = (x, z) => [Math.hypot(x - Ox, z - Oz), wrapAngle(Math.atan2(z - Oz, x - Ox) - A0)];
+  const fromPolar = (rho, th) => [Ox + Math.cos(A0 + th) * rho, Oz + Math.sin(A0 + th) * rho];
+  const DT = XE / RC;
+  const civicBlock = def.seat ? (x, z) => { const [rho, th] = polar(x, z); return rho > RC + 0.3 && rho < RC + 2 * ROW - 0.3 && Math.abs(th) < DT - 0.05; } : () => false;
+  const reach = (x, z) => x >= 2.5 && z >= 2.5 && x <= N - 2.5 && z <= N - 2.5 && (dist(x, z) <= R || (dist(x, z) <= R + OUT && away(x, z) < 0.75));
+  // lay a curve where the land allows: whole, or in pieces (halved again
+  // and again) where it won't go whole
+  const lay = (pts, level) => {
+    if (pts.length < 2) return;
+    let L = 0;
+    for (let i = 1; i < pts.length; i++) L += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+    if (L < 1.4) return;
+    const ctrl = pts.length > 3 ? pts : pts;
+    if (w.placeRoad(ctrl, level).placed) return;
+    const m = pts.length >> 1;
+    if (pts.length < 4) return;
+    lay(pts.slice(0, m + 1), level);
+    lay(pts.slice(m), level);
+  };
+  // the parts of an arc (or a line) inside the town, as runs of points
+  const runs = (f, t0, t1, n) => {
+    const out = [];
+    let cur = [];
+    for (let k = 0; k <= n; k++) {
+      const p = f(t0 + ((t1 - t0) * k) / n);
+      if (reach(p[0], p[1]) && !w.waterAt(p[0], p[1])) cur.push(p); else { if (cur.length > 1) out.push(cur); cur = []; }
+    }
+    if (cur.length > 1) out.push(cur);
+    return out;
+  };
+  const span = (R + OUT) / RC + 0.2;
+  // the cross streets first (every other one an avenue), then the rows
+  // (every third an avenue), which join them where they cross
+  const K = Math.ceil((R + OUT) / ROW) + 1, JN = Math.ceil(span / DT);
+  for (let j = -JN; j <= JN; j++) {
+    const th = j * DT, level = j % 2 === 0 ? 3 : 2;
+    const line = (rho) => fromPolar(rho, th);
+    if (j === 0 && def.seat) {
+      for (const r of runs(line, RC - K * ROW, RC, K * 4)) lay(r, level);
+      for (const r of runs(line, RC + 2 * ROW, RC + K * ROW, K * 4)) lay(r, level);
+    } else for (const r of runs(line, RC - K * ROW, RC + K * ROW, K * 8)) lay(r, level);
   }
-  w.placeRoads(paved, 3);
-  w.placeRoads(cobbled, 2);
+  for (let k = -K; k <= K; k++) {
+    const rho = RC + k * ROW, level = k % 3 === 0 ? 3 : 2, arc = (th) => fromPolar(rho, th), n = Math.ceil((2 * span * rho) / 0.6);
+    if (k === 1 && def.seat) {
+      for (const r of runs(arc, -span, -DT, n)) lay(r, level);
+      for (const r of runs(arc, DT, span, n)) lay(r, level);
+    } else for (const r of runs(arc, -span, span, n)) lay(r, level);
+  }
   // the old way in is paved as far as the edge of town
-  const entryRoad = [];
-  for (let i = 0; i < N * N; i++) if (w.roads[i] === 1 && dist(i % N, (i / N) | 0) <= R + 2) entryRoad.push([i % N, (i / N) | 0]);
-  w.placeRoads(entryRoad, 3);
-  // (the founders' lanes are taken up from the civic block)
-  if (CB) for (let z = CB.z0; z <= CB.z1; z++) for (let x = CB.x0; x <= CB.x1; x++) if (w.roadAt(x, z)) w.removeRoad(x, z);
+  w.setLevel([...w.roads.edges.values()].filter(e => e.level < 3 && (e.a === w.entry.node || e.b === w.entry.node || e.pts.some(p => dist(p[0], p[1]) <= R + 2))).filter(e => e.level === 1).map(e => e.id), 3);
   // streets cut off from the rest (by water or a steep bank) are taken up again
-  for (let i = 0; i < N * N; i++) if (w.roads[i] && !w.connected[i]) w.removeRoad(i % N, (i / N) | 0);
+  for (const e of [...w.roads.edges.values()]) if (w.roads.edges.has(e.id) && !w.edgeConnected(e.id)) w.removeRoadEdge(e.id);
+
+  // the slots along the streets for a plot w wide and d deep (see place, below)
+  const slotsFor = (W, D) => {
+    const out = [];
+    for (const e of w.roads.edges.values()) for (let s = 0.6; s <= e.len - 0.6; s += 0.25) {
+      const p = pointAt(e.pts, e.cum, s);
+      for (const sd of [1, -1]) { const ux = -p[4] * sd, uz = p[3] * sd, off = SETBACK + D / 2; out.push({ x: p[0] + ux * off, z: p[1] + uz * off, a: angleOf(-ux, -uz) }); }
+    }
+    return out;
+  };
+  // ---- the town hall, at the front of its civic block (or by the middle)
+  const thSpot = (x, z) => (def.seat ? (civicBlock(x, z) ? Math.abs(polar(x, z)[1]) * RC + dist(x, z) * 0.1 : null) : dist(x, z));
+  let th = null;
+  {
+    const [W2, D2] = sizeOf('townhall');
+    for (const s of slotsFor(W2, D2).map(s => [thSpot(s.x, s.z), s]).filter(([v]) => v != null).sort((p, q) => p[0] - q[0])) {
+      const r = w.placeBuilding('townhall', s[1].x, s[1].z, { a: s[1].a, ignoreUnlock: true, instant: true, free: true, variant: (rng.next() * 1e9) | 0 });
+      if (r.ok) { th = r.building; break; }
+    }
+  }
+  if (!th) { log.push('no room for the town hall'); return { world: w, sim, log, notes }; }
+  th.level = TOP('townhall');
+  th.look = 'stone';
+  w.emit('building:change', th);
 
   // ---- the seat grows across the civic block, a size at a time, into the
   // Capitol or the Parliament (def.seat), in its style (def.seatStyle)
@@ -113,7 +175,8 @@ export function growCity(def, { onDay } = {}) {
     Object.assign(w.sandbox, { freeUpgrades: true, instantBuild: true });
     for (let k = 0; k < 8 && !(th.type === def.seat && th.level === TOP(def.seat)); k++) {
       if (th.level < TOP(th.type)) { w.upgradeBuilding(th.id); continue; }
-      const o = w.expandOptions(th).filter(e => e.kind === 'grand').sort((a, b) => b.dir - a.dir)[0];
+      // (back into its civic block, away from the street it faces)
+      const o = w.expandOptions(th).filter(e => e.kind === 'grand').sort((a, b) => (a.grow.gz0 - b.grow.gz0) || b.dir - a.dir)[0];
       if (!o || !w.expandBuilding(th.id, o.dir, 'grand').ok || !w.upgradeBuilding(th.id, GRAND[th.type][0]).ok) { log.push(`the town hall could not grow into the ${def.seat}`); break; }
     }
     Object.assign(w.sandbox, keep);
@@ -123,45 +186,64 @@ export function growCity(def, { onDay } = {}) {
   // ---- placing buildings
   const variant = () => (rng.next() * 1e9) | 0;
   let onPlaced = null;   // (b) after each building goes up (set below)
-  const place = (type, x, z, o = {}) => {
+  // a slot is a place along a street a plot can face it from: { x0, z0 (the
+  // middle of the street there), ux, uz (from the street towards the plot) }
+  // and a plot w wide and d deep there stands at its x, z, facing a
+  const at = (sl, W, D) => { const off = SETBACK + D / 2; return { x: sl.x0 + sl.ux * off, z: sl.z0 + sl.uz * off, a: angleOf(-sl.ux, -sl.uz), W, D }; };
+  const place = (type, sl, o = {}) => {
     const d = BUILDINGS[type];
-    const sizes = o.size ? [o.size] : d.merged ? (rng.chance(0.5) ? [[2, 1], [1, 2]] : [[1, 2], [2, 1]]) : [[d.size, d.size]];
+    const sizes = o.size ? [o.size] : d.merged ? (rng.chance(0.5) ? [[2, 1], [1, 2]] : [[1, 2], [2, 1]]) : [sizeOf(type)];
     for (const [W, D] of sizes) {
-      const c = w.checkBuild(type, x, z, { w: W, d: D, ignoreUnlock: true });
-      if (!c.ok) continue;
-      const k = c.access.findIndex(a => a.conn);
-      if (k < 0) continue;
-      const r = w.placeBuilding(type, x, z, {
-        w: W, d: D, ignoreUnlock: true, instant: true, level: o.level ?? TOP(type), look: o.look ?? null, flavor: o.flavor ?? null,
-        variant: variant(), accessIndex: Math.max(0, k),
+      const p = at(sl, W, D);
+      const c = w.checkBuild(type, p.x, p.z, { a: p.a, w: W, d: D, ignoreUnlock: true });
+      if (!c.ok || !c.access || !c.access.conn) continue;
+      const r = w.placeBuilding(type, p.x, p.z, {
+        a: p.a, w: W, d: D, ignoreUnlock: true, instant: true, level: o.level ?? TOP(type), look: o.look ?? null, flavor: o.flavor ?? null,
+        variant: variant(),
       });
       if (r.ok) { if (onPlaced) onPlaced(r.building); return r.building; }
     }
     return null;
   };
-  // the best free spot for a building, by score (lower is better), among
-  // the tiles that pass `where`
-  const spots = [];
-  for (let z = 2; z < N - 2; z++) for (let x = 2; x < N - 2; x++) spots.push([x, z]);
+  // every slot along every street, a quarter apart, both sides
+  const slots = [];
+  for (const e of w.roads.edges.values()) for (let s = 0.6; s <= e.len - 0.6; s += 0.25) {
+    const p = pointAt(e.pts, e.cum, s);
+    for (const sd of [1, -1]) slots.push({ x0: p[0], z0: p[1], ux: -p[4] * sd, uz: p[3] * sd, x: p[0] - p[4] * sd * (SETBACK + 0.5), z: p[1] + p[3] * sd * (SETBACK + 0.5) });
+  }
+  // the best free spot for a building, by score (lower is better) of where
+  // it would stand, among those that pass `where`
+  const taken = (sl) => !!w.buildingAt(sl.x, sl.z) || !!w.buildingAt(sl.x0 + sl.ux * (SETBACK + 0.1), sl.z0 + sl.uz * (SETBACK + 0.1));
   const putBest = (type, score, o = {}) => {
     const cands = [];
-    for (const [x, z] of spots) {
-      if (w.buildingOn(x, z) || w.roadAt(x, z)) continue;
-      const s = score(x, z);
-      if (s !== null && Number.isFinite(s)) cands.push([s + hash2(x, z, seed) * 0.4, x, z]);
+    for (const sl of slots) {
+      if (taken(sl)) continue;
+      const s = score(sl.x, sl.z);
+      if (s !== null && Number.isFinite(s)) cands.push([s + hash2(Math.floor(sl.x * 4), Math.floor(sl.z * 4), seed) * 0.4, sl]);
     }
     cands.sort((a, b) => a[0] - b[0]);
-    for (const [, x, z] of cands) { const b = place(type, x, z, o); if (b) return b; }
+    // (by the water for a pump or a harbour: none that are nowhere near it;
+    // and no more than a few hundred tries: a crowded city has thousands of spots)
+    const wet = BUILDINGS[type].needsWater, near = (sl) => { for (let k = 0; k < 8; k++) { const a = (k * Math.PI) / 4; if (w.waterAt(sl.x + Math.cos(a) * 1.6, sl.z + Math.sin(a) * 1.6)) return true; } return false; };
+    let tries = 0;
+    for (const [, sl] of cands) {
+      if (wet && !near(sl)) continue;
+      if (++tries > 300) break;
+      const b = place(type, sl, o);
+      if (b) return b;
+    }
     // late in the day a garden, a bed of flowers or a statue can make way
     const small = [...w.buildings.values()].filter(b => SMALL.has(b.type)).map(b => [score(b.x, b.z), b]).filter(([s]) => s !== null && Number.isFinite(s)).sort((p, q) => p[0] - q[0]);
     for (const [, g] of small.slice(0, 12)) {
-      const { x, z } = g;
+      // (the slot it was set from: the street in front of it)
+      const G = ownPlot(g), [fx, fz] = toWorld(G, 0, G.hd + SETBACK);
+      const sl = { x0: fx, z0: fz, ux: -G.ux, uz: -G.uz, x: g.x, z: g.z }, gt = g.type;
       w.removeBuilding(g.id, 0);
       covDirty = true;
       retally();
-      const b = place(type, x, z, o) || place(type, x - 1, z, o) || place(type, x, z - 1, o) || place(type, x - 1, z - 1, o);
+      const b = place(type, sl, o);
       if (b) return b;
-      place(g.type, x, z);
+      place(gt, sl);
     }
     notes.push(`no room for ${type}`);
     return null;
@@ -176,12 +258,11 @@ export function growCity(def, { onDay } = {}) {
   else for (const type of ['museum', 'lawcourts', 'operahouse']) core(1, type);
   // ...and the rest of the civic block: a square on the street, then
   // monuments and flower beds
-  let square = null;
-  if (CB) for (let z = CB.z0; z < CB.z1 && !square; z++) for (let x = CB.x0; x < CB.x1 && !square; x++) square = place('plaza', x, z);
-  if (CB) for (let z = CB.z0; z <= CB.z1; z++) for (let x = CB.x0; x <= CB.x1; x++) {
-    if (w.buildingOn(x, z) || w.roadAt(x, z)) continue;
-    const mon = hash2(x, z, seed + 3) < 0.4;
-    place(mon ? 'statue' : 'flowers', x, z, { flavor: mon ? rng.pick(['column', 'rider', 'obelisk', 'founder', 'fountain']) : rng.pick(['bedding', 'topiary', 'planters', 'tree']) });
+  let square = def.seat ? putBest('plaza', (x, z) => (civicBlock(x, z) ? dist(x, z) : null)) : null;
+  if (def.seat) for (const sl of slots) {
+    if (!civicBlock(sl.x, sl.z) || taken(sl)) continue;
+    const mon = hash2(Math.floor(sl.x * 4), Math.floor(sl.z * 4), seed + 3) < 0.4;
+    place(mon ? 'statue' : 'flowers', sl, { flavor: mon ? rng.pick(['column', 'rider', 'obelisk', 'founder', 'fountain']) : rng.pick(['bedding', 'topiary', 'planters', 'tree']) });
   }
   if (!square) core(1, 'plaza');
   core(1, 'markethall');
@@ -242,7 +323,7 @@ export function growCity(def, { onDay } = {}) {
     if (key === 'play') return d.play ? (L.radius || 0) + 0.5 : 0;
     return servicesOf(d).includes(key) ? (L.radius || 0) + 0.5 : 0;
   };
-  const mid = (b) => [b.x + fw(b) / 2, b.z + fd(b) / 2];
+  const mid = (b) => [b.x, b.z];
   // what reaches each tile (from its centre), for each need, kept up to date
   // as buildings go up (and worked out afresh after one is taken down)
   const cov = new Map(NEEDS.map(([k]) => [k, new Uint8Array(N * N)]));
@@ -257,6 +338,7 @@ export function growCity(def, { onDay } = {}) {
       }
     }
   };
+  void HALF;
   // where the works' smoke reaches (a polluter's reach plus a tile and a
   // half, from its middle), and the town's power and water, likewise
   const smoke = new Uint8Array(N * N);
@@ -278,7 +360,7 @@ export function growCity(def, { onDay } = {}) {
   const retally = () => { smoke.fill(0); tot.p = tot.k = tot.s = tot.h = 0; for (const o of w.buildings.values()) tally(o); };
   const reaches = (b, key) => {
     if (covDirty) { covDirty = false; for (const g of cov.values()) g.fill(0); for (const o of w.buildings.values()) stamp(o); }
-    return !!cov.get(key)[b.z * N + b.x];
+    return !!cov.get(key)[cellOf(N, b.x, b.z)];
   };
   const fillServices = () => {
     for (let round = 0; round < 200; round++) {
@@ -302,7 +384,7 @@ export function growCity(def, { onDay } = {}) {
   // works' smoke; the services follow wherever homes would go without.
   const smoky = (x, z) => {
     if (dense ? works(x, z) : dist(x, z) >= R * 0.4 && away(x, z) < 1.05) return true;
-    return !!smoke[z * N + x];
+    return !!smoke[cellOf(N, x, z)];
   };
   const skill = (t) => BUILDINGS[t].levels[TOP(t)].edu || 0;
   let S = 0;
@@ -324,7 +406,7 @@ export function growCity(def, { onDay } = {}) {
   for (let i = -12; i <= 12; i++) for (let j = -12; j <= 12; j++) {
     if (!dense && (Math.abs(i) > 6 || Math.abs(j) > 6)) continue;
     const px = cx + i * SX + (j % 2) * Math.round(SX / 2), pz = cz + j * SZ;
-    if (inside(px, pz) && dist(px, pz) > 4) putBest('coachstop', near(px, pz, (x, z) => Math.hypot(x - px, z - pz) < 2.6));
+    if (inside(px, pz) && dist(px, pz) > 4) putBest('coachstop', near(px, pz, (x, z) => Math.hypot(x - px, z - pz) < 3.2));
   }
   // power and water to keep up as the town fills
   const kwNeed = () => tot.p * 1.25 - tot.k;
@@ -362,28 +444,30 @@ export function growCity(def, { onDay } = {}) {
     }
   };
   const lots = [];
-  for (const [x, z] of spots) if (inside(x, z) || (works(x, z) && dist(x, z) <= R + OUT)) lots.push([dist(x, z) + hash2(x, z, seed + 1) * 2, x, z]);
+  for (const sl of slots) { const { x, z } = sl; if (inside(x, z) || (works(x, z) && dist(x, z) <= R + OUT)) lots.push([dist(x, z) + hash2(Math.floor(x * 4), Math.floor(z * 4), seed + 1) * 2, sl]); }
   lots.sort((a, b) => a[0] - b[0]);
   let J = jobs(), H = housing(), since = 0;
-  for (const [, x, z] of lots) {
-    if (w.buildingOn(x, z) || w.roadAt(x, z)) continue;
+  for (const [, sl] of lots) {
+    const { x, z } = sl;
+    if (taken(sl)) continue;
     let b = null;
+    const h7 = hash2(Math.floor(x * 4), Math.floor(z * 4), seed + 7);
     // about one lot in nine is a garden, a court, a play area or a statue
-    if (!works(x, z) && hash2(x, z, seed + 7) < (def.parks ?? 0.08)) b = place(rng.pick(['garden', 'garden', 'flowers', 'courts', 'playground', 'statue']), x, z);
+    if (!works(x, z) && h7 < (def.parks ?? 0.08)) b = place(rng.pick(['garden', 'garden', 'flowers', 'courts', 'playground', 'statue']), sl);
     const wantHome = H * WORKFORCE < J;
     if (dense && works(x, z)) {
-      b = kwNeed() > 0 ? place('powerplant', x, z) : waterNeed() > 0 ? place('well', x, z) : null;
-      if (!b) b = place(workFor(x, z), x, z, { look: rng.pick(LOOKS) });
+      b = kwNeed() > 0 ? place('powerplant', sl) : waterNeed() > 0 ? place('well', sl) : null;
+      if (!b) b = place(workFor(x, z), sl, { look: rng.pick(LOOKS) });
       if (b) { J += capOf(b, 'jobs'); if ((BUILDINGS[b.type].levels[b.level].edu || 0) >= 2) S += capOf(b, 'jobs'); }
       continue;
     }
     // near the works, where nobody would live, it's a green or a turbine instead
-    if (!b && wantHome && smoky(x, z)) b = place(works(x, z) && kwNeed() > 0 ? 'windgen' : rng.pick(['garden', 'courts', 'garden', 'flowers']), x, z);
+    if (!b && wantHome && smoky(x, z)) b = place(works(x, z) && kwNeed() > 0 ? 'windgen' : rng.pick(['garden', 'courts', 'garden', 'flowers']), sl);
     if (!b && wantHome && !smoky(x, z)) {
       const t = homeFor(dist(x, z));
-      b = place(t, x, z, { look: rng.pick(LOOKS), flavor: t === 'shophouse' ? rng.pick(trades.slice(0, 8)) : null });
+      b = place(t, sl, { look: rng.pick(LOOKS), flavor: t === 'shophouse' ? rng.pick(trades.slice(0, 8)) : null });
     }
-    if (!b && !wantHome) b = place(workFor(x, z), x, z, { look: rng.pick(LOOKS) });
+    if (!b && !wantHome) b = place(workFor(x, z), sl, { look: rng.pick(LOOKS) });
     if (!b) continue;
     J += capOf(b, 'jobs'); H += capOf(b, 'housing');
     if ((BUILDINGS[b.type].levels[b.level].edu || 0) >= 2) S += capOf(b, 'jobs');
@@ -443,11 +527,7 @@ function householdsIn(w, b) {
   return fams.size;
 }
 
-function treesAround(w, x, z, r) {
-  let n = 0;
-  for (let tz = z - r; tz <= z + r; tz++) for (let tx = x - r; tx <= x + r; tx++) if (w.inBounds(tx, tz)) n += w.treeCount[w.idx(tx, tz)];
-  return n;
-}
+function treesAround(w, x, z, r) { return w.treesNear(x, z, r).length; }
 
 // Enough school places for the children of every stage (elementary,
 // middle, high school), by the homes they live in. Places are counted from

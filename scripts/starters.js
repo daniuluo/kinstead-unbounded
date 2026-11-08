@@ -27,20 +27,21 @@ const DAYS = Number(args[0] || 6);
 const only = args[1] ? args[1].split(',') : null;
 let failures = 0;
 
-// The town as text: buildings by letter (capital once upgraded), : dirt,
-// = cobbles, | bridge, ~ water, T trees, ^ steep.
+// The town as text, a character for each unit square (what stands at its
+// middle): buildings by letter (capital once upgraded), : dirt, = cobbles,
+// | bridge, ~ water, T trees, ^ steep.
 const LETTER = { townhall: 'H', capitol: 'H', parliament: 'H', house: 'h', market: 'm', bakery: 'b', tavern: 'p', well: 'w', builder: 'B', farm: 'F', lumber: 'L', fishery: 'f', workshop: 'W',
   school: 'S', chapel: 'C', clinic: '+', watch: 'G', garden: 'g', flowers: '*', coachstop: 'c', watermill: 'M', windgen: 'X', pump: 'u' };
 function asciiMap(w, R = 14) {
-  const th = [...w.buildings.values()].find(b => BUILDINGS[b.type].seat), cx = th.x + 1, cz = th.z + 1, rows = [];
+  const th = [...w.buildings.values()].find(b => BUILDINGS[b.type].seat), cx = Math.floor(th.x), cz = Math.floor(th.z), rows = [];
   for (let z = Math.max(0, cz - R); z <= Math.min(w.N - 1, cz + R); z++) {
     let row = '';
     for (let x = Math.max(0, cx - R); x <= Math.min(w.N - 1, cx + R); x++) {
-      const b = w.buildingOn(x, z), r = w.roadAt(x, z);
+      const px = x + 0.5, pz = z + 0.5, b = w.buildingAt(px, pz), r = w.roadAt(px, pz, 0.1);
       if (b) { const c = LETTER[b.type] || '?'; row += b.level ? c.toUpperCase() : c; }
-      else if (r) row += w.terrain.isWater(x, z) ? '|' : r === 1 ? ':' : '=';
-      else if (w.terrain.isWater(x, z)) row += '~';
-      else if (w.treeCount[w.idx(x, z)]) row += 'T';
+      else if (r) row += w.waterAt(px, pz) ? '|' : r.e.level === 1 ? ':' : '=';
+      else if (w.waterAt(px, pz)) row += '~';
+      else if (w.treesNear(px, pz, 0.5).length) row += 'T';
       else row += w.terrain.slope(x, z) > 0.85 ? '^' : '.';
       row += ' ';
     }
@@ -100,7 +101,7 @@ for (const def of STARTERS) {
     if (L.housing && bd.residents.length > capOf(bd, 'housing') + 1) problem(0, `${L.name} #${bd.id} starts overcrowded: ${bd.residents.length}/${capOf(bd, 'housing')}`);
   }
   let road2 = 0;
-  for (let i = 0; i < w.roads.length; i++) if (w.roads[i] >= 2) road2 = Math.max(road2, w.roads[i]);
+  for (const e of w.roads.edges.values()) if (e.level >= 2) road2 = Math.max(road2, e.level);
   if (road2 && ROAD_LEVELS[road2].unlock > w.population) problem(0, `${ROAD_LEVELS[road2].name} laid with only ${w.population} villagers`);
   const R = w.research, researched = R.done.join(', ') || 'none', researching = R.current;
   if (R.current && !w.canResearch(R.current)) problem(0, `researching ${R.current} without what it needs`);
