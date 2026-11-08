@@ -33,7 +33,7 @@ import { World, capOf, householdCap, isOpen, sizeOf, ownPlot, SETBACK, HALF } fr
 import { BUILDINGS, TECHS, GRAND, servicesOf } from '../defs.js';
 import { pointAt, angleOf, toWorld, wrapAngle } from './geom.js';
 import { cellOf } from '../sim/sim.js';
-import { stageForAge } from '../sim/people.js';
+import { stageForAge, eduOf } from '../sim/people.js';
 import { RNG, hash2 } from '../util/rng.js';
 import { headlessGame } from './starters.js';
 
@@ -513,6 +513,33 @@ export function growCity(def, { onDay } = {}) {
     if (onDay) onDay(w, sim);
     w.day++;
     sim.daily();
+  }
+  // (the city's schooled hands, first hired wherever was nearest, move to
+  // the skilled work standing short-handed: the streets curve, and the
+  // nearest is seldom the one that needs them)
+  sim.recompute();
+  for (const b of w.buildings.values()) {
+    const need = BUILDINGS[b.type].levels[b.level].edu || 0, jobs = sim.jobsOf(b);
+    if (need < 2 || !b.connected || b.workers.length >= jobs * 0.75) continue;
+    const from = [...w.buildings.values()].filter(o => o !== b && !(BUILDINGS[o.type].levels[o.level].edu || 0) && o.workers.length)
+      .sort((p, q) => Math.hypot(p.x - b.x, p.z - b.z) - Math.hypot(q.x - b.x, q.z - b.z));
+    for (const o of from) {
+      for (const rid of [...o.workers]) {
+        if (b.workers.length >= jobs * 0.75) break;
+        const r = w.residents.get(rid);
+        if (!r || eduOf(r) < need) continue;
+        o.workers.splice(o.workers.indexOf(rid), 1);
+        r.job = b.id; b.workers.push(rid);
+      }
+      if (b.workers.length >= jobs * 0.75) break;
+    }
+  }
+  // (the town grew a little as it settled: power for all of it, as the sim
+  // counts it)
+  sim.recompute();
+  for (let i = 0; i < 20 && sim.powerShare < 1; i++) {
+    if (dense ? !putBest('powerplant', worksAt) && !putBest('windgen', worksAt) : !putBest('windgen', windAt) && !putBest('windgen', worksAt)) break;
+    sim.recompute();
   }
   w.sandbox.unlockAll = false;
   sim.recompute();

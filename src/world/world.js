@@ -12,7 +12,7 @@ import { CONFIG, ROAD_LEVELS, BRIDGE_MULT, TREE_COST, CLEAR_COST, TERRAFORM_COST
 import { BUILDINGS, unlockOf, RAIL_COST, workNeeded, TECHS, STYLE_TECH, MERGES, LARGE, ESTATE, GRAND, KINDS, REKIND, kindOf, techForLevel, growsInto, plotName, isSmallPark, BURY_COST, FARM_JOIN, PRODUCE, produceOf, hasFields, choosesProduce, CORNER_SHOPS, CIVIC_QUARTER, seatWorth, SEAT_RESTYLE } from '../defs.js';
 const STYLE_TECH_OF = (look) => STYLE_TECH[look] || null;
 import { generateTerrain } from './terrain.js';
-import { rect, grow, toLocal, toWorld, inRect, aabbOf, rectsOverlap, rectSamples, segRectDist, segDist, segCross, Index, spline, simplify, tightest, cumulative, pointAt, polyLength, angleOf, wrapAngle, resample } from './geom.js';
+import { rect, grow, toLocal, toWorld, inRect, aabbOf, rectsOverlap, rectSamples, segRectDist, segDist, segCross, Index, spline, simplify, tightest, cumulative, pointAt, polyLength, angleOf, wrapAngle, roundAngle, resample } from './geom.js';
 import { Net, edgeHeights, heightOn, wetOn, MIN_EDGE } from './net.js';
 import { newTownId } from '../util/text.js';
 import { RNG, hash2, makeNoise2D, fbm } from '../util/rng.js';
@@ -98,20 +98,38 @@ export function floorHeight(terrain, type, R, minH, maxH) {
   if (!def || def.needsRail || def.needsWater || def.park || !(maxH > minH)) return maxH;
   const [fx, fz] = toWorld(R, 0, R.hd);
   const front = terrain.heightAt(fx, fz);
-  let walls = -Infinity;
-  for (const [x, z] of rectSamples(R, 0.5, WALL_IN)) walls = Math.max(walls, terrain.heightAt(x, z));
+  const walls = rangeUnder(terrain, R, WALL_IN).hi;
   return Math.min(maxH, Math.max(minH, front - 0.02, walls - 0.005));
+}
+// The lowest and highest ground under a rectangle (inset from its edges),
+// exactly: the ground is flat on each triangle of the terrain's mesh, so
+// both are at a corner of the rectangle, a point of the mesh inside it, or
+// where its edges cross the mesh's lines (x whole, z whole, or x - z whole,
+// the diagonal each square is split along). { lo, hi }
+export function rangeUnder(terrain, R, inset = 0) {
+  const r = inset ? grow(R, -inset) : R, P = r.pts;
+  let lo = Infinity, hi = -Infinity;
+  const at = (x, z) => { const h = terrain.heightAt(x, z); if (h < lo) lo = h; if (h > hi) hi = h; };
+  for (let i = 0; i < 4; i++) {
+    const [ax, az] = P[i], [bx, bz] = P[(i + 1) % 4];
+    at(ax, az);
+    for (const [fa, fb] of [[ax, bx], [az, bz], [ax - az, bx - bz]]) {
+      if (Math.abs(fb - fa) < 1e-9) continue;
+      for (let k = Math.ceil(Math.min(fa, fb)); k <= Math.max(fa, fb); k++) {
+        const t = (k - fa) / (fb - fa);
+        if (t > 0 && t < 1) at(ax + (bx - ax) * t, az + (bz - az) * t);
+      }
+    }
+  }
+  const [x0, z0, x1, z1] = aabbOf(r);
+  for (let z = Math.ceil(z0); z <= z1; z++) for (let x = Math.ceil(x0); x <= x1; x++) if (inRect(r, x, z, 1e-9)) at(x, z);
+  return { lo, hi };
 }
 // The lowest and highest ground under a rectangle, and whether any of it is
 // water.
-export function groundUnder(terrain, R, step = 0.25) {
-  let minH = Infinity, maxH = -Infinity, water = false;
-  for (const [x, z] of rectSamples(R, step)) {
-    const h = terrain.heightAt(x, z);
-    minH = Math.min(minH, h); maxH = Math.max(maxH, h);
-    if (h < CONFIG.WATER_LEVEL + 0.05) water = true;
-  }
-  return { minH, maxH, water };
+export function groundUnder(terrain, R) {
+  const { lo, hi } = rangeUnder(terrain, R);
+  return { minH: lo, maxH: hi, water: lo < CONFIG.WATER_LEVEL + 0.05 };
 }
 export function capOf(b, key) {
   const v = BUILDINGS[b.type].levels[b.level][key] || 0;
@@ -343,10 +361,14 @@ export class World {
   // The way a plot at (x, z) would face its nearest road (as the player
   // sees it while placing): towards the road, square to it. null with no
   // road within r.
+  // Past the end of a road (the nearest point of it its end, well off to
+  // one side of square), it faces the end itself.
   faceRoad(x, z, r = 2.5) {
     const h = this.roads.nearest(x, z, r);
     if (!h) return null;
-    const nx = -h.dz, nz = h.dx, s = (h.x - x) * nx + (h.z - z) * nz >= 0 ? 1 : -1;
+    const vx = h.x - x, vz = h.z - z, d = Math.hypot(vx, vz);
+    if (d > 1e-6 && Math.abs(vx * h.dx + vz * h.dz) > 0.5 * d) return angleOf(vx, vz);
+    const nx = -h.dz, nz = h.dx, s = vx * nx + vz * nz >= 0 ? 1 : -1;
     return angleOf(nx * s, nz * s);
   }
   // Where a plot of half-depth hd facing angle a, its front SETBACK from the
@@ -363,17 +385,24 @@ export class World {
 
   // The road a plot reaches from its front: the nearest point of any road
   // to the middle of its front edge, if that is within REACH of the road's
-  // edge and ahead of the plot: { e (edge id), s, x, z, conn }, or null.
+  // edge and ahead of the plot: { e (edge id), s, x, z, conn }, or null. A
+  // plot wider than one may reach it from the middle of either half of its
+  // front instead (its street running along only that half), the middle
+  // if it can.
   accessFor(R) {
-    const [fx, fz] = toWorld(R, 0, R.hd);
     let best = null;
-    for (const { e, d } of this.roads.within(fx, fz, REACH + HALF[3])) {
-      if (d - HALF[e.level] > REACH) continue;
-      const h = this.roads.nearest(fx, fz, d + 1e-6, (x) => x === e);
-      if (!h) continue;
-      const ahead = (h.x - fx) * R.ux + (h.z - fz) * R.uz;
-      if (ahead < -0.02 || (d > 0.05 && ahead < 0.4 * d)) continue;
-      if (!best || d - HALF[e.level] < best.gap) best = { e: e.id, s: h.s, x: h.x, z: h.z, gap: d - HALF[e.level] };
+    for (const u of R.hw > 0.55 ? [0, -(R.hw - 0.5), R.hw - 0.5] : [0]) {
+      const [fx, fz] = toWorld(R, u, R.hd);
+      for (const { e, d } of this.roads.within(fx, fz, REACH + HALF[3])) {
+        if (d - HALF[e.level] > REACH) continue;
+        const h = this.roads.nearest(fx, fz, d + 1e-6, (x) => x === e);
+        if (!h) continue;
+        const ahead = (h.x - fx) * R.ux + (h.z - fz) * R.uz;
+        if (ahead < -0.02 || (d > 0.05 && ahead < 0.4 * d)) continue;
+        const gap = d - HALF[e.level] + (u ? 0.01 : 0);
+        if (!best || gap < best.gap) best = { e: e.id, s: h.s, x: h.x, z: h.z, gap };
+      }
+      if (best && !u) break;
     }
     if (!best) return null;
     const e = this.roads.edges.get(best.e);
@@ -408,7 +437,9 @@ export class World {
     const def = BUILDINGS[type];
     const [w0, d0] = sizeOf(type);
     const W = opts.w ?? w0, D = opts.d ?? d0;
-    const a = opts.a ?? this.faceRoad(x, z) ?? 0;
+    // (checked where it will stand: as rounded to keep, as a save does)
+    x = Math.round(x * 1000) / 1000; z = Math.round(z * 1000) / 1000;
+    const a = roundAngle(opts.a ?? this.faceRoad(x, z) ?? 0);
     const R = rect(x, z, a, W / 2, D / 2);
     const t = this.terrain;
     let reason = null;
@@ -488,7 +519,7 @@ export class World {
     const pick = chk.access;
     const r = (v) => Math.round(v * 1000) / 1000;
     const b = {
-      id: this.newId(), type, level: o.level || 0, x: r(x), z: r(z), a: r(wrapAngle(chk.a)), w: chk.w, d: chk.d, size: Math.max(chk.w, chk.d), flavor: o.flavor || null, look: o.look || null,
+      id: this.newId(), type, level: o.level || 0, x: r(x), z: r(z), a: roundAngle(chk.a), w: chk.w, d: chk.d, size: Math.max(chk.w, chk.d), flavor: o.flavor || null, look: o.look || null,
       variant,
       access: pick ? { e: pick.e, s: pick.s, x: pick.x, z: pick.z } : null,
       rail: chk.rail ? { ...chk.rail } : null,
@@ -614,11 +645,11 @@ export class World {
   }
   turnBuilding(id, a) {
     const b = this.buildings.get(id);
-    a = wrapAngle(Number(a));
+    a = roundAngle(Number(a));
     if (!Number.isFinite(a)) return { ok: false, reason: 'No such turn' };
     const chk = this.turnCheck(b, a);
     if (!chk.ok) return chk;
-    b.a = Math.round(a * 1000) / 1000;
+    b.a = roundAngle(a);
     b.access = chk.access ? { e: chk.access.e, s: chk.access.s, x: chk.access.x, z: chk.access.z } : null;
     b.connected = !!(chk.access && chk.access.conn);
     if (BUILDINGS[b.type].needsRail) b.rail = this.findRail(chk.rect);
@@ -626,7 +657,7 @@ export class World {
     const was = plotOf(b);
     this._file(b);
     this._clearTreesIn(grow(chk.rect, 0.22));
-    this._updateFronts(null, grow(was, Math.max(b.w, b.d)));
+    this._updateFronts(b, grow(was, Math.max(b.w, b.d)));
     this.emit('building:refit', b);
     this.emit('trees');
     return { ok: true, building: b };
@@ -753,7 +784,9 @@ export class World {
     const o = this.buildingAt(px, pz);
     if (!o || o === b) return null;
     const turn = wrapAngle(o.a - b.a), q = Math.round(turn / (Math.PI / 2));
-    if (Math.abs(turn - q * (Math.PI / 2)) > 0.02) return null;
+    // (square to within what rounding leaves: a strip passed between plots
+    // further askew would overlap at its corners)
+    if (Math.abs(turn - q * (Math.PI / 2)) > 0.003) return null;
     const O = ownPlot(o);
     // the direction from b into o, in o's frame: which of o's sides faces b
     const vx = ax ? sg * R.ex : sg * R.ux, vz = ax ? sg * R.ez : sg * R.uz;
@@ -1180,7 +1213,7 @@ export class World {
     const [w0, d0] = sizeOf(rec.type);
     const w = rec.w || w0, d = rec.d || d0;
     const b = {
-      id: rec.id, type: rec.type, level: Math.min(rec.level, def.levels.length - 1), x: rec.x, z: rec.z, a: wrapAngle(rec.a || 0), size: Math.max(w, d), w, d,
+      id: rec.id, type: rec.type, level: Math.min(rec.level, def.levels.length - 1), x: rec.x, z: rec.z, a: roundAngle(rec.a || 0), size: Math.max(w, d), w, d,
       flavor: rec.flavor || null, look: rec.look || null, con: rec.con && typeof rec.con === 'object' ? { ...rec.con } : null,
       variant: rec.variant, access: null, rail: null, baseY: 0, minY: 0, built: rec.built || 1,
       residents: [], workers: [], connected: false, happiness: 60, factors: null,
@@ -1831,7 +1864,7 @@ export class World {
     if (b.con && b.con.kind !== 'upgrade') { plan.short = 'Not until the farm is built'; return plan; }
     for (const p of list) {
       if (!Array.isArray(p) || ![p[0], p[1]].every(Number.isFinite)) continue;
-      const [x, z] = p, a = Number.isFinite(p[2]) ? p[2] : b.a;
+      const r3 = (v) => Math.round(v * 1000) / 1000, x = r3(p[0]), z = r3(p[1]), a = roundAngle(Number.isFinite(p[2]) ? p[2] : b.a);
       plan.tiles.push({ x, z, a, rect: rect(x, z, a, 0.5, 0.5), reason: null, i: plan.tiles.length });
     }
     if (!add) {
@@ -1886,7 +1919,7 @@ export class World {
   }
   _addField(farm, x, z, a, id = null) {
     const r = (v) => Math.round(v * 1000) / 1000;
-    const f = { id: id ?? this.newId(), farm, x: r(x), z: r(z), a: r(wrapAngle(a)) };
+    const f = { id: id ?? this.newId(), farm, x: r(x), z: r(z), a: roundAngle(a) };
     f.rect = rect(f.x, f.z, f.a, 0.5, 0.5);
     this.parcels.set(f.id, f);
     this.fieldIx.add(f, aabbOf(f.rect));
@@ -2162,7 +2195,7 @@ export function findPlot(w, type, near, opts = {}) {
     // (quickly: not on a plot there already)
     if (w.buildingAt(c.x, c.z)) continue;
     const chk = w.checkBuild(type, c.x, c.z, { ...o, a: c.a });
-    if (chk.ok && (!opts.test || opts.test(c.x, c.z, c.a, chk))) return { x: Math.round(c.x * 1000) / 1000, z: Math.round(c.z * 1000) / 1000, a: Math.round(c.a * 1000) / 1000, chk };
+    if (chk.ok && (!opts.test || opts.test(c.x, c.z, c.a, chk))) return { x: Math.round(c.x * 1000) / 1000, z: Math.round(c.z * 1000) / 1000, a: roundAngle(c.a), chk };
   }
   return null;
 }

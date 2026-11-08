@@ -9,6 +9,11 @@
 export const TAU = Math.PI * 2;
 export const wrapAngle = (a) => { a %= TAU; if (a > Math.PI) a -= TAU; if (a < -Math.PI) a += TAU; return a; };
 export const angDiff = (a, b) => Math.abs(wrapAngle(a - b));
+// An angle rounded to a thousandth of a radian and kept within a half turn
+// either way (±3.142, a half turn rounded): rounding it again gives the
+// same angle, as a save and a load must (rounding a wrapped angle doesn't,
+// right by a half turn).
+export const roundAngle = (a) => Math.round((Math.abs(a) > 3.1421 ? wrapAngle(a) : a) * 1000) / 1000;
 // the facing angle of a direction (dx, dz)
 export const angleOf = (dx, dz) => Math.atan2(dx, dz);
 

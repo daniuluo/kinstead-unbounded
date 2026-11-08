@@ -302,7 +302,17 @@ export function planRoadEdit(w, ids, op, opts = {}) {
         if (r && r.pieces.some(p => gone.has(p.e))) along = true;
       }
       if (!along) continue;
-      if (stops.some(s => s.access && gone.has(s.access.e))) out.lines.push(l.id); else out.detour.push(l.id);
+      // with them gone: is there still a way from each stop to the next (a
+      // stop that loses its own road has none)?
+      const ends = (s) => { const e = s.access && net.edges.get(s.access.e); return e ? [e.a, e.b] : null; };
+      let broken = false;
+      for (let i = 0; i < stops.length && !broken; i++) {
+        const a = ends(stops[i]), b = ends(stops[(i + 1) % stops.length]);
+        if (!a || !b) { broken = true; break; }
+        const r = net.reach(a[0]);
+        if (!b.some(n => r.has(n))) broken = true;
+      }
+      if (broken) out.lines.push(l.id); else out.detour.push(l.id);
     }
   }
   if (out.cost - out.refund > w.money) out.short = 'Not enough money';

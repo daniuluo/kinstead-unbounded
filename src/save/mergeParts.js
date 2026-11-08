@@ -4,7 +4,7 @@
 // road networks with new roads routed round what stands in the way.
 
 import { BUILDINGS } from '../defs.js';
-import { rect, rectsOverlap, aabbOf, inRect, rectSamples, segRectDist, Index, simplify, spline, pointAt, polyLength, wrapAngle } from '../world/geom.js';
+import { rect, rectsOverlap, aabbOf, inRect, rectSamples, segRectDist, Index, simplify, spline, pointAt, polyLength, roundAngle } from '../world/geom.js';
 import { Net } from '../world/net.js';
 import { HALF, RAIL_HALF, VERGE, findPlot, groundUnder, plotOf, ownPlot } from '../world/world.js';
 
@@ -14,7 +14,7 @@ import { HALF, RAIL_HALF, VERGE, findPlot, groundUnder, plotOf, ownPlot } from '
 // garden strips and spare land are in its own frame, so they go as they are.
 export function carry(s, b) {
   const [x, z] = s.point(b.x, b.z), r3 = (v) => Math.round(v * 1000) / 1000;
-  return { x: r3(x), z: r3(z), a: r3(wrapAngle(b.a - (s.k * Math.PI) / 2)) };
+  return { x: r3(x), z: r3(z), a: roundAngle(b.a - (s.k * Math.PI) / 2) };
 }
 export const recRect = (r) => rect(r.x, r.z, r.a, r.w / 2, r.d / 2);
 

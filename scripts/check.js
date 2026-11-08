@@ -1,12 +1,17 @@
 // Headless smoke test: generates worlds, builds every model, runs the
 // simulation for a few in-game days and round-trips a save.
 // Usage: npm install three@0.170.0 --no-save && node scripts/check.js
+//
+// In this fork there is no grid: plots are rectangles at any angle, roads
+// are curves (src/world/net.js), and the checks set their towns up with
+// the helpers below (a street from point to point, a plot along a street).
 
 import { CONFIG } from '../src/config.js';
-import { World } from '../src/world/world.js';
+import { World, plotOf, ownPlot, sizeOf, SETBACK, findPlot, seatOf, capOf, isOpen, HALF } from '../src/world/world.js';
+import { rect, toWorld, toLocal, rectsOverlap, aabbOf, pointAt, wrapAngle } from '../src/world/geom.js';
 import { growDemoTown } from '../src/world/demo.js';
 import { PathFinder } from '../src/sim/path.js';
-import { Sim } from '../src/sim/sim.js';
+import { Sim, cellOf } from '../src/sim/sim.js';
 import { Agents } from '../src/sim/agents.js';
 import { Transit, G_HANG } from '../src/sim/transit.js';
 import { Animals } from '../src/sim/animals.js';
@@ -14,12 +19,136 @@ import { Construction } from '../src/sim/construction.js';
 import { siteGeo, bodyBox } from '../src/render/construction.js';
 import { serialize, deserialize } from '../src/save/saves.js';
 import { buildModel, STYLES } from '../src/render/buildings.js';
-import { fw, fd, capOf, isOpen } from '../src/world/world.js';
 import { BUILDINGS, TECHS } from '../src/defs.js';
 import { makeAudit } from './audit.js';
 
 let failures = 0;
 const ok = (cond, msg) => { if (!cond) { failures++; console.error('FAIL', msg); } else console.log('ok  ', msg); };
+// a group of checks: one that throws counts as a failure, and the rest go on
+const block = async (name, f) => {
+  try { await f(); } catch (e) { failures++; console.error('FAIL', `${name} threw: ${(e.stack || String(e)).split('\n').slice(0, 5).join(' | ')}`); }
+};
+const PI = Math.PI;
+const listen = (tw) => ({ world: tw, speed: 0, _ev: {}, on(e, f) { (this._ev[e] ||= []).push(f); }, emit(e, d) { for (const f of this._ev[e] || []) f(d); } });
+
+// ---------------------------------------------------- setting towns up
+// Open ground: a W × D box from (x0, z0) with no building, road, track,
+// field or water on it, the ground no rougher than `rough`.
+function clearAt(tw, x0, z0, W, D, rough = 0.5) {
+  if (x0 < 0.5 || z0 < 0.5 || x0 + W > tw.N - 0.5 || z0 + D > tw.N - 0.5) return false;
+  let lo = Infinity, hi = -Infinity;
+  for (let z = z0; z <= z0 + D + 1e-9; z += 0.25) for (let x = x0; x <= x0 + W + 1e-9; x += 0.25) {
+    if (tw.waterAt(x, z) || tw.buildingAt(x, z) || tw.roadAt(x, z, 0.3) || tw.railAt(x, z, 0.3) || tw.fieldAt(x, z)) return false;
+    const h = tw.terrain.heightAt(x, z);
+    lo = Math.min(lo, h); hi = Math.max(hi, h);
+    if (hi - lo > rough) return false;
+  }
+  return true;
+}
+// The open box nearest a point, searched outward a unit at a time: its
+// corner { x, z }, or null.
+function openBox(tw, W, D, near = null, rough = 0.5) {
+  const c = near || { x: tw.N / 2, z: tw.N / 2 };
+  for (let r = 0; r < tw.N; r++) for (let dz = -r; dz <= r; dz++) for (let dx = -r; dx <= r; dx++) {
+    if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+    const x0 = Math.round(c.x - W / 2) + dx, z0 = Math.round(c.z - D / 2) + dz;
+    if (clearAt(tw, x0, z0, W, D, rough)) return { x: x0, z: z0 };
+  }
+  return null;
+}
+// Level the ground over a box (and a unit round it) and clear its trees.
+function levelBox(tw, x0, z0, W, D, h = 0.5) {
+  for (let z = Math.floor(z0) - 1; z <= Math.ceil(z0 + D) + 1; z++) for (let x = Math.floor(x0) - 1; x <= Math.ceil(x0 + W) + 1; x++) {
+    if (x >= 0 && z >= 0 && x <= tw.N && z <= tw.N) tw.terrain.setCh(x, z, h);
+  }
+  tw._clearTreesIn(rect(x0 + W / 2, z0 + D / 2, 0, W / 2 + 1, D / 2 + 1));
+}
+// A street through these points, at a level: its edge ids (throws if it
+// can't be laid: the checks set up their own ground for it).
+function street(tw, pts, level = 1) {
+  const sb = tw.sandbox.unlockAll;
+  if (level > 1) tw.setSandbox({ unlockAll: true });
+  const r = tw.placeRoad(pts, level);
+  if (level > 1) tw.setSandbox({ unlockAll: sb });
+  if (!r.placed) throw new Error(`street ${JSON.stringify(pts.map(p => p.map(v => +v.toFixed(2))))}: ${r.failed}`);
+  return r.edges;
+}
+// A building on a street of its own, laid across open ground: the street
+// runs along x in front of the plot (which faces -z, towards it), with room
+// beside the plot (left: towards -x, right: towards +x) and behind it
+// (back). The building, or null.
+function lot(tw, type, o = {}) {
+  const [w0, d0] = sizeOf(type), W = o.w ?? w0, D = o.d ?? d0;
+  const L = o.left ?? 0, R = o.right ?? 0, B = o.back ?? 0;
+  const bw = W + L + R + 1.6, bd = SETBACK + D + B + 0.6;
+  const at = openBox(tw, bw, bd, o.near, o.rough ?? 0.5);
+  if (!at) return null;
+  if (o.flat) levelBox(tw, at.x, at.z, bw, bd, o.flat);
+  const zr = at.z + 0.3, cx = at.x + 0.8 + L + W / 2;
+  street(tw, [[at.x + 0.3, zr], [at.x + bw - 0.3, zr]], o.road ?? 1);
+  const p = tw.placeBuilding(type, cx, zr + SETBACK + D / 2, { instant: true, ignoreUnlock: true, a: PI, w: W, d: D, ...(o.opts || {}) });
+  return p.ok ? p.building : null;
+}
+// A building that must stand by the water, on a street of its own laid
+// along the shore: its back to the water, the street across its front,
+// room for a neighbour on its left (its own -x: right, as the pair below
+// puts it). The building, or null.
+function shoreLot(tw, type, o = {}) {
+  const [W, D] = sizeOf(type), side = o.right ?? 0;
+  for (let z = 2; z < tw.N - 2; z++) for (let x = 2; x < tw.N - 2; x++) for (let k = 0; k < 4; k++) {
+    const a = (k * PI) / 2, R = rect(x + 0.5, z + 0.5, a, W / 2, D / 2);
+    if (!tw.waterAt(...toWorld(R, 0, -D / 2 - 0.35))) continue;
+    let fine = true;
+    for (let lz = -D / 2 + 0.1; lz <= D / 2 + SETBACK + 0.45 && fine; lz += 0.25) for (let lx = -W / 2 - side - 0.6; lx <= W / 2 + 0.6 && fine; lx += 0.25) {
+      const [px, pz] = toWorld(R, lx, lz);
+      if (!tw.inBounds(px, pz) || tw.waterAt(px, pz) || tw.buildingAt(px, pz) || tw.roadAt(px, pz, 0.3) || tw.railAt(px, pz, 0.3) || tw.fieldAt(px, pz)) fine = false;
+    }
+    if (!fine) continue;
+    const r = tw.placeRoad([toWorld(R, -W / 2 - side - 0.5, D / 2 + SETBACK), toWorld(R, W / 2 + 0.5, D / 2 + SETBACK)], 1);
+    if (!r.placed) continue;
+    const p = tw.placeBuilding(type, R.cx, R.cz, { instant: true, ignoreUnlock: true, a });
+    if (p.ok) return p.building;
+    for (const id of r.edges) if (tw.roads.edges.has(id)) tw.removeRoadEdge(id);
+  }
+  return null;
+}
+// A building of this type along the town's own streets near a point (the
+// seat, unless told), on the roads to the way out unless o.conn is false.
+function near(tw, type, at = null, o = {}) {
+  const c = at || seatOf(tw) || { x: tw.N / 2, z: tw.N / 2 };
+  const f = findPlot(tw, type, { x: c.x, z: c.z }, {
+    r: o.r ?? 14, w: o.w, d: o.d, score: o.score, step: o.step,
+    opts: { ignoreUnlock: true, ignoreMoney: true, ...(o.opts || {}) },
+    test: (x, z, a, chk) => (!o.test || o.test(x, z, a, chk)) && (!chk || o.conn === false || !!(chk.access && chk.access.conn)),
+  });
+  if (!f) return null;
+  const p = tw.placeBuilding(type, f.x, f.z, { a: f.a, instant: o.instant ?? true, ignoreUnlock: true, ignoreMoney: o.ignoreMoney, w: o.w, d: o.d, level: o.level, flavor: o.flavor });
+  return p.ok ? p.building : null;
+}
+// Where a building of this type would stand beside b (its own x axis: -1
+// its left, 1 its right), square to it: [x, z].
+const besideAt = (b, type, side) => { const [w1] = sizeOf(type); return toWorld(ownPlot(b), side * (b.w + w1) / 2, 0); };
+// Two buildings side by side facing the same street: along the town's own
+// streets when there is room there, or else on a street of their own.
+function pair(tw, ta, tb, o = {}) {
+  const [wa] = sizeOf(ta), [wb] = sizeOf(tb);
+  const second = (A) => { const [x, z] = besideAt(A, tb, -1); const p = tw.placeBuilding(tb, x, z, { a: A.a, instant: true, ignoreUnlock: true }); return p.ok ? p.building : null; };
+  if (!o.own) {
+    // (both on the street: a park beside a home must reach it too; by the water, anywhere it is)
+    const wet = BUILDINGS[ta].needsWater || BUILDINGS[tb].needsWater;
+    const A = near(tw, ta, o.near, { r: o.r ?? (wet ? tw.N : 18), conn: o.conn, test: (x, z, a, chk) => { if (!chk) return true; const [nx, nz] = toWorld(chk.rect, -(wa + wb) / 2, 0), c = tw.checkBuild(tb, nx, nz, { a, ignoreUnlock: true, ignoreMoney: true }); return c.ok && (o.conn === false || !!(c.access && c.access.conn)); } });
+    if (A) { const B = second(A); if (B) return [A, B]; tw.removeBuilding(A.id, 0); }
+  }
+  const A = BUILDINGS[ta].needsWater ? shoreLot(tw, ta, { right: wb + 0.2 }) : lot(tw, ta, { right: wb + 0.2, near: o.lotNear });
+  const B = A && second(A);
+  return A && B ? [A, B] : null;
+}
+// the area of a polygon
+const areaOf = (pts) => { let s = 0; for (let i = 0; i < pts.length; i++) { const [x0, z0] = pts[i], [x1, z1] = pts[(i + 1) % pts.length]; s += x0 * z1 - x1 * z0; } return Math.abs(s) / 2; };
+// the middle of a polygon's corners
+const midOf = (pts) => [pts.reduce((s, p) => s + p[0], 0) / pts.length, pts.reduce((s, p) => s + p[1], 0) / pts.length];
+// a building's model, at a place in the world (buildModel takes its middle and turn)
+const at0 = (o) => ({ x: 0, z: 0, a: 0, ...o });
 
 // 1. every model builds
 let verts = 0;
@@ -30,7 +159,7 @@ for (const [type, def] of Object.entries(BUILDINGS)) {
       const flavor = type === 'shophouse' ? ['market', 'bakery', 'tavern', 'market'][variant - 1] : null;
       const look = variant === 4 ? STYLES[level % STYLES.length].id : null;
       const ext = variant === 3 && def.size === 1 ? { x0: type === 'house' ? -0.25 : 0.25, x1: 0, z0: 0, z1: 0 } : null;
-      const b = { type, level, variant, flavor, look, ext, size: Math.max(W, D), w: W, d: D, baseY: 0.5, minY: 0.2, rot: variant % 4, rail: def.needsRail ? { x: 0, z: 0, dir: 0 } : null };
+      const b = at0({ type, level, variant, flavor, look, ext, size: Math.max(W, D), w: W, d: D, baseY: 0.5, minY: 0.2, a: variant * 0.7 - 1.2, rail: def.needsRail ? { k: 2 } : null });
       const m = buildModel(b);
       if (!m.geo || !m.geo.attributes.position.count) throw new Error(`empty model ${type} L${level}`);
       for (const v of m.geo.attributes.position.array) if (!Number.isFinite(v)) throw new Error(`NaN in ${type} L${level}`);
@@ -46,13 +175,13 @@ for (const [type, def] of Object.entries(BUILDINGS)) {
     }
   });
 }
-ok(true, `all building models build (${verts} verts total)`);
+ok(true, `all building models build, at any angle (${verts} verts total)`);
 // ...and a shop with homes above for every trade it can be joined from
 {
   const { MERGES } = await import('../src/defs.js');
   const flavors = MERGES.find(m => m.to === 'shophouse').b;
   for (const flavor of flavors) for (let level = 0; level < BUILDINGS.shophouse.levels.length; level++) for (const rot of [0, 1]) {
-    const b = { type: 'shophouse', level, variant: 5 + level, flavor, size: 2, w: rot ? 1 : 2, d: rot ? 2 : 1, baseY: 0.5, minY: 0.2, rot };
+    const b = at0({ type: 'shophouse', level, variant: 5 + level, flavor, size: 2, w: rot ? 1 : 2, d: rot ? 2 : 1, baseY: 0.5, minY: 0.2, a: rot * 0.4 });
     const m = buildModel(b);
     if (!m.geo || !m.geo.attributes.position.count || !m.door) throw new Error(`shophouse ${flavor} L${level}`);
   }
@@ -78,7 +207,7 @@ ok(true, `all building models build (${verts} verts total)`);
     for (const [type, def] of Object.entries(BUILDINGS)) def.levels.forEach((_, level) => {
       for (const variant of [21, 22]) {
         const W = def.merged ? 2 : def.size, D = def.merged ? 1 : def.size;
-        const b = { type, level, variant, x: 3, z: 5, size: Math.max(W, D), w: W, d: D, baseY: 0.6, minY: 0.4, rot: variant % 4, rail: def.needsRail ? { x: 0, z: 0, dir: 0 } : null };
+        const b = { type, level, variant, x: 3, z: 5, a: variant * 0.3, size: Math.max(W, D), w: W, d: D, baseY: 0.6, minY: 0.4, rail: def.needsRail ? { k: 2 } : null };
         const at = buildModel(b, { ground }).geo.attributes;
         let h = 2166136261;
         for (const a of [at.position.array, at.color.array]) for (const x of new Uint8Array(a.buffer, a.byteOffset, a.byteLength)) h = Math.imul(h ^ x, 16777619);
@@ -139,37 +268,31 @@ ok(true, `all building models build (${verts} verts total)`);
 // 1c. the world knows a shop stands on a street corner from the roads round
 // it (b.corner: 1 its left, 2 its right), rebuilds it when that changes, and
 // never saves it: a load works it out again
-{
+await block('1c corner shops', async () => {
   const tw = World.createNew({ N: 48, seed: 77, name: 'Cornerby' });
   tw.setSandbox({ infiniteMoney: true, unlockAll: true, instantBuild: true });
-  let shop = null, sideRoad = null;
-  const free = (x, z) => tw.inBounds(x, z) && !tw.buildingOn(x, z) && !tw.roadAt(x, z) && !tw.terrain.isWater(x, z) && tw.checkRoad(x, z, 1).ok;
-  for (let z = 4; z < tw.N - 5 && !shop; z++) for (let x = 4; x < tw.N - 5 && !shop; x++) {
-    // a street in front (z - 1) and a side street down the right (x + 1), and nothing else round it
-    const street = [[x - 1, z - 1], [x, z - 1], [x + 1, z - 1]], side = [[x + 1, z], [x + 1, z + 1]];
-    if (![...street, ...side, [x, z], [x - 1, z], [x, z + 1]].every(([a, b]) => free(a, b))) continue;
-    tw.placeRoads(street, 1);
-    const r = tw.placeBuilding('grocer', x, z, { instant: true });
-    if (!r.ok || r.building.rot !== 2) { if (r.ok) tw.removeBuilding(r.building.id, 0); continue; }
-    shop = r.building; sideRoad = side;
-  }
-  ok(!!shop && !shop.corner, 'a shop with only a street in front is not on a corner');
-  if (shop) {
-    const refits = [];
-    tw.on('building:refit', (b) => refits.push(b.id));
-    tw.placeRoads(sideRoad, 1);
-    // facing -z (rot 2), the side street at x + 1 is on its left
-    ok(shop.corner === 1 && refits.includes(shop.id), `a side street turning the corner makes it a corner shop, rebuilt (corner ${shop.corner})`);
-    ok(shop.sides === 1, `and the world knows its left side is on a street, for its walls there (sides ${shop.sides})`);
-    const saved = JSON.stringify(serialize(tw));
-    ok(!saved.includes('corner'), 'the corner is never saved');
-    const tw2 = deserialize(JSON.parse(saved));
-    ok(tw2.buildings.get(shop.id).corner === 1 && tw2.buildings.get(shop.id).sides === 1, 'a loaded town works the corner and the street sides out again');
-    refits.length = 0;
-    for (const [x, z] of sideRoad) tw.removeRoad(x, z);
-    ok(!shop.corner && !shop.sides && refits.includes(shop.id), 'taking the side street up makes it an ordinary shop again');
-  }
-}
+  const o = openBox(tw, 6, 5, { x: 12, z: 12 });
+  levelBox(tw, o.x, o.z, 6, 5);
+  // a street along x, ending at X + 1; the shop facing it from the +z side
+  const X = o.x + 2.5, Z = o.z + 1;
+  street(tw, [[o.x + 0.3, Z], [X + 1, Z]]);
+  const r = tw.placeBuilding('grocer', X, Z + SETBACK + 0.5, { instant: true });
+  const shop = r.ok ? r.building : null;
+  ok(!!shop && Math.abs(wrapAngle(shop.a - PI)) < 0.01 && !shop.corner, `a shop with only a street in front is not on a corner, and turns to face the street by itself (${r.reason || shop.a})`);
+  const refits = [];
+  tw.on('building:refit', (b) => refits.push(b.id));
+  // facing -z, its left as seen from the street is +x: a side street there
+  const [side] = street(tw, [[X + 1, Z], [X + 1, Z + 2.8]]);
+  ok(shop.corner === 1 && refits.includes(shop.id), `a side street turning the corner makes it a corner shop, rebuilt (corner ${shop.corner})`);
+  ok(shop.sides === 1, `and the world knows its left side is on a street, for its walls there (sides ${shop.sides})`);
+  const saved = JSON.stringify(serialize(tw));
+  ok(!saved.includes('corner'), 'the corner is never saved');
+  const tw2 = deserialize(JSON.parse(saved));
+  ok(tw2.buildings.get(shop.id).corner === 1 && tw2.buildings.get(shop.id).sides === 1, 'a loaded town works the corner and the street sides out again');
+  refits.length = 0;
+  tw.removeRoadEdge(side);
+  ok(!shop.corner && !shop.sides && refits.includes(shop.id), 'taking the side street up makes it an ordinary shop again');
+});
 
 // 1d. a building with a street along its side or back has windows on that
 // wall (b.sides), whatever its looks; yards, farms, towers and open stalls,
@@ -184,7 +307,7 @@ ok(true, `all building models build (${verts} verts total)`);
     const W = d.merged ? 2 : d.size, D = d.merged ? 1 : d.size;
     for (let level = 0; level < d.levels.length; level++) for (const variant of [777, 4242, 31337]) {
       if (type === 'market' && level === 0) continue;
-      const g = buildModel({ type, level, variant, size: d.size, w: W, d: D, baseY: 0, minY: 0, rot: 0, rail: d.needsRail ? { x: 0, z: 0, dir: 2 } : null, sides: 7 }, { flat: true }).geo;
+      const g = buildModel({ type, level, variant, size: d.size, w: W, d: D, baseY: 0, minY: 0, rot: 0, rail: d.needsRail ? { k: 2 } : null, sides: 7 }, { flat: true }).geo;
       const P = g.attributes.position.array, Nn = g.attributes.normal.array, C = g.attributes.color.array, E = g.attributes.emit.array;
       const cnt = { left: 0, right: 0, back: 0 };
       for (let i = 0; i < P.length / 3; i++) {
@@ -266,6 +389,7 @@ const w = World.createNew({ N: 48, seed: 4242, name: 'Testbury' });
 ok([...w.buildings.values()].some(b => b.type === 'builder'), "new towns start with a builder's yard");
 growDemoTown(w, 99, 1);
 ok([...w.buildings.values()].some(b => b.type === 'terrace' || b.type === 'shophouse'), 'demo town has joined buildings');
+ok([...w.buildings.values()].some(b => Math.abs(Math.sin(2 * b.a)) > 0.05), 'and buildings that stand at angles other than the four ways');
 game.world = w;
 game.paths = new PathFinder(w);
 game.sim = new Sim(game);
@@ -280,16 +404,15 @@ game.transit.planCarts();
 const pop0 = w.population;
 ok(pop0 > 10, `demo town seeded with ${pop0} villagers`);
 
-// add a coach line between two stops along the roads
+// add a coach line between stops along the roads, well apart
 const stops = [];
-for (let z = 0; z < w.N && stops.length < 3; z++) for (let x = 0; x < w.N && stops.length < 3; x++) {
-  if (stops.some(s => Math.abs(s.x - x) + Math.abs(s.z - z) < 8)) continue;
-  const r = w.placeBuilding('coachstop', x, z, { free: true, ignoreMoney: true, instant: true });
-  if (r.ok && r.building.connected) stops.push(r.building); else if (r.ok) w.removeBuilding(r.building.id, 0);
+for (let k = 0; k < 3; k++) {
+  const b = near(w, 'coachstop', null, { r: 22, test: (x, z) => stops.every(s => Math.hypot(s.x - x, s.z - z) >= 8) });
+  if (b) stops.push(b);
 }
 w.money += 1000;
 const line = game.transit.createLine('coach', stops.map(s => s.id));
-ok(line.ok, `coach line created through ${stops.length} stops (${line.reason || 'ok'})`);
+ok(line.ok && stops.length >= 2, `coach line created through ${stops.length} stops (${line.reason || 'ok'})`);
 game.transit.rebuild();
 
 let maxWalkers = 0, frames = 0;
@@ -315,187 +438,201 @@ ok(game.transit.vehicles.length === 1, 'one coach on the line');
   ok(homes.length > 0 && !off.length, `happiness breakdowns add up (${homes.length} homes${off.length ? `, ${off.length} off` : ''})`);
 }
 
+// A building that needs track (a station) beside rail edge e at s, on one
+// side of it (1 or -1), its back to the track and a street of its own in
+// front: the building, or null.
+function byTrack(tw, type, e, s, side) {
+  const [x, z, , dx, dz] = pointAt(e.pts, e.cum, s), nx = -dz * side, nz = dx * side;
+  const [W, D] = sizeOf(type), r0 = 0.3 + D + SETBACK, h = W / 2 + 0.5;
+  street(tw, [[x + nx * r0 - dx * h, z + nz * r0 - dz * h], [x + nx * r0 + dx * h, z + nz * r0 + dz * h]]);
+  const r = tw.placeBuilding(type, x + nx * (0.3 + D / 2), z + nz * (0.3 + D / 2), { instant: true, a: Math.atan2(nx, nz) });
+  if (!r.ok) console.log('      (by the track:', r.reason + ')');
+  return r.ok ? r.building : null;
+}
+// points round a circle from angle t0 to t1 (radians, x = sin, z = cos)
+const arc = (cx, cz, R, t0, t1, n) => Array.from({ length: n + 1 }, (_, i) => { const t = t0 + ((t1 - t0) * i) / n; return [cx + R * Math.sin(t), cz + R * Math.cos(t)]; });
+
 // 3b. railway: trains never reverse, so a dead-end line is refused and a
-// loop of track runs forward forever
-{
+// loop of track (laid as curves) runs forward forever
+await block('3b railway', async () => {
   w.setSandbox({ infiniteMoney: true, unlockAll: true });
-  const W = 10, H = 5;
-  let spot = null;
-  for (let z0 = 3; z0 < w.N - H - 3 && !spot; z0++) {
-    for (let x0 = 2; x0 < w.N - W - 2 && !spot; x0++) {
-      const ring = [];
-      for (let x = x0; x <= x0 + W; x++) ring.push([x, z0], [x, z0 + H]);
-      for (let z = z0 + 1; z < z0 + H; z++) ring.push([x0, z], [x0 + W, z]);
-      const okRing = ring.every(([tx, tz]) => w.checkRail(tx, tz).ok && !w.roadAt(tx, tz));
-      const st1 = [x0 + 3, z0 - 1], st2 = [x0 + W - 3, z0 + H + 1];
-      const okSt = w.checkRoad(st1[0], st1[1] - 1, 1).ok && w.checkRoad(st2[0], st2[1] + 1, 1).ok
-        && [st1, st2, [x0 + W - 2, z0 + 2], [x0 + W - 1, z0 + 2]].every(([tx, tz]) => w.inBounds(tx, tz) && !w.buildingOn(tx, tz) && !w.roadAt(tx, tz) && !w.terrain.isWater(tx, tz) && w.terrain.slope(tx, tz) < 0.5);
-      if (okRing && okSt) spot = { x0, z0, ring, st1, st2 };
-    }
+  const o = openBox(w, 16, 13, { x: 10, z: 10 }, 1.2);
+  if (!o) { console.log('      (no room for a rail loop on this map)'); return; }
+  levelBox(w, o.x, o.z, 16, 13);
+  const cx = o.x + 8, cz = o.z + 6.5, zt = cz - 2, zb = cz + 2;
+  const lay = (pts) => { const r = w.placeRail(pts); if (!r.placed) throw new Error('track: ' + r.failed); };
+  const edgeNear = (x, z) => w.rails.nearest(x, z, 0.4).e;
+  // a station by the track near (x, z), on its north side (dir -1) or south (1)
+  const stationAt = (x, z, dir) => { const h = w.rails.nearest(x, z, 0.4), e = h.e, p = pointAt(e.pts, e.cum, h.s); return byTrack(w, 'station', e, h.s, Math.sign(p[3] * dir) || 1); };
+  // the top of the loop, and a spur off it: a dead end a train would have to back out of
+  lay([[cx - 4, zt], [cx + 4, zt]]);
+  const s1 = stationAt(cx - 2, zt, -1);
+  lay([[cx + 1, zt], [cx + 3.5, zt - 2.5]]);
+  const spur = edgeNear(cx + 2.4, zt - 1.4);
+  const sp = pointAt(spur.pts, spur.cum, spur.len * 0.6), s2tmp = byTrack(w, 'station', spur, spur.len * 0.6, sp[3] > 0 ? -1 : 1);
+  ok(s1 && s2tmp && s1.rail && s2tmp.rail && Math.abs(wrapAngle(s2tmp.a - s1.a)) > 0.5, 'stations stand beside the track, square to it whichever way it runs');
+  const dead = game.transit.createLine('rail', [s1.id, s2tmp.id]);
+  ok(!dead.ok && /reverse/.test(dead.reason), `dead-end line refused ("${dead.reason}")`);
+  w.removeBuilding(s2tmp.id);
+  w.removeRailEdge(spur.id);
+  ok(w.rails.edges.size === 1, `taking the spur up leaves the line one stretch of track again (${w.rails.edges.size})`);
+  // close the loop: round the end, back along the bottom and round the other end
+  lay([...arc(cx + 4, cz, 2, PI, 0, 12), ...Array.from({ length: 7 }, (_, i) => [cx + 3 - i, zb]), ...arc(cx - 4, cz, 2, 0, -PI, 12)]);
+  const s2 = stationAt(cx + 2, zb, 1);
+  const rl = game.transit.createLine('rail', [s1.id, s2.id]);
+  ok(rl.ok, `loop line created (${rl.reason || 'ok'})`);
+  game.transit.rebuild();
+  const v = game.transit.vehicles.find(v => v.line.mode === 'rail');
+  const L = v.route.length;
+  const visited = new Set();
+  let backwards = 0, laps = 0, minGap = Infinity, maxGap = 0, prev = v.s;
+  for (let i = 0; i < 6000; i++) {
+    step(0.05);
+    const ds = ((v.s - prev) + L) % L;
+    if (ds > L / 2) backwards++;
+    if (v.s < prev - L / 2) laps++;
+    prev = v.s;
+    if (v.state === 'dwell') visited.add(v.next);
+    const p0 = v.meshes[0].position, p1 = v.meshes[1].position;
+    const gap = Math.hypot(p0.x - p1.x, p0.z - p1.z);
+    minGap = Math.min(minGap, gap); maxGap = Math.max(maxGap, gap);
   }
-  if (spot) {
-    const { x0, z0, ring, st1, st2 } = spot;
-    const top = ring.filter(([, tz]) => tz === z0);
-    w.placeRails(top);
-    w.placeRoads([[st1[0], st1[1] - 1]], 1);
-    const s1 = w.placeBuilding('station', st1[0], st1[1], { instant: true });
-    // second station on a spur off the top row: a dead end the train would have to back out of
-    w.placeRails([[x0 + W - 3, z0 + 1], [x0 + W - 3, z0 + 2]]);
-    w.placeRoads([[x0 + W - 1, z0 + 2]], 1);
-    const s2tmp = w.placeBuilding('station', x0 + W - 2, z0 + 2, { instant: true });
-    ok(s1.ok && s2tmp.ok, 'stations placed beside the track');
-    const dead = game.transit.createLine('rail', [s1.building.id, s2tmp.building.id]);
-    ok(!dead.ok && /reverse/.test(dead.reason), `dead-end line refused ("${dead.reason}")`);
-    w.removeBuilding(s2tmp.building.id);
-    w.removeRail(x0 + W - 3, z0 + 1); w.removeRail(x0 + W - 3, z0 + 2);
-    // complete the loop and put the second station on the far side
-    w.placeRails(ring);
-    w.placeRoads([[st2[0], st2[1] + 1]], 1);
-    const s2 = w.placeBuilding('station', st2[0], st2[1], { instant: true });
-    const rl = game.transit.createLine('rail', [s1.building.id, s2.building.id]);
-    ok(rl.ok, `loop line created (${rl.reason || 'ok'})`);
-    game.transit.rebuild();
-    const v = game.transit.vehicles.find(v => v.line.mode === 'rail');
-    const L = v.route.length;
-    const visited = new Set();
-    let backwards = 0, laps = 0, minGap = Infinity, maxGap = 0, prev = v.s;
-    for (let i = 0; i < 6000; i++) {
-      step(0.05);
-      const ds = ((v.s - prev) + L) % L;
-      if (ds > L / 2) backwards++;
-      if (v.s < prev - L / 2) laps++;
-      prev = v.s;
-      if (v.state === 'dwell') visited.add(v.next);
-      const p0 = v.meshes[0].position, p1 = v.meshes[1].position;
-      const gap = Math.hypot(p0.x - p1.x, p0.z - p1.z);
-      minGap = Math.min(minGap, gap); maxGap = Math.max(maxGap, gap);
-    }
-    ok(backwards === 0, `train only ever moves forward (${laps} laps of a ${L.toFixed(1)}-tile loop)`);
-    ok(laps >= 1, 'train completes laps of the loop');
-    ok(visited.size === 2, `train calls at both stations (${[...visited].join(', ')})`);
-    ok(minGap > 0.4 && maxGap < 0.62, `cars stay coupled (gap ${minGap.toFixed(2)}–${maxGap.toFixed(2)})`);
-  } else console.log('      (no room for a rail loop on this map)');
+  ok(backwards === 0, `train only ever moves forward (${laps} laps of a ${L.toFixed(1)}-unit loop)`);
+  ok(laps >= 1, 'train completes laps of the loop');
+  ok(visited.size === 2, `train calls at both stations (${[...visited].join(', ')})`);
+  ok(minGap > 0.4 && maxGap < 0.62, `cars stay coupled round the curves (gap ${minGap.toFixed(2)}–${maxGap.toFixed(2)})`);
   w.setSandbox({ infiniteMoney: false, unlockAll: false });
   ok(Number.isFinite(w.money), 'sandbox can be switched off again');
-}
+});
+w.setSandbox({ infiniteMoney: false, unlockAll: false });
 
 // 3b2. gondolas: a line runs straight between two stations over whatever lies
 // between, its pylons on open ground and its cabins clear of the roofs; the
 // cabins go round and round, evenly spaced, calling at both stations and
 // carrying riders; the line saves and loads, and goes with a station
-{
+await block('3b2 gondolas', async () => {
   w.setSandbox({ infiniteMoney: true, unlockAll: true });
-  const man = (a, b) => Math.abs(a.x - b.x) + Math.abs(a.z - b.z);
-  const open = (x, z) => w.inBounds(x, z) && !w.buildingOn(x, z) && !w.roadAt(x, z) && !w.terrain.isWater(x, z) && [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dz]) => w.roadAt(x + dx, z + dz));
-  const station = (x, z) => {
-    const r = w.placeBuilding('gondola', x, z, { instant: true });
-    if (r.ok && r.building.connected && r.building.access) return r.building;
-    if (r.ok) w.removeBuilding(r.building.id, 0);
-    return null;
-  };
-  // how many buildings stand under the straight line between two tiles
+  // how many buildings stand under the straight line between two points
   const under = (a, b) => {
     const seen = new Set(), L = Math.hypot(b.x - a.x, b.z - a.z);
     for (let u = 0; u <= L; u += 0.25) {
-      const o = w.buildingOn(Math.floor(a.x + 0.5 + ((b.x - a.x) * u) / L), Math.floor(a.z + 0.5 + ((b.z - a.z) * u) / L));
+      const o = w.buildingAt(a.x + ((b.x - a.x) * u) / L, a.z + ((b.z - a.z) * u) / L);
       if (o && o !== a && o !== b) seen.add(o.id);
     }
     return seen.size;
   };
-  let A = null, B = null;
-  for (let z = 2; z < w.N - 2 && !B; z += 3) for (let x = 2; x < w.N - 2 && !B; x += 3) {
-    if (!open(x, z) || !(A = station(x, z))) continue;
-    for (let z2 = 2; z2 < w.N - 2 && !B; z2++) for (let x2 = 2; x2 < w.N - 2 && !B; x2++) {
-      if (Math.hypot(x2 - x, z2 - z) < 14 || !open(x2, z2) || under(A, { x: x2, z: z2 }) < 3) continue;
-      B = station(x2, z2);
-    }
-    if (!B) { w.removeBuilding(A.id, 0); A = null; }
+  const th = seatOf(w);
+  const A = near(w, 'gondola', th, { r: 12 });
+  // the far station: 14 or more away over at least three roofs, among
+  // homes, where the walk round by the streets is the longest for the way
+  // straight across (so the cable saves the most)
+  const { walkCost } = await import('../src/sim/agents.js');
+  const spots = [];
+  if (A) findPlot(w, 'gondola', A, { r: 30, opts: { ignoreMoney: true }, test: (x, z, a, chk) => {
+    if (Math.hypot(x - A.x, z - A.z) < 14 || under(A, { x, z }) < 3 || w.buildingsNear(x, z, 3.5).filter(b => b.access && b.connected).length < 3) return false;
+    if (!chk) return spots.length < 60;
+    if (chk.access && chk.access.conn) spots.push({ x, z, a, access: chk.access });
+    return false;
+  } });
+  let best = null;
+  for (const sp of spots) {
+    const way = game.paths.road(A.access, sp.access), k = way ? walkCost(w, way) / Math.hypot(sp.x - A.x, sp.z - A.z) : 0;
+    if (way && (!best || k > best.k)) best = { ...sp, k };
   }
-  if (A && B) {
-    const gl = game.transit.createLine('gondola', [A.id, B.id]);
-    ok(gl.ok && gl.line.name === 'Red Line', `gondola line created over ${under(A, B)} buildings, ${Math.hypot(B.x - A.x, B.z - A.z).toFixed(1)} tiles (${gl.reason || gl.line.name})`);
-    game.transit.setVehicles(gl.line.id, 4);
-    game.transit.rebuild();
-    const r = game.transit.routes.get(gl.line.id);
-    const pylons = r.legs.flatMap(l => l.pylons);
-    ok(pylons.length >= 1 && pylons.every(p => { const o = w.buildingOn(Math.floor(p.x), Math.floor(p.z)); return game.transit._pylonSpot(p.x, p.z) >= 0 && (!o || BUILDINGS[o.type].park) && p.h - p.g <= 6.001; }), `its ${pylons.length} pylon(s) stand where there is room (open ground, a field, a park or a road's verge), at most 6 high`);
-    let worst = Infinity;
-    r.pts.forEach(([x, z], i) => {
-      if (Math.hypot(x - A.x - 0.5, z - A.z - 0.5) < 0.7 || Math.hypot(x - B.x - 0.5, z - B.z - 0.5) < 0.7) return;
-      const o = w.buildingOn(Math.floor(x), Math.floor(z));
-      if (o) worst = Math.min(worst, r.ys[i] - G_HANG - game.transit._topOf(o));
+  const B = best && w.placeBuilding('gondola', best.x, best.z, { a: best.a, instant: true }).building;
+  if (!A || !B) { console.log('      (no room for a gondola line on this map)'); if (A) w.removeBuilding(A.id, 0); return; }
+  const gl = game.transit.createLine('gondola', [A.id, B.id]);
+  ok(gl.ok && gl.line.name === 'Red Line', `gondola line created over ${under(A, B)} buildings, ${Math.hypot(B.x - A.x, B.z - A.z).toFixed(1)} units (${gl.reason || gl.line.name})`);
+  game.transit.setVehicles(gl.line.id, 4);
+  game.transit.rebuild();
+  const r = game.transit.routes.get(gl.line.id);
+  const pylons = r.legs.flatMap(l => l.pylons);
+  ok(pylons.length >= 1 && pylons.every(p => { const o = w.buildingAt(p.x, p.z); return game.transit._pylonSpot(p.x, p.z) >= 0 && (!o || BUILDINGS[o.type].park) && p.h - p.g <= 6.001; }), `its ${pylons.length} pylon(s) stand where there is room (open ground, a field, a park or a road's verge), at most 6 high`);
+  let worst = Infinity;
+  r.pts.forEach(([x, z], i) => {
+    if (Math.hypot(x - A.x, z - A.z) < 0.7 || Math.hypot(x - B.x, z - B.z) < 0.7) return;
+    const o = w.buildingAt(x, z);
+    if (o) worst = Math.min(worst, r.ys[i] - G_HANG - game.transit._topOf(o));
+  });
+  ok(worst > 0, `the cabins clear every roof under the line (the closest by ${worst.toFixed(2)})`);
+  ok(r.marks.length === 2 && r.wheels.length === 2 && game.transit.cables.has(gl.line.id), 'it turns round a bullwheel at each end, with its cable drawn');
+  // send villagers on trips from near one station to near the other that
+  // are quicker by gondola than on foot, as the streets go
+  const by = (S) => [...w.buildings.values()].filter(b => b !== A && b !== B && b.access && b.connected && isOpen(b) && Math.hypot(b.x - S.x, b.z - S.z) <= 6);
+  const trips = [];
+  for (const f of by(A)) for (const t of by(B)) {
+    if (trips.length >= 3) break;
+    const way = game.paths.road(f.access, t.access);
+    const p = way && game.transit.plan(f, t, walkCost(w, way));
+    if (p && p.line === gl.line) trips.push([f, t]);
+  }
+  const sent = [...w.residents.values()].filter(x => x.loc === 'in').slice(0, trips.length);
+  sent.forEach((r, i) => { r.at = trips[i][0].id; game.agents.go(r, trips[i][1].id); });
+  const rode = new Set();
+  const cabins = game.transit.vehicles.filter(v => v.line === gl.line);
+  const L = r.length, prev = cabins.map(v => v.s), called = new Set();
+  let backwards = 0, minGap = Infinity;
+  for (let i = 0; i < 5000; i++) {
+    step(0.05);
+    cabins.forEach((v, k) => {
+      if (((v.s - prev[k]) + L) % L > L / 2) backwards++;
+      prev[k] = v.s;
+      if (v.state === 'dwell') called.add(v.route.marks[v.next].stop);
     });
-    ok(worst > 0, `the cabins clear every roof under the line (the closest by ${worst.toFixed(2)})`);
-    ok(r.marks.length === 2 && r.wheels.length === 2 && game.transit.cables.has(gl.line.id), 'it turns round a bullwheel at each end, with its cable drawn');
-    // send a villager from near one station to near the other
-    const near = (S) => [...w.buildings.values()].find(b => b !== A && b !== B && b.access && b.connected && isOpen(b) && man(b, S) <= 4);
-    const from = near(A), to = near(B);
-    const rider = [...w.residents.values()].find(x => x.loc === 'in');
-    if (from && to && rider) { rider.at = from.id; game.agents.go(rider, to.id); }
-    const cabins = game.transit.vehicles.filter(v => v.line === gl.line);
-    const L = r.length, prev = cabins.map(v => v.s), called = new Set();
-    let backwards = 0, minGap = Infinity, rode = false;
-    for (let i = 0; i < 5000; i++) {
-      step(0.05);
-      cabins.forEach((v, k) => {
-        if (((v.s - prev[k]) + L) % L > L / 2) backwards++;
-        prev[k] = v.s;
-        if (v.state === 'dwell') called.add(v.route.marks[v.next].stop);
-      });
-      const ss = cabins.map(v => v.s).sort((a, b) => a - b);
-      for (let k = 0; k < ss.length; k++) minGap = Math.min(minGap, ((ss[(k + 1) % ss.length] - ss[k]) + L) % L);
-      if (rider && rider.loc === 'ride' && game.transit.lineNameOf(rider) === gl.line.name) rode = true;
-    }
-    const gs = game.transit.stats[gl.line.id] || { riders: 0, fares: 0 };
-    ok(cabins.length === 4 && backwards === 0 && called.size === 2, `4 cabins run round the line, never backwards, calling at both stations`);
-    ok(minGap > L / 8, `the cabins stay spread out (closest ${minGap.toFixed(1)} of ${(L / 4).toFixed(1)} tiles apart)`);
-    ok(gs.riders > 0 && gs.fares > 0 && (rode || !rider || !from || !to), `villagers ride the gondola (${gs.riders} riders, $${gs.fares} in fares${rode ? ', one sent across' : ''})`);
-    // a trip to the top of a hill, the station up there with it: walking it
-    // takes the climb as well, the gondola climbs for them
-    {
-      const lo = { x: A.x + 1, z: A.z, baseY: A.baseY }, up = 4, was = B.baseY;
-      B.baseY = was + up;
-      const hi = { x: B.x + 1, z: B.z, baseY: B.baseY }, flat = (Math.abs(hi.x - lo.x) + Math.abs(hi.z - lo.z)) * 1.2, hill = flat + CONFIG.CLIMB * up;
-      const p = game.transit.plan(lo, hi, hill);
-      B.baseY = was;
-      ok(p && p.line === gl.line && p.cost < flat, `a trip up a hill takes the gondola: walking it is ${hill.toFixed(0)} tiles' worth, climbing counted, by gondola ${p ? p.cost.toFixed(0) : '-'}`);
-    }
-    const back = deserialize(JSON.parse(JSON.stringify(serialize(w))));
-    const bl = back.lines.find(l => l.id === gl.line.id);
-    const t2 = new Transit({ world: back, renderer: { scene }, paths: new PathFinder(back), view: null, emit() {}, on() {} });
-    t2.rebuild();
-    ok(bl && bl.mode === 'gondola' && bl.vehicles === 4 && t2.routes.get(bl.id) && t2.vehicles.filter(v => v.line === bl).length === 4, 'a gondola line saves and loads, cabins and all');
-    w.removeBuilding(B.id);
-    game.transit.rebuild();
-    ok(gl.line.broken && !game.transit.vehicles.some(v => v.line === gl.line) && !game.transit.cables.has(gl.line.id), 'demolishing a station takes the line out of service, cable and cabins');
-    game.transit.deleteLine(gl.line.id);
-    w.removeBuilding(A.id);
-  } else console.log('      (no room for a gondola line on this map)');
-  w.setSandbox({ infiniteMoney: false, unlockAll: false });
-}
+    const ss = cabins.map(v => v.s).sort((a, b) => a - b);
+    for (let k = 0; k < ss.length; k++) minGap = Math.min(minGap, ((ss[(k + 1) % ss.length] - ss[k]) + L) % L);
+    for (const r of sent) if (r.loc === 'ride' && game.transit.lineNameOf(r) === gl.line.name) rode.add(r.id);
+  }
+  const gs = game.transit.stats[gl.line.id] || { riders: 0, fares: 0 };
+  ok(cabins.length === 4 && backwards === 0 && called.size === 2, `4 cabins run round the line, never backwards, calling at both stations`);
+  ok(minGap > L / 8, `the cabins stay spread out (closest ${minGap.toFixed(1)} of ${(L / 4).toFixed(1)} units apart)`);
+  ok(trips.length && rode.size === sent.length && gs.riders >= sent.length && gs.fares > 0, `villagers sent where the gondola is quicker than the streets ride it (${rode.size} of ${sent.length}; ${gs.riders} riders in all, $${gs.fares} in fares)`);
+  // a trip to the top of a hill, the station up there with it: walking it
+  // takes the climb as well, the gondola climbs for them
+  {
+    const lo = { x: A.x + 1, z: A.z, baseY: A.baseY }, up = 4, was = B.baseY;
+    B.baseY = was + up;
+    const hi = { x: B.x + 1, z: B.z, baseY: B.baseY }, flat = (Math.abs(hi.x - lo.x) + Math.abs(hi.z - lo.z)) * 1.2, hill = flat + CONFIG.CLIMB * up;
+    const p = game.transit.plan(lo, hi, hill);
+    B.baseY = was;
+    ok(p && p.line === gl.line && p.cost < flat, `a trip up a hill takes the gondola: walking it is ${hill.toFixed(0)} units' worth, climbing counted, by gondola ${p ? p.cost.toFixed(0) : '-'}`);
+  }
+  const back = deserialize(JSON.parse(JSON.stringify(serialize(w))));
+  const bl = back.lines.find(l => l.id === gl.line.id);
+  const t2 = new Transit({ world: back, renderer: { scene }, paths: new PathFinder(back), view: null, emit() {}, on() {} });
+  t2.rebuild();
+  ok(bl && bl.mode === 'gondola' && bl.vehicles === 4 && t2.routes.get(bl.id) && t2.vehicles.filter(v => v.line === bl).length === 4, 'a gondola line saves and loads, cabins and all');
+  w.removeBuilding(B.id);
+  game.transit.rebuild();
+  ok(gl.line.broken && !game.transit.vehicles.some(v => v.line === gl.line) && !game.transit.cables.has(gl.line.id), 'demolishing a station takes the line out of service, cable and cabins');
+  game.transit.deleteLine(gl.line.id);
+  w.removeBuilding(A.id);
+});
+w.setSandbox({ infiniteMoney: false, unlockAll: false });
 
 // 3b3. gondolas up the mountainside, from beside the town hall on the valley
 // floor to the highest flat ground up the escarpment: no span steeper than a
 // cabin can hang under, the cable clear of every cabin's roof all the way
-{
+await block('3b3 mountain gondolas', async () => {
   let lines = 0, steepest = 0, closest = Infinity;
   for (let s = 1; s <= 8; s++) {
     const mw = World.createNew({ N: 64, seed: s * 1009, name: 'T', relief: 'mountains' });
     mw.setSandbox({ infiniteMoney: true, unlockAll: true, instantBuild: true });
     const mg = { speed: 1, env: { night: 0 }, renderer: { scene }, view: { smoke: { emit() {} } }, _ev: {}, on(e, f) { (this._ev[e] ||= []).push(f); }, emit(e, d) { for (const f of this._ev[e] || []) f(d); }, world: mw };
     mg.paths = new PathFinder(mw); mg.sim = new Sim(mg); mg.transit = new Transit(mg);
-    const th = [...mw.buildings.values()].find(b => b.type === 'townhall'), t = mw.terrain;
-    let lo = null, hi = null, top = 0;
-    for (let z = 2; z < mw.N - 2 && !lo; z++) for (let x = 2; x < mw.N - 2 && !lo; x++) if (Math.hypot(x - th.x, z - th.z) > 2 && Math.hypot(x - th.x, z - th.z) < 6 && mw.checkBuild('gondola', x, z).ok) lo = [x, z];
+    const th = seatOf(mw), t = mw.terrain;
+    const lo = near(mw, 'gondola', th, { r: 6, test: (x, z) => Math.hypot(x - th.x, z - th.z) > 2 });
     if (!lo) continue;
+    let hi = null, top = 0;
     for (let z = 3; z < mw.N - 3; z++) for (let x = 3; x < mw.N - 3; x++) {
-      const h = t.tileAvg(x, z), d = Math.hypot(x - lo[0], z - lo[1]);
-      if (h > top && d > 9 && d < 18 && t.slope(x, z) < 0.3 && t.slope(x, z + 1) < 0.3) { top = h; hi = [x, z]; }
+      const h = t.tileAvg(x, z), d = Math.hypot(x + 0.5 - lo.x, z + 0.5 - lo.z);
+      if (h > top && d > 9 && d < 18 && t.slope(x, z) < 0.3 && t.slope(x, z + 1) < 0.3 && t.slope(x - 1, z + 1) < 0.3 && t.slope(x + 1, z + 1) < 0.3) { top = h; hi = [x + 0.5, z + 0.5]; }
     }
     if (!hi) continue;
-    mw.placeRoads([[hi[0] - 1, hi[1] + 1], [hi[0], hi[1] + 1], [hi[0] + 1, hi[1] + 1]], 1);
-    const st = [lo, hi].map(([x, z]) => mw.placeBuilding('gondola', x, z, { instant: true })).filter(r => r.ok).map(r => r.building);
-    const ln = st.length === 2 ? mg.transit.createLine('gondola', st.map(b => b.id)) : { ok: false };
+    // a street of its own up there, in front of the station
+    if (!mw.placeRoad([[hi[0] - 1.2, hi[1] + 1], [hi[0] + 1.2, hi[1] + 1]], 1).placed) continue;
+    const up = mw.placeBuilding('gondola', hi[0], hi[1], { instant: true });
+    const ln = up.ok ? mg.transit.createLine('gondola', [lo.id, up.building.id]) : { ok: false };
     if (!ln.ok) continue;
     mg.transit.rebuild();
     const r = mg.transit.routes.get(ln.line.id);
@@ -505,10 +642,10 @@ ok(game.transit.vehicles.length === 1, 'one coach on the line');
     closest = Math.min(closest, mg.transit.cabinClearance(r).clear);
   }
   ok(lines >= 6 && steepest <= 1.001 && closest > 0.005, `gondolas up the mountainside (${lines} lines): no span steeper than one in one (the steepest ${steepest.toFixed(2)}), the cable over every cabin's roof all the way (by ${closest.toFixed(3)} at the closest)`);
-}
+});
 
 // 3c. animals keep out of buildings and stay in their habitat
-{
+await block('3c animals', async () => {
   const animals = new Animals(game);
   const counts = {};
   for (const a of animals.list) counts[a.sp] = (counts[a.sp] || 0) + 1;
@@ -516,9 +653,7 @@ ok(game.transit.vehicles.length === 1, 'one coach on the line');
   let bad = 0;
   const check = () => {
     for (const a of animals.list) {
-      const tx = Math.floor(a.x), tz = Math.floor(a.z);
-      const b = w.buildingOn(tx, tz);
-      const water = w.terrain.isWater(tx, tz);
+      const b = w.buildingAt(a.x, a.z), water = w.waterAt(a.x, a.z);
       if (a.sp === 'duck') { if (!water) bad++; }
       else if (a.farm != null) { if (!b || b.id !== a.farm) bad++; }
       else if (b || water) bad++;
@@ -530,27 +665,20 @@ ok(game.transit.vehicles.length === 1, 'one coach on the line');
   }
   ok(bad === 0, `no animal walked into a building or out of its habitat (${bad} violations)`);
   // build right on top of a wild animal: it should be moved out of the way
-  const wild = animals.list.find(a => a.farm == null && a.sp !== 'duck');
+  const wild = animals.list.find(a => a.farm == null && a.sp !== 'duck' && clearAt(w, a.x - 1.5, a.z - 0.8, 3, 2.6, 0.8));
   if (wild) {
-    const tx = Math.floor(wild.x), tz = Math.floor(wild.z);
     w.setSandbox({ infiniteMoney: true, unlockAll: true });
-    w.placeRoads([[tx + 1, tz]], 1);
-    const r = w.placeBuilding('house', tx, tz, {});
+    street(w, [[wild.x - 1.2, wild.z + 1], [wild.x + 1.2, wild.z + 1]]);
+    const r = w.placeBuilding('house', wild.x, wild.z, {});
     for (let i = 0; i < 30; i++) animals.update(0.05, 1);
-    if (r.ok) ok(!animals.list.includes(wild) || w.buildingOn(Math.floor(wild.x), Math.floor(wild.z)) === null, 'animal under a new building steps aside');
+    ok(r.ok && (!animals.list.includes(wild) || w.buildingAt(wild.x, wild.z) === null), `animal under a new building steps aside (${r.reason || 'built'})`);
     w.setSandbox({ infiniteMoney: false, unlockAll: false });
-  }
-}
+  } else console.log('      (no open ground round a wild animal to build on)');
+});
 
 // 3d. construction: builders walk out, work on site, and finish the job
-const freeSpot = (W = 1, D = 1, skip = new Set()) => {
-  for (let z = 2; z < w.N - 3; z++) for (let x = 2; x < w.N - 3; x++) {
-    if (skip.has(`${x},${z}`)) continue;
-    const c = w.checkBuild('house', x, z, { w: W, d: D, ignoreMoney: true, ignoreUnlock: true });
-    if (c.ok && c.access.some(a => a.conn)) return { x, z };
-  }
-  return null;
-};
+// (a free plot along the town's streets, on the roads to the way out: { x, z, a })
+const freeSpot = (W = 1, D = 1, skip = []) => findPlot(w, 'house', seatOf(w), { r: 20, w: W, d: D, opts: { ignoreMoney: true, ignoreUnlock: true }, test: (x, z, a, chk) => skip.every(s => Math.hypot(s.x - x, s.z - z) > 1.5) && (!chk || !!(chk.access && chk.access.conn)) });
 const runUntil = (pred, days = 6) => {
   const end = w.day + days;
   let peak = 0;
@@ -561,7 +689,7 @@ const runUntil = (pred, days = 6) => {
   }
   return { ok: false, peak };
 };
-{
+await block('3d construction', async () => {
   w.money = 1e6;
   // founders are random: make sure the builder's yard has a builder
   const yard = [...w.buildings.values()].find(b => BUILDINGS[b.type].builders);
@@ -570,7 +698,7 @@ const runUntil = (pred, days = 6) => {
     if (hand) { hand.job = yard.id; game.sim.recompute(); }
   }
   const spot = freeSpot();
-  const r = w.placeBuilding('house', spot.x, spot.z, {});
+  const r = w.placeBuilding('house', spot.x, spot.z, { a: spot.a });
   ok(r.ok && r.building.con && r.building.con.kind === 'build', 'a new cottage starts as a building site');
   // hired hands start every site at once; make this one big enough that the
   // town's builders, on their slow walk from the yard, get there before
@@ -604,8 +732,8 @@ const runUntil = (pred, days = 6) => {
   // a site the player puts first gets the builders before an older one
   {
     const { runCommand } = await import('../src/commands.js');
-    const sa = freeSpot(), A = w.placeBuilding('house', sa.x, sa.z, {}).building;
-    const sb = freeSpot(), B = w.placeBuilding('house', sb.x, sb.z, {}).building;
+    const sa = freeSpot(), A = w.placeBuilding('house', sa.x, sa.z, { a: sa.a }).building;
+    const sb = freeSpot(), B = w.placeBuilding('house', sb.x, sb.z, { a: sb.a }).building;
     A.con.work *= 20; B.con.work *= 20;   // so the hired hands don't finish them before the builders come
     const pr = runCommand(game, { t: 'priority', id: B.id, on: true });
     const crew = (b) => game.construction.crew.get(b.id) || { assigned: 0 };
@@ -617,29 +745,36 @@ const runUntil = (pred, days = 6) => {
   }
 
   // joining two neighbours
-  let pair = null;
+  let pr2 = null;
   for (const a of w.buildings.values()) {
     if (a.con) continue;
     const m = w.mergeOptions(a).find(m => m.type === 'terrace' || m.type === 'shophouse');
-    if (m) { pair = [a, m]; break; }
+    if (m) { pr2 = [a, m]; break; }
   }
-  if (pair) {
-    const [a, m] = pair;
+  if (!pr2) {
+    // (the demo town may have joined every pair already: two cottages side by side)
+    const P = pair(w, 'house', 'house');
+    const m = P && w.mergeOptions(P[0]).find(m => m.other === P[1]);
+    if (m) pr2 = [P[0], m];
+  }
+  if (pr2) {
+    const [a, m] = pr2;
     const people = [...w.residents.values()].filter(r => r.home === a.id || r.home === m.other.id).length;
     const mr = w.mergeBuildings(a.id, m.other.id);
     const nb = mr.building;
-    ok(mr.ok && fw(nb) * fd(nb) === 2 && !w.buildings.has(a.id), `joined into a ${m.name} on a ${fw(nb)}×${fd(nb)} plot`);
+    ok(mr.ok && nb.w * nb.d === 2 && !w.buildings.has(a.id), `joined into a ${m.name} on a ${nb.w}×${nb.d} plot`);
     const kept = [...w.residents.values()].filter(r => r.home === nb.id).length;
     ok(kept === people, `everyone moved in (${kept}/${people})`);
     ok(runUntil(() => !nb.con).ok, 'builders finished the joined building');
   } else ok(false, 'no pair of neighbours to join');
 
-  // moving a house: taken down, carted over, rebuilt
+  // moving a house: taken down, carted over, rebuilt (turned to its new street)
   const home = [...w.buildings.values()].find(b => b.type === 'house' && !b.con && b.residents.length);
-  const dest = freeSpot(1, 1, new Set([`${home.x},${home.z}`]));
+  const dest = freeSpot(1, 1, [home]);
   const who = home.residents.slice();
-  const mv = w.moveBuilding(home.id, dest.x, dest.z);
-  ok(mv.ok && home.con && home.con.kind === 'dismantle' && mv.building.con.wait === 'dismantle', 'move: old house is being taken down');
+  const mv = w.moveBuilding(home.id, dest.x, dest.z, { a: dest.a });
+  ok(mv.ok && home.con && home.con.kind === 'dismantle' && mv.building.con.wait === 'dismantle', `move: old house is being taken down (${mv.reason || 'ok'})`);
+  ok(mv.ok && Math.abs(wrapAngle(mv.building.a - dest.a)) < 0.002, 'and goes up again facing its new street');
   ok(who.every(id => w.residents.get(id)?.home === mv.building.id), 'the household now belongs to the new plot');
   let sawHaul = false;
   const res3 = runUntil(() => { if (mv.building.con && mv.building.con.wait === 'haul') sawHaul = true; return !mv.building.con; }, 8);
@@ -652,12 +787,12 @@ const runUntil = (pred, days = 6) => {
   for (const b of w.buildings.values()) deals += (b.leases || []).filter(l => l.buyer).length;
   if (!deals) {
     // make one: a villa next to a cottage
-    for (const b of w.buildings.values()) {
+    for (const b of [...w.buildings.values()]) {
       if (b.type !== 'house' || b.con) continue;
-      for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-        const c = w.checkBuild('villa', b.x + dx, b.z + dz, { ignoreMoney: true, ignoreUnlock: true });
-        if (!c.ok) continue;
-        const v = w.placeBuilding('villa', b.x + dx, b.z + dz, { ignoreUnlock: true });
+      for (const side of [1, -1]) {
+        const [x, z] = besideAt(b, 'villa', side);
+        if (!w.checkBuild('villa', x, z, { a: b.a, ignoreMoney: true, ignoreUnlock: true }).ok) continue;
+        const v = w.placeBuilding('villa', x, z, { a: b.a, ignoreUnlock: true });
         if (v.ok) w.tryEncroach(v.building);
         break;
       }
@@ -665,40 +800,20 @@ const runUntil = (pred, days = 6) => {
       if (deals) break;
     }
   }
-  const DIR = [[0, 1], [1, 0], [0, -1], [-1, 0]];
-  const rects = [...w.buildings.values()].map(b => {
-    const e = { x0: 0, x1: 0, z0: 0, z1: 0, ...(b.ext || {}) };
-    const [dx, dz] = DIR[b.rot], f = b.front || 0;
-    if (dx > 0) e.x1 += f; if (dx < 0) e.x0 += f; if (dz > 0) e.z1 += f; if (dz < 0) e.z0 += f;
-    return [b.x - e.x0, b.z - e.z0, b.x + fw(b) + e.x1, b.z + fd(b) + e.z1, b.id];
-  });
-  ok([...w.buildings.values()].some(b => b.front > 0), `buildings come forward to the street (${[...w.buildings.values()].filter(b => b.front > 0).length})`);
+  const all = [...w.buildings.values()], rects = all.map(plotOf);
+  ok(all.some(b => b.front > 0), `buildings come forward to the street (${all.filter(b => b.front > 0).length})`);
   let overlaps = 0;
-  for (let i = 0; i < rects.length; i++) for (let j = i + 1; j < rects.length; j++) {
-    const a = rects[i], b = rects[j];
-    if (a[0] < b[2] - 1e-6 && b[0] < a[2] - 1e-6 && a[1] < b[3] - 1e-6 && b[1] < a[3] - 1e-6) overlaps++;
-  }
+  for (let i = 0; i < rects.length; i++) for (let j = i + 1; j < rects.length; j++) if (rectsOverlap(rects[i], rects[j], 0.004)) overlaps++;
   ok(deals > 0, `big homes bought garden land (${deals} deal${deals === 1 ? '' : 's'})`);
   ok(overlaps === 0, `no two plots overlap after land deals (${overlaps})`);
   w.setSandbox({ freeUpgrades: false, unlockAll: false, instantBuild: false });
-}
+});
+w.setSandbox({ freeUpgrades: false, unlockAll: false, instantBuild: false });
 
 // 3d0. combination joins: every pairing in every recipe yields its building,
 // and no earlier recipe takes a pair meant for a later one (in a fresh town
-// with a long street, so there is room for every pair)
-// Two side-by-side plots with a short street in front, for joining tests.
-const placePair = (tw, ta, tb) => {
-  for (let z = 3; z < tw.N - 4; z++) for (let x = 3; x < tw.N - 5; x++) {
-    if (![x, x + 1].every(k => tw.checkRoad(k, z - 1, 1).ok || tw.roadAt(k, z - 1))) continue;
-    if (![[x, z], [x + 1, z]].every(([a, b]) => tw.inBounds(a, b) && !tw.buildingOn(a, b) && !tw.roadAt(a, b) && !tw.terrain.isWater(a, b))) continue;
-    if (!tw.roadAt(x, z - 1) || !tw.roadAt(x + 1, z - 1)) tw.placeRoads([[x, z - 1], [x + 1, z - 1]], 1);
-    const A = tw.placeBuilding(ta, x, z, { instant: true }), B = A.ok && tw.placeBuilding(tb, x + 1, z, { instant: true });
-    if (A.ok && B.ok) return [A.building, B.building];
-    for (const P of [A, B]) if (P && P.ok && tw.buildings.has(P.building.id)) tw.removeBuilding(P.building.id, 0);
-  }
-  return null;
-};
-{
+// with long streets, so there is room for every pair)
+await block('3d0 joins', async () => {
   const { MERGES } = await import('../src/defs.js');
   const tw = World.createNew({ N: 64, seed: 31, name: 'Joinbury' });
   tw.setSandbox({ infiniteMoney: true, unlockAll: true, instantBuild: true });
@@ -706,65 +821,67 @@ const placePair = (tw, ta, tb) => {
   for (const m of MERGES) for (const ta of m.a) for (const tb of m.b) pairs.push([ta, tb, m.to]);
   const wrong = [];
   for (const [ta, tb, to] of pairs) {
-    const P = placePair(tw, ta, tb);
+    const P = pair(tw, ta, tb);
     const r = P ? tw.mergeBuildings(P[0].id, P[1].id) : { ok: false, reason: 'no room' };
     if (!r.ok || r.building.type !== to) wrong.push(`${ta} + ${tb} → ${r.ok ? r.building.type : r.reason} (not ${to})`);
   }
   ok(!wrong.length, `every pairing in every join recipe makes its building (${pairs.length} pairs, ${MERGES.length} recipes)${wrong.length ? ': ' + wrong.join('; ') : ''}`);
-}
+  // and only between neighbours standing square to each other, side by side
+  const P = pair(tw, 'house', 'house');
+  ok(P && tw.mergeOptions(P[0]).some(m => m.other === P[1]), 'two cottages side by side can join');
+  const spot = { x: P[1].x, z: P[1].z, a: P[1].a };
+  tw.removeBuilding(P[1].id, 0);
+  const [ox, oz] = toWorld(rect(spot.x, spot.z, spot.a, 0.5, 0.5), -0.12, 0);
+  const skew = tw.placeBuilding('house', ox, oz, { instant: true, a: spot.a + 0.2 });
+  ok(skew.ok && !tw.mergeOptions(P[0]).some(m => m.other === skew.building), `...but not with one beside it turned askew (${skew.reason || 'turned 0.2'})`);
+});
 
 // 3d0d. a tea garden lifts the street round it and sells tea; a free library
 // joined from a stationer and a school adds to research once it's staffed
-{
+await block('3d0d tea garden and library', async () => {
   const { RESEARCH_SOURCES, tradesOf } = await import('../src/defs.js');
   const tw = World.createNew({ N: 48, seed: 35, name: 'Teaby' });
   tw.setSandbox({ infiniteMoney: true, unlockAll: true, instantBuild: true });
-  const tg = { world: tw, speed: 0, _ev: {}, on(e, f) { (this._ev[e] ||= []).push(f); }, emit(e, d) { for (const f of this._ev[e] || []) f(d); } };
+  const tg = listen(tw);
   const sim = new Sim(tg);
   sim.seedFounders();
-  const [Co, Gr] = placePair(tw, 'coffeehouse', 'garden');
-  const i = tw.idx(Co.x, Co.z - 2);
+  const [Co, Gr] = pair(tw, 'coffeehouse', 'garden');
+  const [fx, fz] = toWorld(ownPlot(Co), 0, Co.d / 2 + 1.2), i = cellOf(tw.N, fx, fz);
   sim.recompute();
   const before = sim.appeal[i];
   const t = tw.mergeBuildings(Co.id, Gr.id);
   sim.recompute();
   ok(t.ok && t.building.type === 'teagarden' && tradesOf(t.building).includes('tea') && sim.appeal[i] > before, `a coffee house and a green make a Tea Garden that sells tea and lifts the street (appeal ${before.toFixed(1)} → ${sim.appeal[i].toFixed(1)})`);
   // the library goes on the town's own street, so it is connected and staffed
-  let St = null, Sc = null;
-  const conn = (t, x, z) => { const c = tw.checkBuild(t, x, z); return c.ok && c.access.some(a => a.conn); };
-  for (let z = 1; z < tw.N - 1 && !St; z++) for (let x = 1; x < tw.N - 2 && !St; x++) {
-    if (!conn('stationer', x, z) || !conn('school', x + 1, z)) continue;
-    St = tw.placeBuilding('stationer', x, z, { instant: true }).building;
-    Sc = tw.placeBuilding('school', x + 1, z, { instant: true }).building;
-  }
+  const [St, Sc] = pair(tw, 'stationer', 'school');
   const lib = tw.mergeBuildings(St.id, Sc.id).building;
   for (const r of [...tw.residents.values()].filter(r => r.age === 'adult').slice(0, 2)) { r.job = lib.id; r.edu = 3; }
   sim.recompute();
   const src = sim.researchSources().find(s => s.name === 'Free Library');
-  ok(lib.type === 'library' && RESEARCH_SOURCES.library && src && src.points > 0, `a stationer and a school make a Free Library that adds ${src ? src.points : 0} research a day`);
-}
+  ok(lib.type === 'library' && lib.connected && RESEARCH_SOURCES.library && src && src.points > 0, `a stationer and a school make a Free Library that adds ${src ? src.points : 0} research a day`);
+});
 
 // 3d0c. a builder's yard joined with a woodcutter is still where the builders
 // work from, and they work faster; a chapel keeps its look in its vicarage
-{
+await block('3d0c yards and vicarage', async () => {
   const tw = World.createNew({ N: 48, seed: 34, name: 'Yardley' });
   tw.setSandbox({ infiniteMoney: true, unlockAll: true, instantBuild: true });
-  const [Y, Wd] = placePair(tw, 'builder', 'lumber');
+  const [Y, Wd] = pair(tw, 'builder', 'lumber');
   const r = tw.mergeBuildings(Y.id, Wd.id), def = r.ok && BUILDINGS[r.building.type];
   ok(def && def.builders && def.levels[0].rate > BUILDINGS.builder.levels[0].rate && capOf(r.building, 'jobs') >= 6, `a builder's yard and a woodcutter make a ${def && def.levels[0].name} whose builders work at ${def && def.levels[0].rate}×`);
-  const [Ch, Co] = placePair(tw, 'house', 'chapel');
+  const [Ch, Co] = pair(tw, 'house', 'chapel');
   const v = tw.mergeBuildings(Ch.id, Co.id);
   ok(v.ok && v.building.type === 'vicarage' && v.building.variant === Co.variant, 'a chapel taking in the cottage next door keeps the chapel\'s look');
-}
+});
 
 // 3d0b. a joined building is never a level the town can't build yet, a grand
 // home leads when it takes in a cottage, and the join says who must move out
-{
+await block('3d0b join levels', async () => {
   const tw = World.createNew({ N: 48, seed: 33, name: 'Clampton' });
   tw.money = 1e6;
   Object.defineProperty(tw, 'unlockPop', { value: 500 });
   tw.research.done.push('carpentry', 'joining', 'masonry', 'stonework', 'architecture', 'homes2', 'homes3', 'brickmaking', 'urban', 'flats');
-  const [V, H] = placePair(tw, 'villa', 'house');
+  const [V, H] = pair(tw, 'villa', 'house');
   V.level = 1;   // a Manor House
   let opt = tw.mergeOptions(V).find(m => m.other === H);
   ok(opt && opt.type === 'mansion' && opt.level === 0, `a Manor House and a cottage make a ${opt && opt.name} until Grand Architecture is researched`);
@@ -773,7 +890,7 @@ const placePair = (tw, ta, tb) => {
   ok(opt && opt.level === 1 && opt.name === 'Stately Home', `...and a ${opt && opt.name} after`);
   const r = tw.mergeBuildings(V.id, H.id);
   ok(r.ok && r.building.variant === V.variant, 'the villa leads: the joined house keeps its look, not the cottage\'s');
-  const [F, G] = placePair(tw, 'flats', 'flats');
+  const [F, G] = pair(tw, 'flats', 'flats');
   F.level = G.level = 2;   // two Mansion Blocks, full
   const full = BUILDINGS.flats.levels[2].housing, room = BUILDINGS.apartments.levels[1].housing;
   F.residents = new Array(full).fill(0); G.residents = new Array(full).fill(0);
@@ -782,56 +899,60 @@ const placePair = (tw, ta, tb) => {
   ok(opt && opt.name === 'Grand Apartments' && opt.moveOut === Math.max(0, 2 * full - room), `two full Mansion Blocks (${full} each) joined into the ${opt && opt.name} (${room}) say ${opt && opt.moveOut} must move out`);
   F.residents = []; G.residents = [];
   // ...and when the two hold more than what they become, the ones who won't fit
-  const [V2, H2] = placePair(tw, 'villa', 'house');
+  const [V2, H2] = pair(tw, 'villa', 'house');
   V2.level = 2; H2.level = 1;   // a Grand Manor and a Family House, full
   const a = BUILDINGS.villa.levels[2].housing, b = BUILDINGS.house.levels[1].housing, into = BUILDINGS.mansion.levels[1].housing;
   V2.residents = new Array(a).fill(0); H2.residents = new Array(b).fill(0);
   const o2 = tw.mergeOptions(V2).find(m => m.other === H2);
   ok(o2 && o2.name === 'Stately Home' && o2.moveOut === a + b - into && o2.moveOut > 0, `a full Grand Manor (${a}) and Family House (${b}) joined into a ${o2 && o2.name} (${into}) say ${o2 && o2.moveOut} must move out`);
   V2.residents = []; H2.residents = [];
-}
+});
 
 // 3d0f. farms: the farmyard by the road with fields behind; farmland beyond
-// the plot (touching it, up to a limit, priced, blocking building, cleared by
-// the bulldozer and with the farm); what a farm produces; a homestead
-{
-  const { capOf, homeField, aheadOf } = await import('../src/world/world.js');
-  const { CONFIG } = await import('../src/config.js');
+// the plot (squares of it at the farm's own angle, touching it, up to a
+// limit, priced, blocking building, cleared by the bulldozer and with the
+// farm); what a farm produces; a homestead
+await block('3d0f farms', async () => {
+  const { homeField, aheadOf } = await import('../src/world/world.js');
   const { PRODUCE } = await import('../src/defs.js');
   const { workArea } = await import('../src/render/buildings.js');
   const tw = World.createNew({ N: 48, seed: 61, name: 'Furrowby' });
   tw.setSandbox({ unlockAll: true, instantBuild: true });
   tw.money = 1e5;
-  const th = [...tw.buildings.values()].find(b => b.type === 'townhall');
-  let F = null;
-  for (let r = 3; r < 18 && !F; r++) for (let dz = -r; dz <= r && !F; dz++) for (let dx = -r; dx <= r && !F; dx++) {
-    if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
-    const c = tw.checkBuild('farm', th.x + dx, th.z + dz);
-    if (!c.ok || !c.access.some(a => a.conn)) continue;
-    const p = tw.placeBuilding('farm', th.x + dx, th.z + dz, { instant: true });
-    if (p.ok) F = p.building;
-  }
+  const th = seatOf(tw);
+  // (with room behind and beside it for its fields)
+  const roomy = (x, z, a) => { const R = rect(x, z, a, 1, 1); return [[-2.5, -0.5], [2.5, -0.5], [-1.5, -1.5], [0.5, -2.5], [-0.5, -2.5]].every(([lx, lz]) => { const [px, pz] = toWorld(R, lx, lz); return !tw.buildingAt(px, pz) && !tw.roadAt(px, pz, 0.3) && !tw.waterAt(px, pz); }); };
+  const F = near(tw, 'farm', th, { r: 18, test: (x, z, a) => roomy(x, z, a) });
   ok(!!F, 'found room for a test farm');
-  const wk = workArea(F), [fx, fz] = [[0, 1], [1, 0], [0, -1], [-1, 0]][F.rot];
-  const cx = F.x + 1, cz = F.z + 1, front = (x, z) => (x - cx) * fx + (z - cz) * fz;
-  ok(front((wk[0] + wk[2]) / 2, (wk[1] + wk[3]) / 2) < 0, 'its fields lie behind the farmyard, away from the road');
-  const ring = [];
-  for (let z = F.z - 6; z < F.z + 8; z++) for (let x = F.x - 6; x < F.x + 8; x++) ring.push([x, z]);
-  const far = tw.planFields(F.id, [[F.x - 6, F.z - 6]], true);
-  ok(!far.n && /touch/.test(far.tiles[0].reason || ''), 'a field must touch the farm or its fields');
-  const hf = homeField(F);
-  ok(hf.length === 2 && hf.every(([x, z]) => tw.buildingAt[tw.idx(x, z)] === F.id && front(x + 0.5, z + 0.5) < 0), 'its own field is the back row of its plot, one farmland with the fields beyond');
-  const ahead = ring.find(([x, z]) => aheadOf(F, x, z) > 0 && tw.inBounds(x, z) && !tw.roads[tw.idx(x, z)] && tw.buildingAt[tw.idx(x, z)] < 0 && !tw.terrain.isWater(x, z) && tw.terrain.slope(x, z) <= 0.6);
-  ok(!ahead || /behind and beside/.test(tw._fieldBlock(F, ...ahead) || ''), 'fields go behind and beside a farm, not between it and the road');
-  const m0 = tw.money, plan = tw.planFields(F.id, ring, true), r1 = tw.setFields(F.id, ring, true);
+  const wk = workArea(F);
+  ok((wk[1] + wk[3]) / 2 < 0 && wk[4] && Math.abs(wk[4].a - F.a) < 1e-9, 'its fields lie behind the farmyard, away from the road, in its own frame');
+  // squares of land round it, lined up with the farm: beside it and behind it
+  const P = ownPlot(F), lattice = [];
+  for (let j = -6; j <= 3; j++) for (let i = -6; i <= 6; i++) { const [x, z] = toWorld(P, i * 1 + 0.5 * ((F.w + 1) % 2), j - 0.5 + 0.5 * (F.d % 2)); lattice.push([x, z, F.a]); }
+  const [bx, bz] = toWorld(P, 0, -F.d / 2 - 6.5);
+  const far = tw.planFields(F.id, [[bx, bz, F.a]], true);
+  ok(!far.n && /touch/.test(far.tiles[0].reason || ''), `a field must touch the farm or its fields (${far.tiles[0].reason})`);
+  const hf = homeField(F), [hx, hz] = toLocal(P, hf.cx, hf.cz);
+  ok(hf && Math.abs(hx) < 1e-6 && hz < 0 && Math.abs(hf.hw * 2 - F.w) < 1e-6 && tw.buildingAt(hf.cx, hf.cz) === F, 'its own field is the back of its plot, one farmland with the fields beyond');
+  const ahead = lattice.find(([x, z]) => aheadOf(F, x, z) > 0.5 && !tw.roadAt(x, z, 0.7) && !tw.buildingAt(x, z) && !tw.waterAt(x, z));
+  ok(!ahead || /behind and beside/.test(tw._fieldBlock(F, rect(ahead[0], ahead[1], F.a, 0.5, 0.5)) || ''), 'fields go behind and beside a farm, not between it and the road');
+  const m0 = tw.money, plan = tw.planFields(F.id, lattice, true), r1 = tw.setFields(F.id, lattice, true);
   ok(r1.ok && F.fields === CONFIG.FIELD_MAX[0] && tw.money === m0 - plan.cost && plan.cost >= CONFIG.FIELD_MAX[0] * CONFIG.FIELD_COST, `a farmstead ploughs up to ${CONFIG.FIELD_MAX[0]} fields at $${CONFIG.FIELD_COST} each ($${plan.cost})`);
+  ok(tw.fieldsOf(F.id).every(f => Math.abs(wrapAngle(f.a - F.a)) < 0.002), 'its fields lie at the farm\'s own angle');
   ok(capOf(F, 'jobs') === Math.round(BUILDINGS.farm.levels[0].jobs + F.fields * CONFIG.FIELD_JOBS), `each field adds work (${capOf(F, 'jobs')} jobs)`);
   tw.upgradeBuilding(F.id);
-  ok(tw.setFields(F.id, ring, true).ok && F.fields === CONFIG.FIELD_MAX[1], `a farm works more (${F.fields})`);
-  const fi = tw.fieldTiles.get(F.id)[0], fxz = [fi % tw.N, (fi / tw.N) | 0];
-  ok(!tw.checkBuild('house', ...fxz).ok && !tw.checkRoad(...fxz, 1).ok, 'fields block buildings and roads');
+  ok(tw.setFields(F.id, lattice, true).ok && F.fields === CONFIG.FIELD_MAX[1], `a farm works more (${F.fields})`);
+  // a field turned askew, touching the others: fine too
+  const f0 = tw.fieldsOf(F.id)[0];
+  ok(!tw.checkBuild('house', f0.x, f0.z, { a: f0.a }).ok && !tw.checkRoad([[f0.x - 0.45, f0.z], [f0.x + 0.45, f0.z]], 1).ok, 'fields block buildings and roads');
   const n1 = F.fields;
-  ok(tw.bulldoze(...fxz).ok && F.fields === n1 - 1 && tw.fields[fi] === -1, 'the bulldozer takes a field out');
+  ok(tw.bulldoze(f0.x, f0.z).ok && F.fields === n1 - 1 && !tw.parcels.has(f0.id), 'the bulldozer takes a field out');
+  // a field at an angle of its own, touching the back of the farm
+  tw.setFields(F.id, tw.fieldsOf(F.id).map(f => [f.x, f.z, f.a]), false);
+  const [kx, kz] = toWorld(P, 0, -F.d / 2 - 0.5 * (Math.cos(0.4) + Math.sin(0.4)) - 0.02);
+  const skew = tw.setFields(F.id, [[kx, kz, F.a + 0.4]], true);
+  ok(skew.ok && F.fields === 1 && Math.abs(wrapAngle(tw.fieldsOf(F.id)[0].a - F.a - 0.4)) < 0.002, `a field can lie at an angle of its own, where it touches the farmland (${skew.reason || 'ploughed'})`);
+  tw.setFields(F.id, lattice, true);
   // what it produces: jobs and earnings
   const sim = new Sim({ world: tw, speed: 0, agents: { relocate() {}, depart() {}, arrive() {} }, _ev: {}, on(e, f) { (this._ev[e] ||= []).push(f); }, emit(e, d) { for (const f of this._ev[e] || []) f(d); } });
   const j0 = capOf(F, 'jobs');
@@ -843,14 +964,16 @@ const placePair = (tw, ta, tb) => {
   ok(perWorker > BUILDINGS.farm.levels[1].income * 1.4, `each shepherd earns more ($${perWorker.toFixed(1)} a worker)`);
   // saved and loaded
   const back = deserialize(JSON.parse(JSON.stringify(serialize(tw))));
-  const FB = back.buildings.get(F.id);
-  ok(FB.fields === F.fields && back.fields.every((v, i) => v === tw.fields[i]) && FB.flavor === 'sheep', 'saves keep the fields and what the farm keeps');
+  const FB = back.buildings.get(F.id), sig = (W) => [...W.parcels.values()].map(f => `${f.farm}:${f.x},${f.z},${f.a}`).sort().join(' ');
+  ok(FB.fields === F.fields && sig(back) === sig(tw) && FB.flavor === 'sheep', 'saves keep the fields, where and how they lie, and what the farm keeps');
   // a homestead: a cottage beside it joined on
   let cot = null;
-  for (let dz = -1; dz <= 2 && !cot; dz++) for (let dx = -1; dx <= 2 && !cot; dx++) {
-    if ((dx === -1 || dx === 2) === (dz === -1 || dz === 2)) continue;
-    const c = tw.checkBuild('house', F.x + dx, F.z + dz);
-    if (c.ok) { const p = tw.placeBuilding('house', F.x + dx, F.z + dz, { instant: true }); if (p.ok) cot = p.building; }
+  for (const [lx, lz] of [[1.5, 0.5], [-1.5, 0.5], [1.5, -0.5], [-1.5, -0.5]]) {
+    const [x, z] = toWorld(ownPlot(F), lx, lz);
+    // (the field there makes way)
+    for (const f of tw.fieldsOf(F.id)) if (rectsOverlap(f.rect, rect(x, z, F.a, 0.5, 0.5), 0.004)) tw.setFields(F.id, [[f.x, f.z, f.a]], false);
+    const p = tw.placeBuilding('house', x, z, { instant: true, a: F.a });
+    if (p.ok) { cot = p.building; break; }
   }
   if (cot) {
     sim.makeFamily(cot, 3);
@@ -861,77 +984,67 @@ const placePair = (tw, ta, tb) => {
   } else ok(false, 'no room for a cottage beside the farm');
   // a farm turned orchard keeps its fields, planted with fruit trees
   {
-    let G = null;
-    for (let r = 6; r < 22 && !G; r++) for (let dz = -r; dz <= r && !G; dz++) for (let dx = -r; dx <= r && !G; dx++) {
-      if (Math.max(Math.abs(dx), Math.abs(dz)) !== r || Math.max(Math.abs(th.x + dx - F.x), Math.abs(th.z + dz - F.z)) < 10) continue;
-      const c = tw.checkBuild('farm', th.x + dx, th.z + dz);
-      if (!c.ok || !c.access.some(a => a.conn)) continue;
-      const p = tw.placeBuilding('farm', th.x + dx, th.z + dz, { instant: true });
-      if (p.ok) G = p.building;
-    }
+    const G = near(tw, 'farm', th, { r: 24, test: (x, z, a) => Math.hypot(x - F.x, z - F.z) >= 10 && roomy(x, z, a) });
     if (G) {
       tw.upgradeBuilding(G.id);
-      const near = [];
-      for (let z = G.z - 4; z < G.z + 6; z++) for (let x = G.x - 4; x < G.x + 6; x++) near.push([x, z]);
-      tw.setFields(G.id, near, true);
+      const GP = ownPlot(G), lat = [];
+      for (let j = -4; j <= 2; j++) for (let i = -4; i <= 4; i++) { const [x, z] = toWorld(GP, i + 0.5, j - 0.5); lat.push([x, z]); }
+      tw.setFields(G.id, lat, true);
       const n0 = G.fields, u = tw.upgradeBuilding(G.id, 'orchard');
-      ok(u.ok && G.type === 'orchard' && n0 > 0 && G.fields === n0 && tw.fieldMax(G) >= n0 && !homeField(G).length && !tw.setProduce(G.id, 'sheep').ok, `a farm turned orchard keeps its ${n0} fields (as fruit trees), and grows only fruit`);
+      ok(u.ok && G.type === 'orchard' && n0 > 0 && G.fields === n0 && tw.fieldMax(G) >= n0 && !homeField(G) && !tw.setProduce(G.id, 'sheep').ok, `a farm turned orchard keeps its ${n0} fields (as fruit trees), and grows only fruit`);
     } else ok(false, 'no room for a second farm');
   }
   // gone with the farm
   const id = F.id;
   tw.removeBuilding(id, 0);
-  ok(!tw.fields.some(v => v === id), 'its fields go with the farm');
-}
+  ok(![...tw.parcels.values()].some(f => f.farm === id), 'its fields go with the farm');
+});
 
 // 3d0c. shopping trips spread over the trades the town sells: everyday food
 // most, the town's only draper still gets the clothes shopping, a trade sold
 // only far from home is shopped for less; offices take no shoppers, and a
 // shop with homes above sells its own trade
-{
+await block('3d0c shopping', async () => {
   const { tradesOf, TRADES } = await import('../src/defs.js');
   const { visitKind } = await import('../src/sim/agents.js');
   const tw = World.createNew({ N: 48, seed: 35, name: 'Shopton' });
   tw.setSandbox({ infiniteMoney: true, unlockAll: true, instantBuild: true });
-  const [home, mk] = placePair(tw, 'house', 'market');
-  const near = ['bakery', 'butcher', 'draper'].map(t => placePair(tw, t, 'garden')[0]);
-  const far = (() => {
-    for (let z = tw.N - 6; z > 3; z--) for (let x = tw.N - 6; x > 3; x--) {
-      const d = Math.abs(x - home.x) + Math.abs(z - home.z);
-      if (d < 18 || d > 26 || !tw.checkRoad(x, z - 1, 1).ok) continue;
-      if (tw.buildingOn(x, z) || tw.roadAt(x, z) || tw.terrain.isWater(x, z)) continue;
-      tw.placeRoads([[x, z - 1]], 1);
-      const r = tw.placeBuilding('bank', x, z, { instant: true });
-      if (r.ok) return r.building;
-    }
-    return null;
-  })();
-  const shops = [mk, ...near, far].filter(Boolean);
+  const [home, mk] = pair(tw, 'house', 'market');
+  const nearby = ['bakery', 'butcher', 'draper'].map(t => pair(tw, t, 'garden', { near: home })[0]);
+  let far = null;
+  for (let k = 0; k < 40 && !far; k++) {
+    const t = (k * 2.4) % (2 * PI), d = 18 + (k % 8);
+    const at = { x: home.x + d * Math.sin(t), z: home.z + d * Math.cos(t) };
+    if (at.x < 4 || at.z < 4 || at.x > tw.N - 4 || at.z > tw.N - 4) continue;
+    const b = lot(tw, 'bank', { near: at });
+    if (b && Math.hypot(b.x - home.x, b.z - home.z) >= 16 && Math.hypot(b.x - home.x, b.z - home.z) <= 28) far = b;
+    else if (b) tw.removeBuilding(b.id, 0);
+  }
+  const shops = [mk, ...nearby, far].filter(Boolean);
   const A = { world: tw, _nearest: Agents.prototype._nearest };
   const n = 6000, got = new Map();
   for (let i = 0; i < n; i++) { const id = Agents.prototype._shopFor.call(A, { home: home.id }, shops); got.set(id, (got.get(id) || 0) + 1); }
   const share = (b) => (got.get(b.id) || 0) / n;
-  const [bak, but, dra] = near;
+  const [bak, but, dra] = nearby;
   const pct = (b) => `${Math.round(share(b) * 100)}%`;
-  ok(shops.every(b => share(b) > 0), `every trade gets shoppers (market ${pct(mk)}, bakery ${pct(bak)}, butcher ${pct(but)}, draper ${pct(dra)}${far ? `, a bank ${Math.abs(far.x - home.x) + Math.abs(far.z - home.z)} tiles off ${pct(far)}` : ''})`);
+  ok(shops.every(b => share(b) > 0), `every trade gets shoppers (market ${pct(mk)}, bakery ${pct(bak)}, butcher ${pct(but)}, draper ${pct(dra)}${far ? `, a bank ${Math.hypot(far.x - home.x, far.z - home.z).toFixed(0)} units off ${pct(far)}` : ''})`);
   ok(share(mk) > share(bak) && share(bak) > share(but) && share(but) > share(dra) && share(dra) > 0.05, 'everyday trades are shopped for most, clothes less, but the lone draper still gets its share');
   ok(!far || share(far) < 0.5 * TRADES.banking.often / TRADES.clothes.often * share(dra), 'a trade only sold far from home is shopped for less');
   ok(visitKind(BUILDINGS.offices) === null && !tradesOf({ type: 'offices' }).length, 'offices take no shoppers');
   ok(tradesOf({ type: 'shophouse', flavor: 'butcher' }).join() === 'meat' && tradesOf({ type: 'deptstore' }).includes('clothes') && !tradesOf({ type: 'deptstore' }).includes('banking'), 'a shophouse sells its own trade, a department store every trade but banking');
-}
+});
 
 // 3d0d. somewhere to play: a home with children and a play area in reach is
 // happier for it, one without children isn't asked, and children mostly
 // head for somewhere to play
-{
+await block('3d0d play', async () => {
   const tw = World.createNew({ N: 48, seed: 37, name: 'Playford' });
   tw.setSandbox({ infiniteMoney: true, unlockAll: true, instantBuild: true });
-  const [home, pg] = placePair(tw, 'house', 'playground');
-  const [other, gd] = placePair(tw, 'house', 'garden');
+  const [home, pg] = pair(tw, 'house', 'playground');
+  const [other, gd] = pair(tw, 'house', 'garden');
   const kid = { id: tw.newId(), first: 'Pip', last: 'Swing', age: 'child', years: 8, edu: 0, home: home.id, job: null, look: 12345, mood: 60 };
   tw.residents.set(kid.id, kid); home.residents.push(kid.id);
-  const tg = { world: tw, speed: 0, _ev: {}, on(e, f) { (this._ev[e] ||= []).push(f); }, emit(e, d) { for (const f of this._ev[e] || []) f(d); } };
-  const sim = new Sim(tg);
+  const sim = new Sim(listen(tw));
   const play = (b) => { sim.recompute(); sim._happiness(); const p = b.factors.parts.find(q => q[0] === 'play'); return p ? p[1] : null; };
   ok(play(home) === 4 && play(other) === null, 'a home with a child beside a play area gets +4 for somewhere to play; a home without children isn\'t asked');
   const A = { world: tw, _nearest: Agents.prototype._nearest, _shopFor: Agents.prototype._shopFor, _places: Agents.prototype._places, _candidates: (pred) => [...tw.buildings.values()].filter(b => pred(BUILDINGS[b.type], b)) };
@@ -940,27 +1053,26 @@ const placePair = (tw, ta, tb) => {
   ok(outings > 100 && toPlay / outings > 0.6, `children mostly head for somewhere to play (${Math.round((toPlay / outings) * 100)}% of ${outings} outings to the play area, the rest to the garden)`);
   tw.removeBuilding(pg.id, 0);
   ok(play(home) === 0, 'without the play area the home misses it');
-}
+});
 
 // 3d1a. taking the land beside or behind a building leaves it where it
 // stood: same place, same turn, same floor, before and after a save (which
 // rounds the ground heights a little)
-{
+await block('3d1a taking land stays put', async () => {
   const tw = World.createNew({ N: 48, seed: 39, name: 'Stayput' });
   tw.setSandbox({ infiniteMoney: true, unlockAll: true, instantBuild: true });
-  const P = placePair(tw, 'bakery', 'flowers');
-  const spot = { x: P[0].x, z: P[0].z };
-  tw.removeBuilding(P[0].id, 0); tw.removeBuilding(P[1].id, 0);
+  const B0 = lot(tw, 'bakery', { left: 1.3, right: 1.3, back: 1.3 });
+  const spot = { x: B0.x, z: B0.z, a: B0.a };
+  tw.removeBuilding(B0.id, 0);
   // where its front door is in the world, from its model
   const doorAt = (b) => {
-    const m = buildModel(b), j = m.jitter, d = m.door, th = (b.rot * Math.PI) / 2 + j.yaw;
-    const cx = b.x + fw(b) / 2 + j.ox, cz = b.z + fd(b) / 2 + j.oz;
-    return [cx + d.x * Math.cos(th) + d.z * Math.sin(th), cz - d.x * Math.sin(th) + d.z * Math.cos(th), b.baseY];
+    const d = buildModel(b).door, th = b.a;
+    return [b.x + d.x * Math.cos(th) + d.z * Math.sin(th), b.z - d.x * Math.sin(th) + d.z * Math.cos(th), b.baseY];
   };
   const tried = [], moved = [];
   for (let k = 0; k < 4; k++) {
     for (const variant of [16, 48]) {   // both ends a seed would pick
-      const r = tw.placeBuilding('bakery', spot.x, spot.z, { instant: true, variant });
+      const r = tw.placeBuilding('bakery', spot.x, spot.z, { instant: true, variant, a: spot.a });
       if (!r.ok) continue;
       const b = r.building, before = doorAt(b);
       const opt = tw.expandOptions(b).find(o => o.dir === k && o.kind === 'land');
@@ -970,63 +1082,58 @@ const placePair = (tw, ta, tb) => {
         const loaded = doorAt(w2.buildings.get(b.id));
         const off = Math.max(...before.map((v, i) => Math.max(Math.abs(v - after[i]), Math.abs(v - loaded[i]))));
         tried.push(`${opt.where} v${variant}`);
-        if (off > 1e-3) moved.push(`${opt.where} v${variant} by ${off.toFixed(3)}`);
+        if (off > 2e-3) moved.push(`${opt.where} v${variant} by ${off.toFixed(3)}`);
       }
       tw.removeBuilding(b.id, 0);
     }
   }
-  ok(tried.length >= 2 && !moved.length, `taking land leaves the building where it stood (${tried.join(', ')})${moved.length ? ': moved ' + moved.join('; ') : ''}`);
-}
+  ok(tried.length >= 4 && !moved.length, `taking land leaves the building where it stood (${tried.join(', ')})${moved.length ? ': moved ' + moved.join('; ') : ''}`);
+});
 
 // 3d1b. ...and where the street ends beside it, the grown plot doesn't come
-// forward over the neighbour in front of its new tile (only the building
+// forward over the neighbour in front of its new land (only the building
 // itself does, over its own street)
-{
+await block('3d1b street end', async () => {
   const { auditTown } = await import('./audit.js');
   const tw = World.createNew({ N: 48, seed: 41, name: 'Streetend' });
   tw.setSandbox({ infiniteMoney: true, unlockAll: true, instantBuild: true });
-  const free = (x, z) => tw.inBounds(x, z) && !tw.buildingOn(x, z) && !tw.roadAt(x, z) && !tw.terrain.isWater(x, z);
-  let A = null, C = null;
-  for (let z = 4; z < tw.N - 4 && !A; z++) for (let x = 4; x < tw.N - 4 && !A; x++) {
-    // a street ending at (x, z - 1), the bakery behind its last tile, and a
-    // neighbour on the tile past the end that faces another street
-    if (![[x - 2, z - 1], [x - 1, z - 1], [x, z - 1], [x + 1, z - 2]].every(([a, c]) => tw.roadAt(a, c) || tw.checkRoad(a, c, 1).ok)) continue;
-    if (![[x, z], [x + 1, z], [x + 1, z - 1]].every(([a, c]) => free(a, c))) continue;
-    if (Math.abs(tw.terrain.tileMax(x, z) - tw.terrain.tileMin(x + 1, z)) > 0.6) continue;
-    tw.placeRoads([[x - 2, z - 1], [x - 1, z - 1], [x, z - 1]], 1); tw.placeRoads([[x + 1, z - 2]], 1);
-    const a = tw.placeBuilding('bakery', x, z, { instant: true });
-    let c = null;
-    for (let k = 0; k < 4 && a.ok && !(c && c.ok && c.building.rot === 2); k++) { if (c && c.ok) tw.removeBuilding(c.building.id, 0); c = tw.placeBuilding('bakery', x + 1, z - 1, { instant: true, accessIndex: k }); }
-    if (a.ok && c && c.ok && a.building.rot === 2 && c.building.rot === 2) { A = a.building; C = c.building; }
-    else for (const P of [a, c]) if (P && P.ok && tw.buildings.has(P.building.id)) tw.removeBuilding(P.building.id, 0);
-  }
-  const opt = A && tw.expandOptions(A).find(o => o.kind === 'land' && o.x === A.x + 1 && o.z === A.z);
+  const o = openBox(tw, 7, 5, { x: 14, z: 14 });
+  levelBox(tw, o.x, o.z, 7, 5);
+  // a street along z = Z ending at X + 0.5, the bakery behind its end; a
+  // neighbour past the end that faces another street
+  const X = o.x + 3, Z = o.z + 2;
+  street(tw, [[o.x + 0.3, Z], [X + 0.5, Z]]);
+  street(tw, [[X + 0.75, Z - 1], [X + 3, Z - 1]]);
+  const a = tw.placeBuilding('bakery', X, Z + SETBACK + 0.5, { instant: true, a: PI });
+  const c = tw.placeBuilding('bakery', X + 1.25, Z, { instant: true, a: PI });
+  const A = a.ok ? a.building : null, C = c.ok ? c.building : null;
+  ok(A && C, `a bakery behind the street's end and one past it (${a.reason || c.reason || 'both built'})`);
+  const opt = A && tw.expandOptions(A).find(q => q.kind === 'land' && Math.hypot(midOf(q.rects[0])[0] - (X + 1), midOf(q.rects[0])[1] - (Z + 1)) < 0.1);
   const grew = opt && tw.expandBuilding(A.id, opt.dir, 'land').ok;
   const faults = [];
   auditTown(tw, (m) => faults.push(m));
-  ok(grew && !faults.some(m => /overlap/.test(m)) && (A.front || 0) === 0 && A.ownFront > 0, `a plot grown past the end of its street keeps behind the neighbour in front of its new tile (front ${A && A.front}, the building's own ${A && A.ownFront})${faults.length ? ': ' + faults.join('; ') : ''}`);
-}
+  ok(grew && !faults.some(m => /overlap/.test(m)) && (A.front || 0) === 0 && A.ownFront > 0, `a plot grown past the end of its street keeps behind the neighbour in front of its new land (front ${A && A.front}, the building's own ${A && A.ownFront})${faults.length ? ': ' + faults.join('; ') : ''}`);
+});
 
 // 3d1. taking a neighbouring plot: the land first (no builders, the building
 // stays its size), then what to build across it
-{
+await block('3d1 neighbouring plot', async () => {
   const { sizeK, sizeKFor } = await import('../src/world/world.js');
-  const { CONFIG } = await import('../src/config.js');
+  const { CLEAR_COST } = await import('../src/config.js');
   w.setSandbox({ infiniteMoney: true });
   let done = null;
   for (const b of [...w.buildings.values()]) {
     if (b.type !== 'house' || b.con) continue;
     const opt = w.expandOptions(b).find(o => o.kind === 'land') || w.expandOptions(b).find(o => o.kind === 'takeover');
     if (!opt) continue;
-    const cap0 = b.level >= 0 ? (b.residents.length, null) : null; void cap0;
     const r = w.expandBuilding(b.id, opt.dir, opt.kind);
     if (r.ok) { done = { b, opt }; break; }
   }
-  ok(done && fw(done.b) * fd(done.b) === 2 && !done.b.con && done.b.spare && sizeK(done.b) === 1, `a house takes a neighbouring plot (${done ? done.opt.kind : 'none'}) as land only: no builders, still its own size`);
+  ok(done && done.b.w * done.b.d === 2 && !done.b.con && done.b.spare && sizeK(done.b) === 1, `a house takes a neighbouring plot (${done ? done.opt.kind : 'none'}) as land only: no builders, still its own size`);
   if (done) {
-    const b = done.b;
-    ok(w.buildingOn(done.opt.x, done.opt.z) === b, 'the new plot belongs to it');
-    ok(done.opt.kind !== 'land' || done.opt.cost === CONFIG.PLOT_PRICE + w.treeCount[w.idx(done.opt.x, done.opt.z)] * 3, `an empty plot costs the price of the land ($${done.opt.cost})`);
+    const b = done.b, [mx, mz] = midOf(done.opt.rects[0]);
+    ok(w.buildingAt(mx, mz) === b, 'the new plot belongs to it');
+    ok(done.opt.kind !== 'land' || (done.opt.cost >= CONFIG.PLOT_PRICE && (done.opt.cost - CONFIG.PLOT_PRICE) % CLEAR_COST === 0), `an empty plot costs the price of the land, and of clearing its trees ($${done.opt.cost})`);
     const opts = w.upgradeOptions(b), big = opts.filter(o => o.large).map(o => o.type);
     ok(big.length >= 2 && opts.some(o => o.extend), `then it can be rebuilt bigger (${big.join(', ')}) or extended`);
     const cap0 = capOf(b, 'housing'), chk = w.upgradeCheck(b, 'extend');
@@ -1037,23 +1144,29 @@ const placePair = (tw, ta, tb) => {
   }
   w.setSandbox({ infiniteMoney: false });
   w.money = 1e6;
-}
+});
+w.setSandbox({ infiniteMoney: false });
+w.money = 1e6;
 
 // 3d1a. land deals beside street corners: a plot never reaches into a third
-// plot, whichever order the deals and the buildings come in
-{
-  // a small flat town: a street along z = 6, plus the road tiles given
-  const back = Array.from({ length: 12 }, (_, x) => [x, 3]);
-  const town = (roads, builds) => {
-    const tw = new World(12, 1, { isWater: () => false, tileMin: () => 0, tileMax: () => 0 });
+// plot, whichever order the deals and the buildings come in (laid out as
+// plots in rows, a unit square each: (x, z) the square, its middle at
+// x + 0.5, z + 0.5)
+await block('3d1a land deals by corners', async () => {
+  const base = World.createNew({ N: 40, seed: 3, name: 'Dealby' });
+  const o = openBox(base, 13, 9, { x: 8, z: 8 });
+  const town = (spurs, builds, back = true) => {
+    const tw = deserialize(JSON.parse(JSON.stringify(serialize(base))));
     tw.setSandbox({ infiniteMoney: true, unlockAll: true, instantBuild: true });
-    for (let x = 0; x < 12; x++) tw.roads[tw.idx(x, 6)] = 1;
-    for (const [x, z] of roads) tw.roads[tw.idx(x, z)] = 1;
-    tw.entry = { x: 0, z: 6 };
-    tw.updateRoadNetwork();
+    levelBox(tw, o.x, o.z, 13, 9);
+    const T = (x, z) => [o.x + x + 0.5, o.z + z + 0.5];
+    street(tw, [T(-0.2, 6), T(11.2, 6)]);
+    if (back) street(tw, [T(-0.2, 3), T(11.2, 3)]);
+    // a spur up from the street to just short of the plot it ends at
+    for (const [x, z] of spurs) street(tw, [T(x, 6), [T(x, z)[0], T(x, z)[1] - 0.23]]);
     const at = {};
-    for (const [k, type, x, z] of builds) at[k] = tw.placeBuilding(type, x, z).building;
-    return { tw, at };
+    for (const [k, type, x, z] of builds) { const p = tw.placeBuilding(type, ...T(x, z)); at[k] = p.ok ? p.building : null; }
+    return { tw, at, T };
   };
   const overlapsIn = (tw) => {
     const found = [];
@@ -1064,54 +1177,44 @@ const placePair = (tw, ta, tb) => {
   // a villa between a cottage beside it and one behind it buys from only one
   // of them, so a chapel can still go on the corner plot between the two
   {
-    const { tw, at } = town(back, [['v', 'villa', 5, 5], ['a', 'house', 4, 5], ['b', 'house', 5, 4]]);
+    const { tw, at, T } = town([], [['v', 'villa', 5, 5], ['a', 'house', 4, 5], ['b', 'house', 5, 4]]);
     tw.tryEncroach(at.v);
-    const c = tw.placeBuilding('chapel', 4, 4);
-    ok(axes(at.v).size === 1 && c.ok && !overlapsIn(tw).length, `a villa buys garden on one axis only (${[...axes(at.v)]}) and the corner plot stays free ${overlapsIn(tw).join('; ')}`);
+    const c = tw.placeBuilding('chapel', ...T(4, 4));
+    ok(at.v && at.a && at.b && axes(at.v).size === 1 && c.ok && !overlapsIn(tw).length, `a villa buys garden on one axis only (${[...axes(at.v)]}) and the corner plot stays free ${c.reason || ''} ${overlapsIn(tw).join('; ')}`);
   }
   // a cottage between two villas sells a strip to one of them only
   {
-    const { tw, at } = town(back, [['h', 'house', 5, 5], ['a', 'villa', 4, 5], ['b', 'villa', 5, 4]]);
+    const { tw, at } = town([], [['h', 'house', 5, 5], ['a', 'villa', 4, 5], ['b', 'villa', 5, 4]]);
     tw.tryEncroach(at.a); tw.tryEncroach(at.b);
     ok((at.h.leases || []).length === 1 && !overlapsIn(tw).length, `a cottage sells one strip at most (${(at.h.leases || []).length}) ${overlapsIn(tw).join('; ')}`);
   }
-  // a villa facing the street with a strip of the garden beside it: its front
-  // does not run into a building on the street corner next to it
+  // a villa facing a spur, with a strip of the cottage's garden beside it
+  // (the cottage facing a spur of its own, square to the villa): neither the
+  // plot nor its front runs into a building on the corner next to it
   {
-    // villa (5,4) faces the spur at (5,5); cottage (6,4) faces the spur at (7,4)
-    const spurs = [[5, 5], [7, 4], [7, 5]];
-    const a = town(spurs, [['v', 'villa', 5, 4], ['h', 'house', 6, 4]]);
+    const spurs = [[5, 5], [7, 4]];
+    const a = town(spurs, [['v', 'villa', 5, 4], ['h', 'house', 6, 4]], false);
     a.tw.tryEncroach(a.at.v);
-    const kept = a.at.v.front > 0 && (a.at.v.leases || []).length === 1;
-    a.tw.placeBuilding('market', 6, 5);
-    const b = town(spurs, [['v', 'villa', 5, 4], ['h', 'house', 6, 4], ['m', 'market', 6, 5]]);
+    const turned = a.at.h && Math.abs(Math.abs(wrapAngle(a.at.h.a - a.at.v.a)) - PI / 2) < 0.01;
+    const sold = (a.at.v.leases || []).length === 1;
+    a.tw.placeBuilding('market', ...a.T(6, 5));
+    const b = town(spurs, [['v', 'villa', 5, 4], ['h', 'house', 6, 4], ['m', 'market', 6, 5]], false);
     b.tw.tryEncroach(b.at.v);
-    ok(kept && (b.at.v.leases || []).length === 1 && !overlapsIn(a.tw).length && !overlapsIn(b.tw).length,
+    ok(turned && sold && (b.at.v.leases || []).length === 1 && !overlapsIn(a.tw).length && !overlapsIn(b.tw).length,
       `a villa with a strip beside it keeps clear of the corner plot (front ${a.at.v.front} / ${b.at.v.front}) ${[...overlapsIn(a.tw), ...overlapsIn(b.tw)].join('; ')}`);
   }
-}
+});
 
 // 3d1e. single-family homes take one family (a few in the big houses), and
 // newcomers to them come as one family sized to the house; a home with more
 // households than it takes (an old save) lets the newest one move on
-{
+await block('3d1e households', async () => {
   const { householdCap } = await import('../src/world/world.js');
   const { householdsIn } = await import('../src/sim/people.js');
   const sim = game.sim;
   w.setSandbox({ infiniteMoney: true, unlockAll: true, instantBuild: true });
-  const placeNear = (type) => {
-    const th = [...w.buildings.values()].find(b => b.type === 'townhall');
-    for (let r = 2; r < 20; r++) for (let dz = -r; dz <= r; dz++) for (let dx = -r; dx <= r; dx++) {
-      if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
-      const c = w.checkBuild(type, th.x + dx, th.z + dz);
-      if (!c.ok || !c.access.some(a => a.conn)) continue;
-      const p = w.placeBuilding(type, th.x + dx, th.z + dz, { instant: true });
-      if (p.ok) return p.building;
-    }
-    return null;
-  };
   const evict = (b) => { for (const id of b.residents) w.residents.delete(id); b.residents = []; };
-  const fh = placeNear('house');
+  const fh = near(w, 'house', null, { r: 20 });
   fh.level = 1;   // a Family House: room for 6, one household
   const sizes = [];
   for (let k = 0; k < 30; k++) { sizes.push(sim.makeFamily(fh, capOf(fh, 'housing')).length); evict(fh); }
@@ -1120,24 +1223,24 @@ const placePair = (tw, ta, tb) => {
   ok(householdsIn(w, fh) === 1 && fh.residents.length < capOf(fh, 'housing') && !sim.vacantHomes().includes(fh), 'with a family in, it takes no other household, though it has room');
   ok(householdCap({ type: 'house', level: 0 }) === 1 && householdCap({ type: 'villa', level: 2 }) === 2 && householdCap({ type: 'flats', level: 0 }) === Infinity, 'cottages and villas take one family, a grand manor two, flats any number');
   // an old save: two households in one cottage, and a home with room nearby
-  const c = placeNear('house');
+  const c = near(w, 'house', null, { r: 20 });
   evict(c);
   const lodger = sim.makeFamily(c, 1)[0], other = sim.makeFamily(c, 1)[0];
   lodger.fam = lodger.id; other.fam = other.id;
-  const spare = placeNear('flats');
+  const spare = near(w, 'flats', null, { r: 20 });
   sim.recompute();
   sim._settleHouseholds();
   ok(householdsIn(w, c) === 1 && c.residents.includes(lodger.id) && w.residents.get(other.id).home !== c.id, 'an extra household moves on to a home with room (the newest one)');
   for (const b of [fh, c, spare]) if (b && w.buildings.has(b.id)) { evict(b); w.removeBuilding(b.id, 0); }
-  w.setSandbox({ infiniteMoney: false, unlockAll: false, instantBuild: false });
-  w.money = 1e6;
-}
+});
+w.setSandbox({ infiniteMoney: false, unlockAll: false, instantBuild: false });
+w.money = 1e6;
 
 // 3d1b. a home rebuilt to hold fewer people (a Grand Manor on a double plot
 // becoming a Country Mansion): the households that no longer fit move out
-{
+await block('3d1b fewer people', async () => {
   w.setSandbox({ infiniteMoney: true, unlockAll: true, freeUpgrades: true, instantBuild: true });
-  const b = [...w.buildings.values()].find(b => b.type === 'house' && !b.con && fw(b) * fd(b) === 2);
+  const b = [...w.buildings.values()].find(b => b.type === 'house' && !b.con && b.w * b.d === 2);
   if (b) {
     b.type = 'villa'; b.level = 2;
     const people = () => [...w.residents.values()].filter(r => r.home === b.id);
@@ -1156,30 +1259,25 @@ const placePair = (tw, ta, tb) => {
       `a Grand Manor (${before.length}/${was}) rebuilt as a ${BUILDINGS.mansion.levels[0].name} keeps ${stay.length}/${cap}; ${moved.length} moved house, ${left.length} left (${chk.moveOut} foretold)`);
     ok(!split && moved.every(p => fits(w.buildings.get(p.home))), 'whole households move out, into homes with room');
   } else ok(false, 'no house on a double plot to rebuild');
-  w.setSandbox({ infiniteMoney: false, unlockAll: false, freeUpgrades: false, instantBuild: false });
-  w.money = 1e6;
-}
+});
+w.setSandbox({ infiniteMoney: false, unlockAll: false, freeUpgrades: false, instantBuild: false });
+w.money = 1e6;
 
-// 3d1c. with Great Plots a double plot grows into a 2×2 estate onto the two
-// plots behind it, and can then be rebuilt as its 2×2 counterpart (every
-// ESTATE recipe), at the level it had reached
-{
+// 3d1c. with Great Plots a double plot grows into a 2×2 estate onto the land
+// behind it, and can then be rebuilt as its 2×2 counterpart (every ESTATE
+// recipe), at the level it had reached
+await block('3d1c estates', async () => {
   const { ESTATE, techForLevel } = await import('../src/defs.js');
-  const { sizeK, capOf } = await import('../src/world/world.js');
+  const { sizeK } = await import('../src/world/world.js');
   const tw = World.createNew({ N: 64, seed: 37, name: 'Grangeley' });
   tw.setSandbox({ infiniteMoney: true, instantBuild: true });
   tw.research.done.push('surveying');
   const made = [];
   let gated = null;
   for (const [src, list] of Object.entries(ESTATE)) {
-    let done = false;
-    for (let z = 3; z < tw.N - 5 && !done; z++) for (let x = 3; x < tw.N - 5 && !done; x++) {
-      if (![x, x + 1].every(k => tw.checkRoad(k, z - 1, 1).ok || tw.roadAt(k, z - 1))) continue;
-      if (![[x, z], [x + 1, z], [x, z + 1], [x + 1, z + 1]].every(([a, b]) => tw.inBounds(a, b) && !tw.buildingOn(a, b) && !tw.roadAt(a, b) && !tw.terrain.isWater(a, b))) continue;
-      tw.placeRoads([[x, z - 1], [x + 1, z - 1]], 1);
-      const P = tw.placeBuilding(src, x, z, { w: 2, d: 1, instant: true, ignoreUnlock: true, level: BUILDINGS[src].levels.length - 1 });
-      if (!P.ok) continue;
-      const b = P.building;
+    for (let tries = 0; tries < 3; tries++) {
+      const b = lot(tw, src, { w: 2, d: 1, back: 1.2, opts: { level: BUILDINGS[src].levels.length - 1 } });
+      if (!b) break;
       if (gated === null) { gated = !tw.expandOptions(b).some(o => o.kind === 'estate'); tw.research.done.push('bigplots'); }
       const opt = tw.expandOptions(b).find(o => o.kind === 'estate');
       if (!opt || !tw.expandBuilding(b.id, opt.dir, 'estate').ok) { tw.removeBuilding(b.id, 0); continue; }
@@ -1188,16 +1286,17 @@ const placePair = (tw, ta, tb) => {
       const r = up && tw.upgradeBuilding(b.id, up.type);
       tw.setSandbox({ unlockAll: false, freeUpgrades: false });
       const L = BUILDINGS[b.type].levels[b.level], m = r && r.ok && buildModel(b);
-      if (r && r.ok && b.type === list[0] && fw(b) * fd(b) === 4 && sizeK(b) === 1 && capOf(b, L.housing ? 'housing' : 'jobs') === (L.housing || L.jobs || 0)
+      if (r && r.ok && b.type === list[0] && b.w * b.d === 4 && sizeK(b) === 1 && capOf(b, L.housing ? 'housing' : 'jobs') === (L.housing || L.jobs || 0)
         && b.level === Math.min(BUILDINGS[src].levels.length - 1, BUILDINGS[b.type].levels.length - 1) && !tw.expandOptions(b).length && m.geo.attributes.position.count) {
-        made.push(`${src}→${b.type}`); done = true;
+        made.push(`${src}→${b.type}`);
+        break;
       }
     }
   }
   ok(gated, 'a double plot only grows into a 2×2 estate once Great Plots is researched');
   ok(made.length === Object.keys(ESTATE).length, `every double-plot building grown to 2×2 rebuilds as its estate, at its level (${made.join(', ')})`);
   ok(Object.values(ESTATE).flat().every(t => BUILDINGS[t].estate && techForLevel(t, 0) && BUILDINGS[t].levels.every((_, i) => techForLevel(t, i))), 'every estate level is gated by research');
-}
+});
 
 // 3d1d. parks: every park type looks different from one plot to the next
 // (its own seed) and the same every time it is drawn, keeps its layout as
@@ -1237,125 +1336,114 @@ const placePair = (tw, ta, tb) => {
 // rebuilt as the double-plot park; a double-plot park grows into a 2×2
 // estate taking in the little parks in the way; and with Public Parks a 2×2
 // park grows into 3×3 grounds and those into 4×4, laid out round the park
-// it was (in the corner it stood in), saved and loaded back
-{
+// it was (in the corner it stood in), saved and loaded back. (Laid out in
+// rows of unit plots: T(x, z) the middle of plot x along, z back.)
+await block('3d1e parks grow', async () => {
   const { parkOrigin, GRAND, techForLevel } = await import('../src/defs.js');
   const { runCommand } = await import('../src/commands.js');
-  const { CONFIG } = await import('../src/config.js');
   const tw = World.createNew({ N: 64, seed: 41, name: 'Greenwick' });
   tw.setSandbox({ infiniteMoney: true, instantBuild: true, freeUpgrades: true });
   for (const t of ['surveying', 'joining', 'gardening', 'bigplots', 'parks2']) tw.research.done.push(t);
-  // an open 6×5 block with a street along its front
-  let at = null;
-  for (let z = 3; z < tw.N - 8 && !at; z++) for (let x = 3; x < tw.N - 8 && !at; x++) {
-    let open = true;
-    for (let dz = 0; dz < 5 && open; dz++) for (let dx = 0; dx < 6; dx++) {
-      const tx = x + dx, tz = z + dz;
-      if (tw.buildingOn(tx, tz) || tw.roadAt(tx, tz) || tw.terrain.isWater(tx, tz) || tw.fields[tw.idx(tx, tz)] >= 0 || tw.terrain.tileMax(tx, tz) - tw.terrain.tileMin(x, z) > 0.5) open = false;
-    }
-    if (open && [0, 1, 2, 3, 4, 5].every(dx => tw.checkRoad(x + dx, z + 5, 1).ok)) at = { x, z };
-  }
-  const { x, z } = at;
-  tw.placeRoads([0, 1, 2, 3, 4, 5].map(dx => [x + dx, z + 5]), 1);
-  const put = (type, px, pz, o = {}) => tw.placeBuilding(type, px, pz, { instant: true, ignoreUnlock: true, ...o }).building;
-  // a pond takes the empty plot beside it and becomes a lake garden
-  const pond = put('pond', x + 5, z + 4);
-  const land = tw.expandOptions(pond).find(o => o.kind === 'land' && o.x === x + 5);
-  ok(land && !tw.expandOptions(pond).some(o => o.kind !== 'land'), 'a little park can take the empty plot beside it (and only empty land)');
+  // an open 6 × 5 block with a street along its front (row 5)
+  const o = openBox(tw, 7, 7, { x: 20, z: 20 });
+  levelBox(tw, o.x, o.z, 7, 7);
+  const T = (x, z) => [o.x + 1 + x, o.z + 1 + z];
+  street(tw, [[o.x + 0.3, T(0, 5)[1]], [o.x + 6.7, T(0, 5)[1]]]);
+  const put = (type, x, z, opt = {}) => { const p = tw.placeBuilding(type, ...T(x, z), { instant: true, ignoreUnlock: true, a: 0, ...opt }); if (!p.ok) throw new Error(`${type} at ${x},${z}: ${p.reason}`); return p.building; };
+  const nearPt = (pts, [x, z]) => Math.hypot(midOf(pts)[0] - x, midOf(pts)[1] - z) < 0.1;
+  // a pond takes the empty plot behind it and becomes a lake garden
+  const pond = put('pond', 5, 4);
+  const land = tw.expandOptions(pond).find(q => q.kind === 'land' && nearPt(q.rects[0], T(5, 3)));
+  ok(land && !tw.expandOptions(pond).some(q => q.kind !== 'land'), 'a little park can take the empty plot beside it (and only empty land)');
   tw.expandBuilding(pond.id, land.dir, 'land');
   const up = tw.upgradeOptions(pond);
-  ok(up.some(o => o.type === 'lakepark' && o.large) && !up.some(o => o.extend), `...and be rebuilt across the double plot as a lake garden, not extended as it is (${up.map(o => o.type + (o.extend ? '+' : '')).join(', ')})`);
-  ok(tw.upgradeBuilding(pond.id, 'lakepark').ok && pond.type === 'lakepark' && fw(pond) * fd(pond) === 2 && !pond.spare, 'the pond is a lake garden on its double plot');
+  ok(up.some(q => q.type === 'lakepark' && q.large) && !up.some(q => q.extend), `...and be rebuilt across the double plot as a lake garden, not extended as it is (${up.map(q => q.type + (q.extend ? '+' : '')).join(', ')})`);
+  ok(tw.upgradeBuilding(pond.id, 'lakepark').ok && pond.type === 'lakepark' && pond.w * pond.d === 2 && !pond.spare, 'the pond is a lake garden on its double plot');
   // a garden and a rose garden join into a park that keeps its roses...
-  const g1 = put('garden', x, z + 4), g2 = put('rosegarden', x + 1, z + 4);
+  const g1 = put('garden', 0, 4), g2 = put('rosegarden', 1, 4);
   const park = tw.mergeBuildings(g1.id, g2.id).building;
   ok(park && park.type === 'park' && park.flavor === 'rosegarden', `a garden and a rose garden join into a park laid out round the roses (${park && park.flavor})`);
   // ...which grows onto the plots behind it, taking in the pond there
-  const duck = put('pond', x, z + 3), stat = put('statue', x + 2, z + 2);
-  const est = tw.expandOptions(park).find(o => o.kind === 'estate' && o.absorb.length);
+  const duck = put('pond', 0, 3), stat = put('statue', 2, 2);
+  const est = tw.expandOptions(park).find(q => q.kind === 'estate' && q.absorb.length);
   ok(est && est.absorb[0] === duck && /becomes part of the park/.test(est.warn || '') && est.cost < 2 * CONFIG.PLOT_PRICE, `a park growing into a 2×2 estate takes in the little park in the way, paying only for the empty plot ($${est && est.cost})`);
   tw.expandBuilding(park.id, est.dir, 'estate');
-  ok(!tw.buildings.has(duck.id) && tw.buildingOn(x, z + 3) === park && fw(park) * fd(park) === 4, 'the pond is now part of the park');
+  ok(!tw.buildings.has(duck.id) && tw.buildingAt(...T(0, 3)) === park && park.w * park.d === 4, 'the pond is now part of the park');
   ok(tw.upgradeBuilding(park.id, 'landscapepark').ok && park.type === 'landscapepark' && park.flavor === 'rosegarden', 'rebuilt as a landscape park, it keeps its roses');
   // grounds: only with Public Parks
   ok(!tw.expandOptions(park).length, 'a 2×2 park only grows into bigger grounds once Public Parks is researched');
   tw.research.done.push('publicparks');
-  const grand = tw.expandOptions(park).filter(o => o.kind === 'grand');
-  const g3 = grand.find(o => o.absorb.includes(stat));
-  ok(grand.length >= 1 && grand.every(o => o.tiles.length === 5) && g3, `...then it can take the land round a corner (${grand.length} ways), taking in the statue in the way`);
+  const grand = tw.expandOptions(park).filter(q => q.kind === 'grand');
+  const g3 = grand.find(q => q.absorb.includes(stat));
+  const areaSum = (q) => q.rects.reduce((s, pts) => s + areaOf(pts), 0);
+  ok(grand.length >= 1 && grand.every(q => Math.abs(areaSum(q) - 5) < 1e-6) && g3, `...then it can take the land round a corner (${grand.length} ways, 5 plots' worth each), taking in the statue in the way`);
   ok(g3 && runCommand({ world: tw, demo: false }, { t: 'expand', id: park.id, dir: g3.dir, kind: 'grand' }).ok, 'the expand command takes the land for bigger grounds');
   const sp0 = { ...(park.spare || {}) };
-  ok(fw(park) === 3 && fd(park) === 3 && park.spare && park.spare.w === 2 && !tw.buildings.has(stat.id), `the park now stands on 3×3 grounds, the landscape park in its corner (${JSON.stringify(park.spare)})`);
+  ok(park.w === 3 && park.d === 3 && park.spare && park.spare.w === 2 && !tw.buildings.has(stat.id), `the park now stands on 3×3 grounds, the landscape park in its corner (${JSON.stringify(park.spare)})`);
   const gup = tw.upgradeOptions(park);
-  ok(gup.some(o => o.type === 'grandpark' && o.grand) && !gup.some(o => o.extend), 'it can be laid out as a Grand Park');
+  ok(gup.some(q => q.type === 'grandpark' && q.grand) && !gup.some(q => q.extend), 'it can be laid out as a Grand Park');
   tw.upgradeBuilding(park.id, 'grandpark');
   const o1 = parkOrigin(park.flavor);
   ok(park.type === 'grandpark' && o1 && o1.type === 'landscapepark' && o1.sx === sp0.sx && o1.sz === sp0.sz && o1.inner === 'rosegarden' && !park.spare, `the Grand Park is laid out round the landscape park it was, in its corner (${park.flavor})`);
   // and again into 4×4: a City Park
-  const city = tw.expandOptions(park).filter(o => o.kind === 'grand');
-  ok(city.length && city.every(o => o.tiles.length === 7), `a Grand Park grows again onto 7 more plots (${city.length} ways)`);
+  const city = tw.expandOptions(park).filter(q => q.kind === 'grand');
+  ok(city.length && city.every(q => Math.abs(areaSum(q) - 7) < 1e-6), `a Grand Park grows again onto 7 more plots' worth (${city.length} ways)`);
   if (city.length) {
     tw.expandBuilding(park.id, city[0].dir, 'grand');
     tw.upgradeBuilding(park.id, 'citypark');
     const o2 = parkOrigin(park.flavor), o3 = o2 && parkOrigin(o2.inner);
-    ok(park.type === 'citypark' && fw(park) === 4 && o2.type === 'grandpark' && o3 && o3.type === 'landscapepark' && !tw.expandOptions(park).length, `a City Park on 4×4 grounds round the Grand Park, round the landscape park (${park.flavor})`);
+    ok(park.type === 'citypark' && park.w === 4 && o2.type === 'grandpark' && o3 && o3.type === 'landscapepark' && !tw.expandOptions(park).length, `a City Park on 4×4 grounds round the Grand Park, round the landscape park (${park.flavor})`);
     const m0 = buildModel(park), cells = new Set();
-    for (let dz = 0; dz < 4; dz++) for (let dx = 0; dx < 4; dx++) cells.add(tw.buildingAt[tw.idx(park.x + dx, park.z + dz)]);
-    ok(m0.geo.attributes.position.count > 0 && cells.size === 1 && cells.has(park.id), 'every plot of the City Park is the park\'s, and it builds');
+    for (let dz = 0; dz < 4; dz++) for (let dx = 0; dx < 4; dx++) cells.add(tw.buildingAt(...toWorld(ownPlot(park), dx - 1.5, dz - 1.5)));
+    ok(m0.geo.attributes.position.count > 0 && cells.size === 1 && cells.has(park), 'every plot of the City Park is the park\'s, and it builds');
     // saved and loaded back: same grounds, same layout
     const back = deserialize(JSON.parse(JSON.stringify(serialize(tw)))).buildings.get(park.id);
     const h = (geo) => { let s = 0; const a = geo.attributes.position.array; for (let i = 0; i < a.length; i += 11) s = (Math.imul(s, 31) + Math.round(a[i] * 1000)) | 0; return s; };
-    ok(back && back.type === 'citypark' && fw(back) === 4 && fd(back) === 4 && back.flavor === park.flavor && h(buildModel(back).geo) === h(m0.geo), 'a save keeps the City Park, its grounds and what it grew from, drawn the same');
+    ok(back && back.type === 'citypark' && back.w === 4 && back.d === 4 && back.flavor === park.flavor && h(buildModel(back).geo) === h(m0.geo), 'a save keeps the City Park, its grounds and what it grew from, drawn the same');
   }
   ok(Object.values(GRAND).flat().filter(t => BUILDINGS[t].park).every(t => BUILDINGS[t].grand && BUILDINGS[t].levels.every((_, i) => techForLevel(t, i) === 'publicparks')), 'every level of the grand parks takes Public Parks');
-}
+});
 
 // 3d1f. what the new parks do: a bandstand brings culture to the streets
 // round it, allotments cheer homes with the retired in them (and the old go
 // and dig there), and the boating lake and the zoo charge their visitors
-{
+await block('3d1f new parks', async () => {
   const tw = World.createNew({ N: 48, seed: 39, name: 'Bandbury' });
   tw.setSandbox({ infiniteMoney: true, unlockAll: true, instantBuild: true });
-  const tg = { world: tw, speed: 0, _ev: {}, on(e, f) { (this._ev[e] ||= []).push(f); }, emit(e, d) { for (const f of this._ev[e] || []) f(d); } };
-  const sim = new Sim(tg);
+  const sim = new Sim(listen(tw));
   // on the town's own street, so they are connected
-  const conn = (t, x, z) => { const c = tw.checkBuild(t, x, z); return c.ok && c.access.some(a => a.conn); };
-  let home = null, stand = null;
-  for (let z = 1; z < tw.N - 1 && !stand; z++) for (let x = 1; x < tw.N - 2 && !stand; x++) {
-    if (!conn('house', x, z) || !conn('bandstand', x + 1, z)) continue;
-    home = tw.placeBuilding('house', x, z, { instant: true }).building;
-    stand = tw.placeBuilding('bandstand', x + 1, z, { instant: true }).building;
-  }
+  const [home, stand] = pair(tw, 'house', 'bandstand');
   sim.recompute();
-  const i = tw.idx(home.x, home.z);
+  const i = cellOf(tw.N, home.x, home.z);
   const cult = sim.coverage.culture[i];
+  const spot = { x: stand.x, z: stand.z, a: stand.a };
   tw.removeBuilding(stand.id, 0);
   sim.recompute();
-  ok(cult && !sim.coverage.culture[i], 'a bandstand brings culture to the homes round it');
+  ok(home.connected && cult && !sim.coverage.culture[i], 'a bandstand brings culture to the homes round it');
   const old = { id: tw.newId(), first: 'Ada', last: 'Spade', age: 'elder', years: 70, edu: 1, home: home.id, job: null, look: 4321, mood: 60 };
   tw.residents.set(old.id, old); home.residents.push(old.id);
   const potter = () => { sim.recompute(); sim._happiness(); const p = home.factors.parts.find(q => q[0] === 'potter'); return p ? p[1] : null; };
   const before = potter();
-  const plot = tw.placeBuilding('allotment', stand.x, stand.z, { instant: true }).building;
+  const plot = tw.placeBuilding('allotment', spot.x, spot.z, { instant: true, a: spot.a }).building;
   const after = potter();
   ok(before === 0 && after === 3, `a home with someone retired in it is happier with allotments in reach (${before} → +${after})`);
   const A = { world: tw, _nearest: Agents.prototype._nearest, _shopFor: Agents.prototype._shopFor, _places: Agents.prototype._places, _candidates: (pred) => [...tw.buildings.values()].filter(b => b.access && pred(BUILDINGS[b.type], b)) };
   // (with a green beside it too, so the allotment isn't the only park to go to)
-  const green = tw.placeBuilding('garden', home.x, home.z - 1, { instant: true }).building || tw.placeBuilding('garden', home.x, home.z + 1, { instant: true }).building;
+  let green = null;
+  for (const [lx, lz] of [[1, 0], [0, -1]]) { const p = tw.placeBuilding('garden', ...toWorld(ownPlot(home), lx, lz), { instant: true, a: home.a }); if (p.ok) { green = p.building; break; } }
   let digs = 0;
   for (let k = 0; k < 200; k++) { A._lists = null; Agents.prototype.planDay.call(A, old, null); if (old.plan.some(p => p.dest === plot.id && p.t < 11.5)) digs++; }
   ok(green && digs > 50 && digs < 180, `the old go and dig their allotment of a morning, some mornings (${digs} in 200)`);
   // a boat hired on the boating lake is paid for; a stroll in the town park isn't
   const pay = (type, level) => {
     const W = 2, D = BUILDINGS[type].merged ? 1 : 2;
-    let b = { ok: false };
-    for (let pz = 1; pz < tw.N - 3 && !b.ok; pz++) for (let px = 1; px < tw.N - 3 && !b.ok; px++) if (tw.checkBuild(type, px, pz, { w: W, d: D, ignoreUnlock: true }).ok) b = tw.placeBuilding(type, px, pz, { instant: true, ignoreUnlock: true, level, w: W, d: D });
-    if (!b.ok) return null;
-    b.building.wet = 2;
+    const b = lot(tw, type, { w: W, d: D, opts: { level } });
+    if (!b) return null;
+    b.wet = 2;
     const m0 = tw.stats.visitIncome, ag = { world: tw, game: { sim, emit() {} }, _visiting: Agents.prototype._visiting, _occupancy: () => new Map(), _drop() {} };
-    b.building.working = 1;
-    Agents.prototype._arrive.call(ag, { id: -1, age: 'adult', home: home.id, job: null, walk: null }, b.building.id);
-    tw.removeBuilding(b.building.id, 0);
+    b.working = 1;
+    Agents.prototype._arrive.call(ag, { id: -1, age: 'adult', home: home.id, job: null, walk: null }, b.id);
+    tw.removeBuilding(b.id, 0);
     return Math.round(tw.stats.visitIncome - m0);
   };
   const boat = pay('lakepark', 1), stroll = pay('park', 0), zoo = pay('zoo', 0);
@@ -1365,20 +1453,20 @@ const placePair = (tw, ta, tb) => {
   const gz = { type: 'grandpark', level: 0, flavor: 'zoo#1@1,1' }, gp = { type: 'citypark', level: 1, flavor: 'grandpark#0@1,1/palmhouse#1@-1,1' };
   ok(visitOf(gz) === BUILDINGS.zoo.levels[1].visit && researchOf(gp) === 8 && researchOf({ type: 'grandpark', level: 0, flavor: 'landscapepark#1' }) === 0 && visitOf({ type: 'grandpark', level: 0, flavor: null }) === 0,
     `grounds grown from a zoo keep its gate ($${visitOf(gz)}), and from the royal botanic gardens their research (${researchOf(gp)} a day)`);
-}
+});
 
 // 3d1g. plantings and monuments come in kinds: each kind builds at every
 // level and looks like no other, one without a kind takes one by its seed
 // (from those that need no research), a kind can be chosen when it is
 // built (if researched) and reworked later by the builders for a share of
 // its worth, and a grand monument brings culture
-{
+await block('3d1g kinds', async () => {
   const { KINDS, REKIND, kindOf } = await import('../src/defs.js');
   const { runCommand } = await import('../src/commands.js');
   const hashOf = (geo) => { let h = 0; const a = geo.attributes.position.array, c = geo.attributes.color.array; for (let i = 0; i < a.length; i += 5) h = (Math.imul(h, 31) + Math.round(a[i] * 1000) + Math.round(c[i] * 255)) | 0; return h; };
   const bad = [], looks = new Map();
   for (const [type, K] of Object.entries(KINDS)) for (const kind of Object.keys(K)) BUILDINGS[type].levels.forEach((_, level) => {
-    const b = { type, level, variant: 4242, flavor: kind, size: 1, w: 1, d: 1, baseY: 0.5, minY: 0.2, rot: 0 };
+    const b = at0({ type, level, variant: 4242, flavor: kind, size: 1, w: 1, d: 1, baseY: 0.5, minY: 0.2 });
     let h = null;
     for (const season of [0, 1, 2, 3]) {
       const m = buildModel(b, { flat: true, season });
@@ -1398,13 +1486,13 @@ const placePair = (tw, ta, tb) => {
   const tw = World.createNew({ N: 48, seed: 43, name: 'Kindleton' });
   tw.money = 1e6;
   const G = { world: tw, demo: false };
-  const spot = (type) => { for (let z = 2; z < tw.N - 2; z++) for (let x = 2; x < tw.N - 2; x++) if (tw.checkBuild(type, x, z, { ignoreUnlock: true }).ok) return { x, z }; return null; };
-  const s1 = spot('flowers');
-  const locked = runCommand(G, { t: 'place', type: 'flowers', x: s1.x, z: s1.z, flavor: 'knot' });
+  const s1 = findPlot(tw, 'flowers', seatOf(tw), { r: 16, opts: { ignoreUnlock: true } });
+  const locked = runCommand(G, { t: 'place', type: 'flowers', x: s1.x, z: s1.z, a: s1.a, flavor: 'knot' });
   tw.research.done.push('gardening', 'botany', 'stonework');
-  const knot = runCommand(G, { t: 'place', type: 'flowers', x: s1.x, z: s1.z, flavor: 'knot' });
+  const knot = runCommand(G, { t: 'place', type: 'flowers', x: s1.x, z: s1.z, a: s1.a, flavor: 'knot' });
   ok(!locked.ok && /Botany/.test(locked.reason || '') && knot.ok && knot.building.flavor === 'knot' && kindOf(knot.building) === 'knot', `a planting can be built as a herb knot once Botany is researched (${locked.reason})`);
-  ok(!runCommand(G, { t: 'place', type: 'flowers', x: s1.x + 1, z: s1.z, flavor: 'clock' }).ok && !runCommand(G, { t: 'place', type: 'house', x: s1.x + 1, z: s1.z, flavor: 'rockery' }).ok, 'a kind of one is refused for the other, and for anything else');
+  const s2 = findPlot(tw, 'flowers', seatOf(tw), { r: 16, opts: { ignoreUnlock: true } });
+  ok(!runCommand(G, { t: 'place', type: 'flowers', x: s2.x, z: s2.z, a: s2.a, flavor: 'clock' }).ok && !runCommand(G, { t: 'place', type: 'house', x: s2.x, z: s2.z, a: s2.a, flavor: 'rockery' }).ok, 'a kind of one is refused for the other, and for anything else');
   const plot = knot.building;
   plot.con = null;
   const m0 = tw.money, ck = tw.kindCheck(plot, 'rockery');
@@ -1415,16 +1503,14 @@ const placePair = (tw, ta, tb) => {
   ok(plot.flavor === 'rockery' && plot.level === 0 && !plot.con, 'when they are done it is a rockery, at its level');
   ok(!tw.kindCheck(plot, 'rockery').ok && !tw.kindCheck(plot, 'arch').ok && !tw.kindCheck(plot, 'tree').ok, 'not as the kind it is, a kind it has not, or one not yet researched');
   // a grand monument brings culture
-  const tg = { world: tw, speed: 0, _ev: {}, on(e, f) { (this._ev[e] ||= []).push(f); }, emit(e, d) { for (const f of this._ev[e] || []) f(d); } };
-  const sim = new Sim(tg);
-  let mon = null;
-  for (let z = 1; z < tw.N - 1 && !mon; z++) for (let x = 1; x < tw.N - 1 && !mon; x++) { const c = tw.checkBuild('statue', x, z, { ignoreUnlock: true }); if (c.ok && c.access.some(a => a.conn)) mon = tw.placeBuilding('statue', x, z, { instant: true, ignoreUnlock: true, level: 1, flavor: 'founder' }).building; }
+  const sim = new Sim(listen(tw));
+  const mon = near(tw, 'statue', null, { r: 16, level: 1, flavor: 'founder' });
   const count = () => { sim.recompute(); let n = 0; for (const v of sim.coverage.culture) n += v ? 1 : 0; return n; };
   const before = count();
   mon.level = 2;
   const after = count();
-  ok(after > before && BUILDINGS.statue.levels[2].culture > 0, `a grand monument brings culture to the streets within ${BUILDINGS.statue.levels[2].culture} tiles (a civic one doesn't)`);
-}
+  ok(after > before && BUILDINGS.statue.levels[2].culture > 0, `a grand monument brings culture to the streets within ${BUILDINGS.statue.levels[2].culture} units (a civic one doesn't)`);
+});
 
 // 3d1h. the seat of government: the town hall comes in styles, rebuilt in
 // another for a share of all the seat has cost; at its top level, with
@@ -1434,80 +1520,67 @@ const placePair = (tw, ta, tb) => {
 // it is; there is only one seat; its tax bonus goes with it; the civic
 // buildings near it make a civic quarter, each kind adding to the taxes
 // once; every seat and civic model fits its plot; and a save keeps it all
-{
+await block('3d1h seat of government', async () => {
   const { SEAT_RESTYLE, seatWorth, CIVIC_QUARTER, CIVIC_TYPES, kindOf, SEAT_STYLES } = await import('../src/defs.js');
-  const { civicQuarter, seatOf } = await import('../src/world/world.js');
+  const { civicQuarter } = await import('../src/world/world.js');
   const { runCommand } = await import('../src/commands.js');
   const tw = World.createNew({ N: 64, seed: 47, name: 'Capitalton' });
   tw.setSandbox({ infiniteMoney: true, instantBuild: true, freeUpgrades: true });
   const G = { world: tw, demo: false };
-  const tg = { world: tw, speed: 0, _ev: {}, on(e, f) { (this._ev[e] ||= []).push(f); }, emit(e, d) { for (const f of this._ev[e] || []) f(d); } };
-  const sim = new Sim(tg);
+  const sim = new Sim(listen(tw));
   // the founders' town hall, its styles
   let th = seatOf(tw);
   ok(th && th.type === 'townhall' && kindOf(th) === 'tower' && kindOf({ ...th, level: 4 }) === 'dome' && kindOf({ ...th, flavor: 'gothic' }) === 'gothic',
     'a town hall with no style chosen has a clock tower, and a dome once it is a Civic Palace');
   const locked = tw.kindCheck(th, 'classical');
   tw.research.done.push('stonework', 'architecture');
-  const cost = tw.kindCheck(th, 'classical').cost, m0 = tw.money;
+  const cost = tw.kindCheck(th, 'classical').cost;
   const rs = runCommand(G, { t: 'kind', id: th.id, kind: 'classical' });
   ok(!locked.ok && /Architecture/.test(locked.reason) && rs.ok && th.flavor === 'classical' && th.level === 0 && cost === Math.round(seatWorth(th) * SEAT_RESTYLE),
     `the temple front waits for Architecture; then builders rebuild it in that style for $${cost} (${Math.round(SEAT_RESTYLE * 100)}% of all the seat has cost)`);
   ok(seatWorth({ type: 'capitol', level: 0 }) > seatWorth({ type: 'townhall', level: 4 }) && seatWorth({ type: 'parliament', level: 1 }) > seatWorth({ type: 'parliament', level: 0 }),
     'restyling only gets dearer as the seat grows');
-  // a fresh seat on an open block, a street along its front
+  // a fresh seat on an open block (plots in rows, T(x, z) the middle of one),
+  // a street along its front at row 6 and room across it
   tw.removeBuilding(th.id, 0);
-  let at = null;
-  for (let z = 4; z < tw.N - 10 && !at; z++) for (let x = 4; x < tw.N - 10 && !at; x++) {
-    let open = true;
-    for (let dz = 0; dz < 6 && open; dz++) for (let dx = 0; dx < 7; dx++) {
-      const tx = x + dx, tz = z + dz;
-      if (tw.buildingOn(tx, tz) || tw.roadAt(tx, tz) || tw.terrain.isWater(tx, tz) || tw.fields[tw.idx(tx, tz)] >= 0 || tw.terrain.tileMax(tx, tz) - tw.terrain.tileMin(x, z) > 0.5) open = false;
-    }
-    if (open && [0, 1, 2, 3, 4, 5, 6].every(dx => tw.checkRoad(x + dx, z + 6, 1).ok)) at = { x, z };
-  }
-  const { x, z } = at;
-  tw.placeRoads([0, 1, 2, 3, 4, 5, 6].map(dx => [x + dx, z + 6]), 1);
-  th = tw.placeBuilding('townhall', x + 2, z + 4, { instant: true, ignoreUnlock: true, flavor: 'dome' }).building;
-  ok(th && th.rot === 0, 'a new town hall faces the street');
-  ok(!tw.placeBuilding('townhall', x, z, { instant: true, ignoreUnlock: true }).ok, 'there is only one town hall');
+  const o = openBox(tw, 14, 11, { x: 16, z: 16 });
+  levelBox(tw, o.x, o.z, 14, 11);
+  const T = (x, z) => [o.x + 4 + x, o.z + 1 + z];
+  street(tw, [[o.x + 0.3, T(0, 6)[1]], [o.x + 13.7, T(0, 6)[1]]]);
+  th = tw.placeBuilding('townhall', ...T(2.5, 4.5), { instant: true, ignoreUnlock: true, flavor: 'dome' }).building;
+  ok(th && Math.abs(wrapAngle(th.a)) < 0.01, 'a new town hall faces the street');
+  ok(!tw.placeBuilding('townhall', ...T(0.5, 0.5), { instant: true, ignoreUnlock: true }).ok, 'there is only one town hall');
   tw.research.done.push('surveying', 'bigplots', 'grandarch', 'civic', 'municipal', 'metropolis');
   ok(!tw.expandOptions(th).length, 'the town hall does not grow its grounds below its top level');
   th.level = 4;
   ok(!tw.expandOptions(th).length, '...nor a Civic Palace before Capital City is researched');
   tw.research.done.push('capital');
   // a monument on one corner of the land it could take, a house on another
-  const stat = tw.placeBuilding('statue', x + 4, z + 3, { instant: true, ignoreUnlock: true }).building;
-  const hut = tw.placeBuilding('house', x + 1, z + 5, { instant: true, ignoreUnlock: true }).building;
-  const grow = tw.expandOptions(th).filter(o => o.kind === 'grand');
-  const g3 = grow.find(o => o.absorb.includes(stat));
-  ok(grow.length >= 1 && grow.every(o => o.tiles.length === 5 && !o.tiles.some(([tx, tz]) => tx === hut.x && tz === hut.z)) && g3 && /part of the grounds/.test(g3.warn || ''),
+  const stat = tw.placeBuilding('statue', ...T(4, 3), { instant: true, ignoreUnlock: true, a: 0 }).building;
+  const hut = tw.placeBuilding('house', ...T(1, 5), { instant: true, ignoreUnlock: true }).building;
+  const grow = tw.expandOptions(th).filter(q => q.kind === 'grand');
+  const g3 = grow.find(q => q.absorb.includes(stat));
+  ok(stat && hut && grow.length >= 1 && grow.every(q => !q.absorb.includes(hut)) && g3 && /part of the grounds/.test(g3.warn || ''),
     `the Civic Palace can take the land round a corner (${grow.length} ways), taking in the monument there but never the house`);
-  ok(runCommand(G, { t: 'expand', id: th.id, dir: g3.dir, kind: 'grand' }).ok && fw(th) === 3 && th.spare && !tw.buildings.has(stat.id), `it stands on 3×3 grounds, in its corner (${JSON.stringify(th.spare)})`);
+  ok(runCommand(G, { t: 'expand', id: th.id, dir: g3.dir, kind: 'grand' }).ok && th.w === 3 && th.spare && !tw.buildings.has(stat.id) && tw.buildings.has(hut.id), `it stands on 3×3 grounds, in its corner (${JSON.stringify(th.spare)})`);
   const up3 = tw.upgradeOptions(th);
-  ok(up3.length === 1 && up3[0].type === 'capitol' && up3[0].level === 0 && up3[0].grand, `it is offered the Civic Centre (the first level), never extended as it is (${up3.map(o => `${o.type}.${o.level}`).join(', ')})`);
+  ok(up3.length === 1 && up3[0].type === 'capitol' && up3[0].level === 0 && up3[0].grand, `it is offered the Civic Centre (the first level), never extended as it is (${up3.map(q => `${q.type}.${q.level}`).join(', ')})`);
   ok(runCommand(G, { t: 'upgrade', id: th.id, to: 'capitol' }).ok && th.type === 'capitol' && th.level === 0 && th.flavor === 'dome' && !th.spare, 'rebuilt as the Civic Centre, in its style');
-  ok(/Only one/.test(tw.checkBuild('townhall', x, z, { ignoreUnlock: true }).reason || ''), 'and still no second town hall beside the Civic Centre');
+  ok(/Only one/.test(tw.checkBuild('townhall', ...T(0.5, 0.5), { ignoreUnlock: true }).reason || ''), 'and still no second town hall beside the Civic Centre');
   ok(!tw.expandOptions(th).length, 'a Civic Centre grows no more until it is the Capitol');
   runCommand(G, { t: 'upgrade', id: th.id });
-  const g4 = tw.expandOptions(th).filter(o => o.kind === 'grand');
-  ok(th.type === 'capitol' && th.level === 1 && g4.length && g4.every(o => o.tiles.length === 7), `the Capitol can take 7 more plots for 4×4 grounds (${g4.length} ways)`);
+  const g4 = tw.expandOptions(th).filter(q => q.kind === 'grand');
+  ok(th.type === 'capitol' && th.level === 1 && g4.length && g4.every(q => Math.abs(q.rects.reduce((s, p) => s + areaOf(p), 0) - 7) < 1e-6), `the Capitol can take 7 more plots' worth for 4×4 grounds (${g4.length} ways)`);
   tw.expandBuilding(th.id, g4[0].dir, 'grand');
-  ok(tw.upgradeBuilding(th.id, 'parliament').ok && th.type === 'parliament' && fw(th) === 4 && fd(th) === 4 && !tw.expandOptions(th).length, 'and be rebuilt as the Parliament House, which grows no further');
+  ok(tw.upgradeBuilding(th.id, 'parliament').ok && th.type === 'parliament' && th.w === 4 && th.d === 4 && !tw.expandOptions(th).length, 'and be rebuilt as the Parliament House, which grows no further');
   // its tax bonus, and the civic quarter round it
   const old = { id: tw.newId(), first: 'Ada', last: 'Ledger', age: 'elder', years: 70, edu: 1, home: null, job: null, look: 1, mood: 60 };
   tw.residents.set(old.id, old);
   const taxes = () => { sim.recompute(); return sim.budget.income.taxes; };
   const t0 = taxes(), bonus = BUILDINGS.parliament.levels[0].taxBonus;
   ok(Math.abs(t0 - 1.5 * (tw.taxRate / 10) * (1 + bonus)) < 1e-9, `the Parliament House raises every tax by ${Math.round(bonus * 100)}%`);
-  const conn = (type, o = 3) => { for (let r = 1; r < 14; r++) for (let dz = -r; dz <= r; dz++) for (let dx = -r; dx <= r; dx++) { if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue; const px = th.x + 1 + dx, pz = th.z + 1 + dz, c = tw.checkBuild(type, px, pz, { ignoreUnlock: true }); if (c.ok && c.access.length) { const b = tw.placeBuilding(type, px, pz, { instant: true, ignoreUnlock: true }).building; tw.updateRoadNetwork(); return b; } } return null; };
-  // (the street runs on either way)
-  const more = [];
-  for (let dx = -6; dx <= 12; dx++) if (tw.checkRoad(x + dx, z + 6, 1).ok) more.push([x + dx, z + 6]);
-  tw.placeRoads(more, 1);
-  tw.updateRoadNetwork();
-  const law = conn('lawcourts'), mus = conn('museum'), mus2 = conn('museum');
-  for (const b of [law, mus, mus2]) if (b) b.connected = true;
+  const civic = (type) => { const b = near(tw, type, th, { r: 12, conn: false }); if (b) b.connected = true; return b; };
+  const law = civic('lawcourts'), mus = civic('museum'), mus2 = civic('museum');
   const q = civicQuarter(tw);
   ok(law && mus && mus2 && q.kinds.length === 2 && Math.abs(q.tax - 2 * CIVIC_QUARTER.tax) < 1e-9 && q.members.length === 3,
     `law courts and two museums near it make a civic quarter of ${q.kinds.length} kinds: +${Math.round(q.tax * 100)}% tax (a second museum adds nothing)`);
@@ -1517,7 +1590,7 @@ const placePair = (tw, ta, tb) => {
   law.x = th.x + 2 + CIVIC_QUARTER.reach;
   const q2 = civicQuarter(tw);
   law.x = lx;
-  ok(!q2.members.some(m => m.b === law) && q2.kinds.length === 1, `law courts more than ${CIVIC_QUARTER.reach} tiles away are no part of it`);
+  ok(!q2.members.some(m => m.b === law) && q2.kinds.length === 1, `law courts more than ${CIVIC_QUARTER.reach} units away are no part of it`);
   ok(CIVIC_TYPES.length === 4 && CIVIC_TYPES.includes('library'), `the civic buildings: ${CIVIC_TYPES.join(', ')}`);
   const { techForLevel } = await import('../src/defs.js');
   ok(['capitol', 'parliament'].every(t => BUILDINGS[t].levels.every((_, i) => techForLevel(t, i) === 'capital')), 'every level of the Capitol and the Parliament takes Capital City');
@@ -1527,7 +1600,7 @@ const placePair = (tw, ta, tb) => {
     const d = BUILDINGS[type];
     d.levels.forEach((_, level) => {
       for (const flavor of d.seat ? Object.keys(SEAT_STYLES) : [null]) for (const season of [0, 3]) {
-        const fit = {}, m = buildModel({ type, level, variant: 77 + level, flavor, size: d.size, w: d.size, d: d.size, baseY: 0.5, minY: 0.2, rot: level % 4 }, { fit, season });
+        const fit = {}, m = buildModel(at0({ type, level, variant: 77 + level, flavor, size: d.size, w: d.size, d: d.size, baseY: 0.5, minY: 0.2, a: (level % 4) * 0.8 }), { fit, season });
         if (!m.geo || !m.door || fit.k < (type === 'townhall' ? 0.97 : 0.99)) shrunk.push(`${type}.${level} ${flavor || ''} ${fit.k && fit.k.toFixed(3)}`);
       }
     });
@@ -1536,11 +1609,11 @@ const placePair = (tw, ta, tb) => {
   // a save keeps the Parliament, its grounds and its style
   tw.kindCheck(th, 'gothic').ok && tw.setKind(th.id, 'gothic');
   const back = deserialize(JSON.parse(JSON.stringify(serialize(tw)))).buildings.get(th.id);
-  ok(back && back.type === 'parliament' && fw(back) === 4 && back.flavor === 'gothic' && back.level === th.level, 'a save keeps the Parliament on its 4×4 grounds, in its Gothic style');
-}
+  ok(back && back.type === 'parliament' && back.w === 4 && back.flavor === 'gothic' && back.level === th.level, 'a save keeps the Parliament on its 4×4 grounds, in its Gothic style');
+});
 
 // 3d2. demolition takes a crew and some time
-{
+await block('3d2 demolition', async () => {
   const target = [...w.buildings.values()].find(b => b.type === 'house' && !b.con && b.residents.length);
   const people = target.residents.slice();
   const r = w.demolishBuilding(target.id);
@@ -1548,29 +1621,26 @@ const placePair = (tw, ta, tb) => {
   ok(people.every(id => w.residents.get(id)?.home !== target.id), 'the household moved out at once');
   const res = runUntil(() => !w.buildings.has(target.id), 4);
   ok(res.ok, `the crew pulled it down (peak ${res.peak} on site)`);
-}
+});
 
 // 3d3. research gates buildings and is earned daily
-{
+await block('3d3 research', async () => {
   const fresh = World.createNew({ N: 32, seed: 99, name: 'Lab' });
-  let spot = null;
-  for (let z = 1; z < 31 && !spot; z++) for (let x = 1; x < 31 && !spot; x++) if (fresh.checkBuild('house', x, z, { ignoreMoney: true }).ok) spot = [x, z];
+  const spot = findPlot(fresh, 'house', seatOf(fresh), { r: 14, opts: { ignoreMoney: true } });
   fresh.residents.set(9999, { id: 9999, age: 'adult' });
   for (let i = 0; i < 40; i++) fresh.residents.set(10000 + i, { id: 10000 + i, age: 'adult' });
-  const c1 = fresh.checkBuild('bakery', spot[0], spot[1], { ignoreMoney: true });
+  const c1 = fresh.checkBuild('bakery', spot.x, spot.z, { a: spot.a, ignoreMoney: true });
   ok(!c1.ok && /Research/.test(c1.reason), `a bakery needs research first ("${c1.reason}")`);
   ok(fresh.startResearch('commerce') && fresh.research.current === 'commerce', 'research project started');
   fresh.addResearch(TECHS.commerce.cost);
-  ok(fresh.research.done.includes('commerce') && fresh.checkBuild('bakery', spot[0], spot[1], { ignoreMoney: true }).ok, 'finished research unlocks the bakery');
+  ok(fresh.research.done.includes('commerce') && fresh.checkBuild('bakery', spot.x, spot.z, { a: spot.a, ignoreMoney: true }).ok, 'finished research unlocks the bakery');
   ok(!fresh.canResearch('highrise'), 'later projects wait for their prerequisites');
-}
+});
 
 // 3d4. school stages: children go to the stage for their age; a school can
 // grow larger or move on to the next stage (the bigger stages need room)
-{
-  const sch = [...w.buildings.values()].find(b => b.type === 'school') || (() => {
-    for (let z = 2; z < w.N - 3; z++) for (let x = 2; x < w.N - 3; x++) { const r = w.placeBuilding('school', x, z, { instant: true, ignoreUnlock: true }); if (r.ok) return r.building; }
-  })();
+await block('3d4 schools', async () => {
+  const sch = [...w.buildings.values()].find(b => b.type === 'school') || near(w, 'school', null, { r: 20 });
   w.setSandbox({ unlockAll: true });
   const opts = w.upgradeOptions(sch).map(o => o.type);
   ok(opts.includes('school') && opts.includes('middleschool'), `a schoolhouse can grow larger or become a middle school (${opts.join(', ')})`);
@@ -1581,58 +1651,44 @@ const placePair = (tw, ta, tb) => {
   const hs = w.upgradeCheck(sch, 'highschool');
   ok(hs.reqs.some(r => r.space && !r.met), 'a high school needs a double plot first');
   sch.type = 'school';
-  w.setSandbox({ unlockAll: false });
-}
+});
+w.setSandbox({ unlockAll: false });
 
 // 3e. utilities: a generator powers the town, demand is counted
-{
+await block('3e utilities', async () => {
   game.sim.recompute();
   const before = [...w.buildings.values()].filter(b => b.powered).length;
-  let gen = null;
-  for (let z = 2; z < w.N - 3 && !gen; z++) for (let x = 2; x < w.N - 3 && !gen; x++) {
-    const r = w.placeBuilding('windgen', x, z, { instant: true, ignoreMoney: true, ignoreUnlock: true });
-    if (r.ok && r.building.connected) gen = r.building; else if (r.ok) w.removeBuilding(r.building.id, 0);
-  }
+  const gen = near(w, 'windgen', null, { r: 22 });
   game.sim.recompute();
   const U = game.sim.utility;
   const after = [...w.buildings.values()].filter(b => b.powered).length;
   ok(gen && U.power.gen >= 25 && after > before, `a wind generator powers ${after} buildings (${U.power.demand}/${U.power.gen} kW)`);
   ok(U.water.supply > 0 && U.water.demand === w.population, `water: ${U.water.demand} villagers, supply for ${U.water.supply}`);
-}
+});
 
 // 3f. power, water and workers decide what works (Sim._working): an
 // unpowered machine makes nothing, street lamps go dark, things without
 // water or staff do less, and the issues panel lists what has stopped
 // (in a small fresh town, so supply is under control)
-{
+await block('3f power water workers', async () => {
   const { RoadsView } = await import('../src/render/roadsView.js');
   const { computeIssues } = await import('../src/ui/issues.js');
+  const { streetOf } = await import('../src/world/streets.js');
   const tw = World.createNew({ N: 40, seed: 77, name: 'Wattsby' });
   tw.setSandbox({ infiniteMoney: true, unlockAll: true, instantBuild: true });
-  const tg = { world: tw, speed: 0, _ev: {}, on(e, f) { (this._ev[e] ||= []).push(f); }, emit(e, d) { for (const f of this._ev[e] || []) f(d); } };
+  const tg = listen(tw);
   const sim = tg.sim = new Sim(tg);
   sim.seedFounders();
   // founders are random: make sure of two grown-ups to staff things
   for (const r of [...tw.residents.values()].slice(0, 2)) { r.age = 'adult'; r.years = 30; r.school = null; }
   const well = [...tw.buildings.values()].find(b => b.type === 'well');
   // cobbled streets get lamps
-  const roads = [];
-  for (let z = 0; z < tw.N; z++) for (let x = 0; x < tw.N; x++) if (tw.roadAt(x, z)) roads.push([x, z]);
-  tw.placeRoads(roads, 2);
-  const near = (type, max = 12) => {
-    for (let r = 1; r <= max; r++) for (let dz = -r; dz <= r; dz++) for (let dx = -r; dx <= r; dx++) {
-      if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
-      const c = tw.checkBuild(type, well.x + dx, well.z + dz);
-      if (!c.ok || !c.access.some(a => a.conn)) continue;
-      const p = tw.placeBuilding(type, well.x + dx, well.z + dz, { instant: true });
-      if (p.ok) return p.building;
-    }
-    return null;
-  };
-  const mf = near('workshop');
+  tw.setLevel([...tw.roads.edges.keys()], 2);
+  const by = (type, max = 12) => near(tw, type, well, { r: max });
+  const mf = by('workshop');
   mf.level = 2;
   for (const r of tw.residents.values()) if (r.age === 'adult') r.job = mf.id;
-  for (let k = 0; k < 8 && (sim.recompute(), sim.powerShare < 1); k++) near('windgen', 16);
+  for (let k = 0; k < 8 && (sim.recompute(), sim.powerShare < 1); k++) by('windgen', 16);
   const rv = new RoadsView(tw, { add() {}, remove() {} });
   rv.lit = (x, z) => sim.lampLit(x, z);
   rv.rebuild();
@@ -1647,437 +1703,337 @@ const placePair = (tw, ta, tb) => {
   ok(rv.lamps.length === 0 && rv.darkLamps === lamps, `street lamps go dark without power (${rv.darkLamps})`);
   const iss = computeIssues(tg).map(i => i.text);
   ok(iss.some(t => /manufactory stopped — no power/.test(t)), `issues list the stopped works ("${iss.find(t => /no power/.test(t))}")`);
-  for (let k = 0; k < 8 && (sim.recompute(), sim.powerShare < 1); k++) near('windgen', 16);
+  for (let k = 0; k < 8 && (sim.recompute(), sim.powerShare < 1); k++) by('windgen', 16);
   ok(mf.working > 0 && !computeIssues(tg).some(i => /no power/.test(i.text)), 'it starts again once the power is back');
   // water: without it a bakery works at reduced output, a clinic reaches
   // less, homes can't expand, and the issues panel says so
-  const bak = near('bakery'), cl = near('clinic');
+  const bak = by('bakery'), cl = by('clinic');
   let n = 0;
   for (const r of tw.residents.values()) if (r.age === 'adult') { r.job = n++ % 2 ? bak.id : cl.id; r.edu = 3; }
   sim.recompute();
   const k0 = bak.working, reach0 = sim.reachOf(cl);
-  ok(bak.wet === 2 && cl.wet === 2 && k0 > 0 && reach0 > 0, `the bakery and clinic have running water (bakery at ${Math.round(k0 * 100)}%, clinic reaches ${reach0} tiles)`);
-  const home = [...tw.buildings.values()].find(b => b.type === 'house' && b.wet === 2 && tw.expandOptions(b).length);
+  ok(bak.wet === 2 && cl.wet === 2 && k0 > 0 && reach0 > 0, `the bakery and clinic have running water (bakery at ${Math.round(k0 * 100)}%, clinic reaches ${reach0} units)`);
+  const home = [...tw.buildings.values()].find(b => b.type === 'house' && b.wet === 2 && tw.expandOptions(b).length) || (() => { const h = by('house', 16); sim.recompute(); return h && h.wet === 2 && tw.expandOptions(h).length ? h : null; })();
   const grow = home && tw.expandOptions(home)[0];
   tw.removeBuilding(well.id, 0);
   sim.recompute();
   ok(bak.blockers.includes('water') && Math.abs(bak.working - k0 * 0.3) < 1e-9, `without water the bakery works at 30% of that (${Math.round(bak.working * 100)}%)`);
-  ok(cl.blockers.includes('water') && sim.reachOf(cl) < reach0, `without water the clinic reaches less (${reach0} → ${sim.reachOf(cl)} tiles)`);
+  ok(cl.blockers.includes('water') && sim.reachOf(cl) < reach0, `without water the clinic reaches less (${reach0} → ${sim.reachOf(cl)} units)`);
   ok(computeIssues(tg).some(i => /bakery without water/.test(i.text)), 'issues list the bakery without water');
   ok(home && home.blockers.includes('water') && !tw.expandOptions(home).length && /water/.test(tw.expandBuilding(home.id, grow.dir, grow.kind).reason || ''), "a home that could expand can't once its water is gone");
   // workers: a school with no teachers has no places
-  const sch = near('school');
+  const sch = by('school');
   sim.recompute();
   ok(!sch.workers.length && sim.seatsOf(sch) === 0 && sch.working === 0 && sch.blockers.includes('workers') && computeIssues(tg).some(i => /schoolhouse with no workers/.test(i.text)), 'a school with no teachers has no places, and the issues panel says so');
   // water comes through the mains under the streets: one well anywhere on
   // the roads waters a bakery right across town, but nothing off the roads
   const { runCommand } = await import('../src/commands.js');
   const { townRoadTiles } = await import('../src/ui/working.js');
-  const well2 = near('well', 16);
-  let far = null, fd2 = -1;
-  for (let z = 1; z < tw.N - 1; z++) for (let x = 1; x < tw.N - 1; x++) {
-    const d = Math.abs(x - well2.x) + Math.abs(z - well2.z), c = d > fd2 && tw.checkBuild('bakery', x, z);
-    if (c && c.ok && c.access.some(a => a.conn)) { far = [x, z]; fd2 = d; }
-  }
-  const fb = tw.placeBuilding('bakery', far[0], far[1], { instant: true }).building;
-  let lone = null;
-  for (let z = 2; z < tw.N - 3 && !lone; z++) for (let x = 2; x < tw.N - 4 && !lone; x++) {
-    const row = [[x, z], [x + 1, z], [x + 2, z]];
-    const clear = (tx, tz) => tw.inBounds(tx, tz) && !tw.roadAt(tx, tz) && !tw.buildingOn(tx, tz) && !tw.terrain.isWater(tx, tz);
-    if (![-1, 0, 1, 2, 3].every(dx => [-1, 0, 1, 2].every(dz => clear(x + dx, z + dz)))) continue;
-    if (!row.every(([tx, tz]) => tw.checkRoad(tx, tz, 1).ok)) continue;
-    tw.placeRoads(row, 1);
-    const h = tw.placeBuilding('house', x + 1, z + 1, { instant: true });
-    if (h.ok) lone = h.building;
-  }
+  const well2 = by('well', 16);
+  const fb = near(tw, 'bakery', well2, { r: 60, score: (x, z) => -Math.hypot(x - well2.x, z - well2.z) });
+  const fd2 = Math.hypot(fb.x - well2.x, fb.z - well2.z);
+  const lone = lot(tw, 'house');
   sim.recompute();
-  ok(fb.connected && fb.wet === 2 && !fb.blockers.includes('water'), `water reaches a bakery ${fd2} tiles from the well, through the mains`);
+  ok(fb.connected && fb.wet === 2 && !fb.blockers.includes('water') && fd2 > 6, `water reaches a bakery ${fd2.toFixed(0)} units from the well, through the mains`);
   ok(lone && !lone.connected && lone.wet === 0, 'a home on a road that leads nowhere gets no water');
   // power lines can be buried (Underground Cables): street by street or the
   // whole town; the poles come down, the street looks better, saves keep it
-  near('windgen', 16);
+  by('windgen', 16);
   sim.recompute();
   rv.rebuild();
-  const poles0 = rv.poles, th = [...tw.buildings.values()].find(b => b.type === 'townhall'), a = th.access;
-  const appeal0 = sim.appeal[tw.idx(a.x, a.z)];
+  const th = seatOf(tw), a = th.access, poles0 = rv.poles;
+  const appeal0 = sim.appeal[cellOf(tw.N, a.x, a.z)];
   tw.setSandbox({ unlockAll: false });
-  ok(!runCommand(tg, { t: 'bury', tiles: tw.streetTiles(a.x, a.z) }).ok, 'burying power lines needs Underground Cables');
+  ok(!runCommand(tg, { t: 'bury', ids: streetOf(tw, a.e) }).ok, 'burying power lines needs Underground Cables');
   tw.setSandbox({ unlockAll: true });
-  ok(!runCommand(tg, { t: 'bury', tiles: [[-1, 3]] }).ok, 'a bury command with a tile off the map is refused');
-  const r1 = runCommand(tg, { t: 'bury', tiles: tw.streetTiles(a.x, a.z) });
+  ok(!runCommand(tg, { t: 'bury', ids: [-1] }).ok, 'a bury command with no such road is refused');
+  const r1 = runCommand(tg, { t: 'bury', ids: streetOf(tw, a.e) });
   sim.recompute();
   rv.rebuild();
-  ok(r1.ok && r1.n > 0 && rv.poles < poles0 && sim.appeal[tw.idx(a.x, a.z)] > appeal0, `burying one street takes its poles down (${poles0} → ${rv.poles} poles) and makes it prettier`);
-  const r2 = runCommand(tg, { t: 'bury', tiles: townRoadTiles(tw) });
+  ok(r1.ok && r1.n > 0 && rv.poles < poles0 && sim.appeal[cellOf(tw.N, a.x, a.z)] > appeal0, `burying one street takes its poles down (${poles0} → ${rv.poles} poles) and makes it prettier`);
+  const r2 = runCommand(tg, { t: 'bury', ids: townRoadTiles(tw) });
   rv.rebuild();
-  ok(r2.ok && rv.poles === 0, `burying every line in town leaves no poles (${r2.n} more road tiles)`);
+  ok(r2.ok && rv.poles === 0, `burying every line in town leaves no poles (${r2.n} more stretches of road)`);
   const back = deserialize(JSON.parse(JSON.stringify(serialize(tw))));
-  ok(townRoadTiles(tw).every(([x, z]) => back.buried[back.idx(x, z)] === 1), 'saves keep the buried power lines');
-}
+  ok(townRoadTiles(tw).every(id => back.roads.edges.get(id).buried === 1), 'saves keep the buried power lines');
+});
 
-// 3g. road shapes and road selection: corners turn in a curve and junction
-// corners are filled in; a click picks the stretch between junctions; plans
+// 3g. curved roads and road selection: a stroke is laid as a smooth curve
+// (net.js), splitting the roads it crosses or ends on into junctions;
+// curves too tight, roads too close alongside, and anything in the way are
+// refused; the surface, junctions and all, is road where it should be and
+// villagers keep to it; a click picks a stretch between junctions; plans
 // add up costs and refunds and say what can't change and who'd be cut off
-{
-  const { roadTile, surfaceAt, curvesAt } = await import('../src/world/roadShape.js');
-  const { roadRun, roadsInBox, planRoadEdit, applyRoadEdit } = await import('../src/world/roadEdit.js');
-  const { tilePolyline } = await import('../src/sim/path.js');
+await block('3g curved roads', async () => {
+  const { surfaceAt, edgeAt, edgesInBox, streetOf, planRoadEdit, applyRoadEdit } = await import('../src/world/streets.js');
+  const { routeLine } = await import('../src/sim/path.js');
+  const { tightest } = await import('../src/world/geom.js');
   const { RoadsView } = await import('../src/render/roadsView.js');
   const { runCommand } = await import('../src/commands.js');
-  const { roadRefund, ROAD_LEVELS } = await import('../src/config.js');
+  const { ROAD_LEVELS, ROAD_SALVAGE } = await import('../src/config.js');
   const tw = World.createNew({ N: 48, seed: 5, name: 'Bendwick' });
   tw.money = 1e6;
-  // a free, gentle 9 × 9 patch for a little network
-  let o = null;
-  for (let z = 1; z < tw.N - 10 && !o; z++) for (let x = 1; x < tw.N - 10 && !o; x++) {
-    let free = true;
-    for (let dz = -1; dz < 10 && free; dz++) for (let dx = -1; dx < 10 && free; dx++) {
-      const X = x + dx, Z = z + dz;
-      if (tw.terrain.isWater(X, Z) || tw.roadAt(X, Z) || tw.railAt(X, Z) || tw.buildingOn(X, Z) || tw.terrain.slope(X, Z) > 0.5) free = false;
-    }
-    if (free) o = { x, z };
-  }
-  ok(!!o, 'found a free patch for the road-shape checks');
+  const o = openBox(tw, 12, 12, { x: 12, z: 12 }, 1.5);
+  ok(!!o, 'found a free patch for the road checks');
+  levelBox(tw, o.x, o.z, 12, 12);
   const P = (x, z) => [o.x + x, o.z + z];
-  // dirt (0..2, 1), cobbled junction (3, 1), paved (4..6, 1) turning down
-  // (6, 2..4), cobbled (3, 2..7), dirt (0..2, 5) meeting it at (3, 5)
   tw.setSandbox({ unlockAll: true });
-  tw.placeRoads([0, 1, 2].map(x => P(x, 1)), 1);
-  tw.placeRoads([P(3, 1), ...[2, 3, 4, 5, 6, 7].map(z => P(3, z))], 2);
-  tw.placeRoads([...[4, 5, 6].map(x => P(x, 1)), ...[2, 3, 4].map(z => P(6, z))], 3);
-  tw.placeRoads([0, 1, 2].map(x => P(x, 5)), 1);
+  // a cobbled street across the patch (the way in at its west end), a dirt
+  // lane curving across it, and a paved street off it, curving away
+  const C = street(tw, [P(0.5, 6), P(11.5, 6)], 2);
+  const before = tw.roads.edges.size;
+  const L = street(tw, [P(2, 10.5), P(3.5, 8), P(5.5, 6), P(7, 4), P(9, 1.5)], 1);
+  const Pv = street(tw, [P(9, 6), P(9.3, 8.5), P(10.5, 10.5)], 3);
   tw.setSandbox({ unlockAll: false });
-  const key = (l) => l.map(([x, z]) => `${x - o.x},${z - o.z}`).sort().join(' ');
-  // shapes
-  const bend = roadTile(tw, ...P(6, 1)), tee = roadTile(tw, ...P(3, 1)), straight = roadTile(tw, ...P(3, 3));
-  ok(bend.bend === 2 && !bend.fillets.length, 'a corner (west and south arms) is laid as a bend round its south-west corner');
-  ok(tee.bend < 0 && key([[0, 0]]) && tee.fillets.join() === '1,2', 'a T-junction fills in its two inside corners');
-  ok(straight.bend < 0 && !straight.fillets.length, 'a straight road has no curves');
-  const [bx, bz] = P(6, 1), [tx, tz] = P(3, 1);
-  ok(surfaceAt(tw, bx + 0.95, bz + 0.05) === 0 && surfaceAt(tw, bx + 0.04, bz + 0.96) === 0, 'the bend leaves grass at its outer and inner corners');
-  ok(surfaceAt(tw, bx + 1 - 0.5 * Math.SQRT1_2 - 0.5, bz + 0.5 * Math.SQRT1_2 + 0.5 - 0.5) > 0 || surfaceAt(tw, bx + 0.5 - 0.5 * Math.SQRT1_2 + 0.5 * Math.SQRT1_2, bz + 1 - 0.5) > 0, 'the bend is road along its curve');
-  ok(surfaceAt(tw, tx + 1 - 0.21, tz + 1 - 0.21) > 0 && surfaceAt(tw, tx + 0.95, tz + 0.95) === 0, 'a junction corner is road out to the fillet, grass right in the corner');
-  ok(curvesAt(tw, bx, bz) && !curvesAt(tw, o.x - 5, o.z - 5), 'walkers may curve on land roads only');
-  // villagers on the inside lane follow the bend and stay on the road
-  const walk = tilePolyline([P(4, 1), P(5, 1), P(6, 1), P(6, 2), P(6, 3)], 0.12, null, null, (x, z) => curvesAt(tw, x, z));
-  const corner = { x: bx, z: bz + 1 };
-  const onArc = walk.filter(([x, z]) => Math.abs(Math.hypot(x - corner.x, z - corner.z) - 0.38) < 1e-6);
-  ok(onArc.length >= 5 && walk.every(([x, z]) => surfaceAt(tw, x, z) > 0), `a villager turning the corner follows the curve (${onArc.length} points on it) and stays on the street`);
+  const deg = (n) => n.edges.length, inPatch = (n) => n.x > o.x && n.x < o.x + 12 && n.z > o.z && n.z < o.z + 12;
+  const cross = [...tw.roads.nodes.values()].find(n => inPatch(n) && deg(n) === 4), tee = [...tw.roads.nodes.values()].find(n => inPatch(n) && deg(n) === 3);
+  ok(C.length === 1 && L.length === 2 && Pv.length === 1 && tw.roads.edges.size === before + 5, `the lane crosses the street in a junction, the paved street meets it in another (the street now ${tw.roads.edges.size - before - 2} stretches)`);
+  ok(cross && Math.hypot(cross.x - (o.x + 5.5), cross.z - (o.z + 6)) < 0.3 && tee && Math.hypot(tee.x - (o.x + 9), tee.z - (o.z + 6)) < 0.45, 'the junctions are where the roads meet');
+  const lane = L.map(id => tw.roads.edges.get(id));
+  ok(lane.every(e => e.pts.length > 8 && tightest(e.pts, 0.2) >= 0.32), `the lane is a smooth curve (${lane.map(e => e.pts.length).join(' + ')} points, its tightest bend ${Math.min(...lane.map(e => tightest(e.pts, 0.2))).toFixed(2)} across)`);
+  // refusals
+  const zig = tw.checkRoad([P(1, 1), P(1.6, 1.2), P(1.1, 1.5), P(1.7, 1.8)], 1);
+  ok(!zig.ok && /tight/.test(zig.reason), `a bend too tight to drive is refused ("${zig.reason}")`);
+  const along = tw.checkRoad([P(1.5, 6.45), P(4.5, 6.45)], 1);
+  ok(!along.ok && /alongside/.test(along.reason), `a road too close alongside another is refused ("${along.reason}")`);
+  // the surface: road along the middle, verge beyond, the junction filled
+  const e0 = lane[0], m = pointAt(e0.pts, e0.cum, e0.len / 2), nx = -m[4], nz = m[3];
+  ok(surfaceAt(tw, m[0], m[1]) > 0 && surfaceAt(tw, m[0] + nx * (HALF[1] - 0.03), m[1] + nz * (HALF[1] - 0.03)) > 0 && surfaceAt(tw, m[0] + nx * (HALF[1] + 0.04), m[1] + nz * (HALF[1] + 0.04)) === 0, 'the lane is road out to its edges, and grass beyond');
+  ok(surfaceAt(tw, cross.x, cross.z) > 0 && surfaceAt(tw, tee.x + 0.12, tee.z + 0.12) > 0, 'and the junctions are road right across');
+  // the way in, at the street's west end
+  const west = tw.roads.nodeNear(o.x + 0.5, o.z + 6, 0.2);
+  tw.entry = { node: west.id, x: west.x, z: west.z };
+  tw.updateRoadNetwork();
+  ok([...tw.roads.edges.values()].filter(e => edgesInBox(tw, [o.x, o.z, o.x + 12, o.z + 12]).includes(e.id)).every(e => tw.edgeConnected(e.id)), 'every stretch reaches the way in');
+  // houses along the lane and the paved street, facing them at whatever angle
+  const H1 = near(tw, 'house', { x: o.x + 7.6, z: o.z + 3.2 }, { r: 1.6, test: (x, z) => z < o.z + 5 });
+  const H2 = near(tw, 'house', { x: o.x + 10.2, z: o.z + 9.5 }, { r: 1.8 });
+  ok(H1 && H2 && H1.access.e === L.find(id => tw.roads.edges.get(id).pts.some(p => p[1] < o.z + 3)) && tw.roads.edges.get(H2.access.e).level === 3, 'a house faces the lane and another the paved street, each on its own stretch');
+  ok([H1, H2].every(b => Math.abs(Math.sin(2 * b.a)) > 0.05), `and stand turned to them, not to the compass (${H1.a.toFixed(2)}, ${H2.a.toFixed(2)})`);
+  // villagers walking between them keep to the road, either side of it
+  const pf = new PathFinder(tw);
+  const route = pf.road(H1.access, H2.access);
+  const sides = route ? [0.08, -0.08].map(off => routeLine(tw.roads, route, off)) : [];
+  ok(route && route.pieces.length >= 3 && sides.every(pts => pts.length > 20 && pts.every(([x, z]) => surfaceAt(tw, x, z) > 0)), `the way between them runs along the curves and through the junctions, and either side of it stays on the road (${route ? route.pieces.length : 0} stretches)`);
   const view = new RoadsView(tw, scene);
-  ok([...view.surface.geometry.attributes.position.array].every(Number.isFinite) && view.surface.geometry.attributes.position.count > 0, 'road surfaces with bends and fillets build cleanly');
+  ok([...view.surface.geometry.attributes.position.array].every(Number.isFinite) && view.surface.geometry.attributes.position.count > 0, 'curved road surfaces and their junctions build cleanly');
   view.dispose();
-  // stretches between junctions
-  ok(key(roadRun(tw, ...P(1, 1))) === key([P(0, 1), P(1, 1), P(2, 1)]), 'a click picks the stretch up to the junction');
-  ok(key(roadRun(tw, ...P(4, 1))) === key([P(4, 1), P(5, 1), P(6, 1), P(6, 2), P(6, 3), P(6, 4)]), 'a stretch follows the road round a bend');
-  ok(key(roadRun(tw, ...P(3, 1))) === key([P(3, 1)]) && roadRun(tw, o.x + 8, o.z + 8).length === 0, 'a junction is a stretch of its own; grass picks nothing');
-  ok(key(roadRun(tw, ...P(3, 3))) === key([P(3, 2), P(3, 3), P(3, 4)]), 'a stretch stops at the next junction too');
-  const all = roadsInBox(tw, { x: o.x, z: o.z }, { x: o.x + 8, z: o.z + 8 });
-  ok(all.length === 3 + 1 + 6 + 6 + 3, `a box picks every road tile in it (${all.length})`);
+  // picking
+  ok(edgeAt(tw, m[0], m[1]) === e0 && !edgeAt(tw, o.x + 1, o.z + 1), 'a click picks the stretch it lands on; grass picks nothing');
+  const st = streetOf(tw, lane[0].id);
+  ok(st.length === 2 && st.includes(lane[1].id), 'the street a stretch is part of carries on through the junction the way it runs, not round the corner');
+  const all = edgesInBox(tw, [o.x, o.z, o.x + 12, o.z + 12]);
+  ok(all.length === 6, `a box picks every stretch in it (${all.length})`);
   // plans: costs, refunds, what can't change and why
-  const dirt = roadRun(tw, ...P(1, 1)), paved = roadRun(tw, ...P(4, 1)), cob = roadRun(tw, ...P(3, 3));
+  const dirt = L, paved = Pv, cob = [...tw.roads.edges.values()].find(e => e.level === 2 && [e.a, e.b].includes(cross.id) && [e.a, e.b].includes(tee.id)).id;
   const locked = planRoadEdit(tw, all, 'up');
   ok(locked.n === 0 && locked.blocked.some(b => /Unlocks at 25/.test(b.reason)) && locked.blocked.some(b => /paved/.test(b.reason)), 'upgrades wait for their unlock, and paved streets go no higher');
   tw.setSandbox({ unlockAll: true });
   const up = planRoadEdit(tw, all, 'up');
-  const want = all.reduce((s, [x, z]) => { const L = tw.roadAt(x, z); return s + (L < 3 ? ROAD_LEVELS[L + 1].cost - ROAD_LEVELS[L].cost : 0); }, 0);
-  ok(up.n === 13 && up.cost === want && up.blocked.length === 1 && up.blocked[0].n === 6, `upgrading the lot costs the sum of each step ($${up.cost}); the 6 paved tiles are skipped`);
+  const groups = new Map();
+  for (const id of all) { const e = tw.roads.edges.get(id); if (e.level < 3) groups.set(e.level + 1, (groups.get(e.level + 1) || 0) + (ROAD_LEVELS[e.level + 1].cost - ROAD_LEVELS[e.level].cost) * e.len); }
+  const want = [...groups.values()].reduce((s, v) => s + Math.round(v), 0);
+  ok(up.n === 5 && up.cost === want && up.blocked.length === 1 && up.blocked[0].n === 1, `upgrading the lot costs each step over its length ($${up.cost}); the paved street is skipped`);
   const down = planRoadEdit(tw, [...dirt, ...paved], 'down');
-  ok(down.n === 6 && down.refund === 6 * roadRefund(3, 2, false) && down.blocked[0].n === 3, `downgrading pays back a quarter of the difference ($${down.refund}); dirt can't go lower`);
-  const rm = planRoadEdit(tw, cob, 'remove');
-  ok(rm.n === 3 && rm.refund === 3 * roadRefund(2, 0, false), `taking up 3 cobbled tiles pays back $${rm.refund}`);
-  ok(roadRefund(2, 0, true) === Math.round(ROAD_LEVELS[2].cost * 3 * 0.25), 'bridges pay back at bridge prices');
-  const entry = planRoadEdit(tw, [[tw.entry.x, tw.entry.z]], 'remove');
+  const dw = Math.round((ROAD_LEVELS[3].cost - ROAD_LEVELS[2].cost) * tw.roads.edges.get(paved[0]).len * ROAD_SALVAGE);
+  ok(down.n === 1 && down.refund === dw && down.blocked[0].n === 2, `downgrading pays back a quarter of the difference ($${down.refund}); dirt can't go lower`);
+  const rm = planRoadEdit(tw, [cob], 'remove');
+  ok(rm.n === 1 && rm.refund === tw.removeCheck(cob).refund && rm.refund === Math.round(ROAD_LEVELS[2].cost * tw.roads.edges.get(cob).len * ROAD_SALVAGE), `taking up a cobbled stretch pays back $${rm.refund}`);
+  const entry = planRoadEdit(tw, [west.edges[0]], 'remove');
   ok(entry.n === 0 && /outside world/.test(entry.blocked[0].reason), 'the road to the outside world must stay');
-  // who would be cut off: a home on the dirt street, a shop at the bend,
-  // and a coach line between them
-  const H1 = tw.placeBuilding('house', ...P(1, 0), { instant: true }).building;
-  const H2 = tw.placeBuilding('house', ...P(7, 3), { instant: true }).building;
+  // who would be cut off: a coach line between the two houses
   tw.lines.push({ id: 9999, mode: 'coach', name: 'Test Line', color: '#fff', stops: [H1.id, H2.id], vehicles: 1 });
-  const before = tw.roads.slice();
-  const cutBend = planRoadEdit(tw, paved, 'remove');
-  ok(cutBend.lost.includes(H2.id) && !cutBend.lost.includes(H1.id) && cutBend.lines.includes(9999), 'taking up the bend leaves its house without a road and the coach line without a route');
-  const cutJunction = planRoadEdit(tw, [P(3, 1)], 'remove');
-  ok(!cutJunction.lost.length && cutJunction.lines.includes(9999), 'taking up the junction between the stops breaks the line too');
-  ok(!planRoadEdit(tw, cob, 'remove').lines.length, 'a stretch the line does not need leaves it alone');
-  ok(H1.front > 0 && planRoadEdit(tw, dirt, 'remove').back.includes(H1.id), 'a house standing forward into the street would step back');
-  // the town itself: taking up the road beside the way in cuts the town off
-  const th = [...tw.buildings.values()].find(b => b.type === 'townhall');
-  const way = [];
-  for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) if (tw.roadAt(tw.entry.x + dx, tw.entry.z + dz)) way.push([tw.entry.x + dx, tw.entry.z + dz]);
-  const sever = planRoadEdit(tw, way, 'remove');
-  ok(sever.cut.includes(th.id), 'taking up the road next to the way in would cut the town hall off');
-  ok(tw.roads.every((v, i) => v === before[i]), 'plans change nothing');
+  const rec0 = JSON.stringify(tw.roads.toRec());
+  const cutPaved = planRoadEdit(tw, paved, 'remove', { paths: pf });
+  ok(cutPaved.lost.includes(H2.id) && !cutPaved.lost.includes(H1.id) && cutPaved.lines.includes(9999), 'taking up the paved street leaves its house without a road and the coach line without a route');
+  const cutMid = planRoadEdit(tw, [cob], 'remove', { paths: pf });
+  ok(!cutMid.lost.length && cutMid.lines.includes(9999) && cutMid.cut.includes(H2.id), 'taking up the stretch between the junctions breaks the line too, and cuts the paved street\'s house off from the way out');
+  const tail = tw.roads.nodeNear(o.x + 11.5, o.z + 6, 0.2).edges[0];
+  ok(!planRoadEdit(tw, [tail], 'remove', { paths: pf }).lines.length && !planRoadEdit(tw, [tail], 'remove', { paths: pf }).detour.length, 'a stretch the line does not need leaves it alone');
+  const fwd = [...tw.buildings.values()].find(b => b.front > 0 && all.includes(b.access?.e));
+  ok(!fwd || planRoadEdit(tw, [fwd.access.e], 'remove').back.includes(fwd.id), 'a house standing forward into the street would step back');
+  ok(JSON.stringify(tw.roads.toRec()) === rec0, 'plans change nothing');
   // doing it
-  tw.money = 30;
+  tw.money = 3;
   const poor = applyRoadEdit(tw, dirt, 'up');
-  ok(!poor.ok && poor.reason === 'Not enough money' && tw.roadAt(...P(1, 1)) === 1 && tw.money === 30, 'an upgrade the town cannot afford changes nothing');
+  ok(!poor.ok && poor.reason === 'Not enough money' && tw.roads.edges.get(dirt[0]).level === 1 && tw.money === 3, 'an upgrade the town cannot afford changes nothing');
   tw.money = 1000;
+  const cost = planRoadEdit(tw, dirt, 'up').cost;
   const did = applyRoadEdit(tw, dirt, 'up');
-  ok(did.ok && did.n === 3 && did.spent === 42 && tw.money === 958 && dirt.every(([x, z]) => tw.roadAt(x, z) === 2), 'upgrading the dirt stretch makes it cobbled and costs $42');
+  ok(did.ok && did.n === 2 && did.cost === cost && tw.money === 1000 - cost && dirt.every(id => tw.roads.edges.get(id).level === 2), `upgrading the lane makes it cobbled and costs $${cost}`);
   const g2 = { world: tw, demo: false, emit() {} };
-  ok(!runCommand(g2, { t: 'roadedit', op: 'paint', tiles: dirt }).ok, 'the roadedit command refuses unknown actions');
-  const gone = runCommand(g2, { t: 'roadedit', op: 'remove', tiles: cob });
-  ok(gone.ok && gone.refund === rm.refund && tw.money === 958 + rm.refund && cob.every(([x, z]) => !tw.roadAt(x, z)), 'taking the cobbled stretch up through the command pays back its refund');
-  const one = tw.money, [ux, uz] = P(5, 5);
-  ok(tw.removeRoad(...P(2, 5)) === true && tw.money === one + roadRefund(1, 0, false) && ux >= 0, 'taking up a single tile pays back too');
-}
+  ok(!runCommand(g2, { t: 'roadedit', op: 'paint', ids: dirt }).ok, 'the roadedit command refuses unknown actions');
+  const m1 = tw.money, gone = runCommand(g2, { t: 'roadedit', op: 'remove', ids: [cob] });
+  ok(gone.ok && gone.refund === rm.refund && tw.money === m1 + rm.refund && !tw.roads.edges.has(cob) && !H2.connected, 'taking the stretch up through the command pays back its refund, and the paved street is cut off');
+  const m2 = tw.money, back = tw.removeCheck(tail).refund;
+  ok(runCommand(g2, { t: 'unroad', e: tail }).ok && tw.money === m2 + back, 'taking up a single stretch pays back too');
+});
 
-// 3h. dressing a street: trees, hedges, lamps or a planted median priced per
-// tile, kept off junctions, bends and driveways, liked by the neighbours,
-// saved, and taken away with the road
-{
-  const { planDress, applyDress, dressSpots, plainLamp } = await import('../src/world/roadDress.js');
-  const { planRoadEdit, applyRoadEdit } = await import('../src/world/roadEdit.js');
+// 3h. dressing a street: trees, hedges, lamps or a planted median priced by
+// its length, kept off junctions, corners and driveways, liked by the
+// neighbours, saved, and taken away with the road; and no boulevards (two
+// roads side by side make one only on squares)
+await block('3h street dressing', async () => {
+  const { planDress, applyDress, dressSpots, plainLamps, planRoadEdit, applyRoadEdit, lengthOf } = await import('../src/world/streets.js');
   const { runCommand } = await import('../src/commands.js');
-  const { DRESSINGS, dressRefund, roadRefund } = await import('../src/config.js');
+  const { DRESSINGS, dressRefund, ROAD_LEVELS, ROAD_SALVAGE } = await import('../src/config.js');
   const { doorPoint } = await import('../src/world/world.js');
   const tw = World.createNew({ N: 48, seed: 12, name: 'Avenue End' });
   tw.money = 1e6;
-  let o = null;
-  for (let z = 1; z < tw.N - 10 && !o; z++) for (let x = 1; x < tw.N - 11 && !o; x++) {
-    let free = true;
-    for (let dz = -1; dz < 9 && free; dz++) for (let dx = -1; dx < 11 && free; dx++) {
-      const X = x + dx, Z = z + dz;
-      if (tw.terrain.isWater(X, Z) || tw.roadAt(X, Z) || tw.railAt(X, Z) || tw.buildingOn(X, Z) || tw.terrain.slope(X, Z) > 0.5) free = false;
-    }
-    if (free) o = { x, z };
-  }
-  ok(!!o, 'found a free patch for the street-dressing checks');
+  const o = openBox(tw, 12, 10, { x: 12, z: 12 }, 1.5);
+  levelBox(tw, o.x, o.z, 12, 10);
   const P = (x, z) => [o.x + x, o.z + z];
-  // a paved street (0..8, 2), a cobbled one down from it (4, 3..6) turning
-  // east (5..6, 6), and a cottage beside the paved street at (2, 3)
-  tw.setSandbox({ unlockAll: true });
-  const paved = [0, 1, 2, 3, 4, 5, 6, 7, 8].map(x => P(x, 2)), cob = [...[3, 4, 5, 6].map(z => P(4, z)), P(5, 6), P(6, 6)];
-  tw.placeRoads(paved, 3);
-  tw.placeRoads(cob, 2);
-  const H = tw.placeBuilding('house', ...P(2, 3), { instant: true }).building;
-  tw.setSandbox({ unlockAll: false });
-  const all = [...paved, ...cob];
+  // a paved street bending across the patch, a cobbled one down from it
+  // curving east, and a cottage beside the paved street
+  const paved = street(tw, [P(0.5, 2.5), P(5, 2), P(11.5, 3)], 3);
+  const cob = street(tw, [P(5, 2.05), P(5.3, 6), P(8, 8.5)], 2);
+  const H = near(tw, 'house', { x: o.x + 2.5, z: o.z + 3.4 }, { r: 1.2, conn: false });
+  const all = [...tw.roads.edges.keys()].filter(id => edgesNear(id));
+  function edgesNear(id) { const e = tw.roads.edges.get(id); return e.pts.every(([x, z]) => x >= o.x - 0.1 && x <= o.x + 12.1 && z >= o.z - 0.1 && z <= o.z + 10.1); }
+  const pv = all.filter(id => tw.roads.edges.get(id).level === 3), cb = all.filter(id => tw.roads.edges.get(id).level === 2);
+  ok(H && pv.length === 2 && cb.length === 1, `the paved street meets the cobbled one in a junction (${pv.length} + ${cb.length} stretches), a cottage beside it`);
+  const units = (ids) => ids.reduce((s, id) => s + Math.max(1, Math.round(tw.roads.edges.get(id).len)), 0);
   const early = planDress(tw, all, 1);
   ok(!early.n && /Unlocks at 25/.test(early.blocked[0].reason) && planDress(tw, all, 2).n === all.length, 'avenues wait for a village; hedges can go in from the start');
   tw.setSandbox({ unlockAll: true });
   const med = planDress(tw, all, 4);
-  ok(med.n === paved.length && med.blocked[0].reason === 'Only on paved streets', 'a planted median only goes down paved streets');
+  ok(med.n === pv.length && med.blocked[0].reason === 'Only on paved streets', 'a planted median only goes down paved streets');
   const trees = planDress(tw, all, 1);
-  ok(trees.n === all.length && trees.cost === all.length * DRESSINGS[1].cost, `an avenue costs $${DRESSINGS[1].cost} a tile ($${trees.cost} for ${all.length})`);
-  // the town hall's appeal before and after (the sim adds it up)
-  const tg = { world: tw, speed: 0, _ev: {}, on(e, f) { (this._ev[e] ||= []).push(f); }, emit(e, d) { for (const f of this._ev[e] || []) f(d); } };
-  const sim = new Sim(tg);
+  ok(trees.n === all.length && trees.cost === units(all) * DRESSINGS[1].cost, `an avenue costs $${DRESSINGS[1].cost} a unit of street ($${trees.cost} for ${units(all)})`);
+  const BLVD = DRESSINGS.findIndex(d => d && d.blvd);
+  ok(BLVD > 0 && /squares/.test(planDress(tw, all, BLVD).blocked[0].reason), 'boulevard looks are for towns on squares: here a street is dressed instead');
+  // the cottage's appeal before and after (the sim adds it up)
+  const sim = new Sim(listen(tw));
   sim.recompute();
-  const hi = tw.idx(H.x, H.z), before = sim.appeal[hi], m0 = tw.money, forward = H.front;
+  const hi = cellOf(tw.N, H.x, H.z), before = sim.appeal[hi], m0 = tw.money, forward = H.front;
   sim._budget();
   const upkeep0 = sim.budget.expense.roads;
-  ok(applyDress(tw, all, 1).ok && tw.money === m0 - trees.cost && tw.dress[tw.idx(...P(1, 2))] === 1, 'the avenue is planted and paid for');
+  ok(applyDress(tw, all, 1).ok && tw.money === m0 - trees.cost && all.every(id => tw.roads.edges.get(id).dress === 1), 'the avenue is planted and paid for');
   sim.recompute();
   sim._budget();
   ok(sim.appeal[hi] > before + 1, `the cottage beside it likes it (appeal ${before.toFixed(1)} → ${sim.appeal[hi].toFixed(1)})`);
-  ok(Math.abs(sim.budget.expense.roads - upkeep0 - all.length * DRESSINGS[1].upkeep) < 1e-6, 'and the avenue has its upkeep');
+  ok(Math.abs(sim.budget.expense.roads - upkeep0 - lengthOf(tw, all) * DRESSINGS[1].upkeep) < 1e-6, 'and the avenue has its upkeep, by its length');
   let sp = dressSpots(tw);
-  const tileOf = (p) => [Math.floor(p.x), Math.floor(p.z)];
-  const at = (list, [x, z]) => list.filter(p => tileOf(p)[0] === x && tileOf(p)[1] === z);
-  ok(sp.trees.length > 10 && !at(sp.trees, P(4, 2)).length && !at(sp.trees, P(4, 6)).length, `street trees (${sp.trees.length}) stand clear of the junction and the bend`);
+  const knots = [...tw.roads.nodes.values()].filter(n => n.edges.length > 2 || n.edges.length === 1);
+  const clearOf = (list, r) => list.every(p => knots.every(n => Math.hypot(p.x - n.x, p.z - n.z) > r));
+  ok(sp.trees.length > 10 && clearOf(sp.trees, 0.4), `street trees (${sp.trees.length}) stand clear of the junction and the ends`);
   const door = doorPoint(H);
-  const nearDoor = (list, gap) => list.filter(p => p.z > door.z - 0.5 && Math.abs(p.x - door.x) < gap && tileOf(p)[1] === o.z + 2);
-  ok(forward > 0 && trees.back.includes(H.id) && H.front === 0 && sp.trees.some(p => tileOf(p)[0] === o.x + 2 && tileOf(p)[1] === o.z + 2 && p.z > o.z + 2.5), 'the cottage that stood forward into the street steps back behind its trees');
-  ok(!nearDoor(sp.trees, 0.2).length && (!H.front || !sp.trees.some(p => tileOf(p)[1] === o.z + 2 && tileOf(p)[0] === o.x + 2 && p.z > o.z + 2.5)), 'and leave the cottage its driveway');
+  ok(forward > 0 && trees.back.includes(H.id) && H.front === 0, `the cottage that stood forward into the street (${forward}) steps back behind its trees`);
+  ok(sp.trees.every(p => Math.hypot(p.x - door.x, p.z - door.z) > 0.2), 'and they leave the cottage its driveway');
   // hedges instead along the paved street: a quarter of the trees back
-  const m1 = tw.money, hedge = applyDress(tw, paved, 2);
-  ok(hedge.ok && hedge.refund === paved.length * dressRefund(1) && tw.money === m1 - hedge.spent + hedge.refund, 'swapping trees for hedges pays back a quarter of the trees');
+  const m1 = tw.money, hedge = applyDress(tw, pv, 2);
+  ok(hedge.ok && hedge.refund === units(pv) * dressRefund(1) && tw.money === m1 - hedge.spent + hedge.refund, 'swapping trees for hedges pays back a quarter of the trees');
   sp = dressSpots(tw);
-  ok(sp.hedges.length > 50 && !nearDoor(sp.hedges, 0.13).length && !at(sp.hedges, P(4, 2)).length, `hedges (${sp.hedges.length} plants) run along the street with gaps at the junction and the driveway`);
+  ok(sp.hedges.length > 50 && sp.hedges.every(p => Math.hypot(p.x - door.x, p.z - door.z) > 0.13) && clearOf(sp.hedges, 0.3), `hedges (${sp.hedges.length} plants) run along the street with gaps at the junction and the driveway`);
   // lamps down the cobbled street, instead of its plain ones
-  applyDress(tw, cob, 3);
+  const plainOn = (ids) => plainLamps(tw).filter(p => { const h = tw.roads.nearest(p.x, p.z, 0.6); return h && ids.includes(h.e.id); }).length;
+  ok(plainOn(cb) > 0, `a plain cobbled street has its street lamps (${plainOn(cb)})`);
+  applyDress(tw, cb, 3);
   sp = dressSpots(tw);
-  ok(sp.lamps.length >= 1 && cob.every(([x, z]) => !plainLamp(tw, x, z)), `a lamp-lit street has its own lamps (${sp.lamps.length}) and none of the plain ones`);
+  ok(sp.lamps.length >= 3 && !plainOn(cb), `a lamp-lit street has its own lamps (${sp.lamps.length}) and none of the plain ones`);
   // a planted median down the paved street
-  applyDress(tw, paved, 4);
+  applyDress(tw, pv, 4);
   sp = dressSpots(tw);
-  ok(sp.medians.length === 6 && !at(sp.medians.map(m => ({ x: (m.x0 + m.x1) / 2, z: (m.z0 + m.z1) / 2 })), P(4, 2)).length && sp.shrubs.length > 6, 'the median runs down the straight paved tiles, stopping short of the junction and the ends');
-  ok(planRoadEdit(tw, paved, 'down').undressed === paved.length, 'downgrading below paving would take the median off');
-  applyRoadEdit(tw, [P(1, 2)], 'down');
-  ok(tw.dress[tw.idx(...P(1, 2))] === 0 && tw.roadAt(...P(1, 2)) === 2, 'and does');
+  ok(sp.medians.length === pv.length && sp.shrubs.length > 6 && sp.medians.every(md => md.pts.every(([x, z]) => knots.every(n => Math.hypot(x - n.x, z - n.z) > 0.4))), 'the median runs down the paved street, stopping short of the junction and the ends');
+  ok(planRoadEdit(tw, pv, 'down').undressed === pv.length, 'downgrading below paving would take the median off');
+  applyRoadEdit(tw, [pv[0]], 'down');
+  ok(tw.roads.edges.get(pv[0]).dress === 0 && tw.roads.edges.get(pv[0]).level === 2, 'and does');
   // saved, sent to guests through the command, and gone with the road
   const back = deserialize(JSON.parse(JSON.stringify(serialize(tw))));
-  ok(back.dress.every((v, i) => v === tw.dress[i]) && back.dress.some(Boolean), 'saves keep the dressed streets');
+  ok(all.every(id => back.roads.edges.get(id).dress === tw.roads.edges.get(id).dress) && all.some(id => back.roads.edges.get(id).dress), 'saves keep the dressed streets');
   const g2 = { world: tw, demo: false, emit() {} };
-  ok(!runCommand(g2, { t: 'dress', kind: DRESSINGS.length, tiles: cob }).ok && runCommand(g2, { t: 'dress', kind: 0, tiles: [P(4, 6)] }).ok && !tw.dress[tw.idx(...P(4, 6))], 'the dress command refuses unknown kinds and can take a dressing away');
-  const m2 = tw.money, lampTile = P(4, 4);
-  ok(tw.removeRoad(...lampTile) === true && !tw.dress[tw.idx(...lampTile)] && tw.money === m2 + roadRefund(2, 0, false) + dressRefund(3), 'taking a lamp-lit tile up takes its lamp too (a quarter of both back)');
-}
+  ok(!runCommand(g2, { t: 'dress', kind: DRESSINGS.length, ids: cb }).ok && runCommand(g2, { t: 'dress', kind: 0, ids: [pv[1]] }).ok && !tw.roads.edges.get(pv[1]).dress, 'the dress command refuses unknown kinds and can take a dressing away');
+  const m2 = tw.money, rc = tw.removeCheck(cb[0]), ce = tw.roads.edges.get(cb[0]);
+  const want = Math.round(ROAD_LEVELS[2].cost * ce.len * ROAD_SALVAGE + dressRefund(3) * Math.max(1, Math.round(ce.len)));
+  ok(rc.ok && rc.refund === want && tw.removeRoadEdge(cb[0]) === true && tw.money === m2 + want, `taking a lamp-lit street up takes its lamps too (a quarter of both back: ${want})`);
+});
 
-// 3i. boulevards: roads laid side by side become a boulevard (a lane each
-// way, a median between) worked out from the roads alone; junctions, ends,
-// corners, crossings and bridges; looks priced, unlocked and researched like
-// dressings, liked by the neighbours, gone with the boulevard; traffic keeps
-// to its side; buildings still come forward; it all draws
-{
-  const { findBoulevards, boulevardTiles, medianSegs, boulevardSpots } = await import('../src/world/boulevard.js');
-  const { roadTile, surfaceAt, linked } = await import('../src/world/roadShape.js');
-  const { planDress, applyDress, dressSpots, plainLamp } = await import('../src/world/roadDress.js');
-  const { roadRun, planRoadEdit, applyRoadEdit } = await import('../src/world/roadEdit.js');
-  const { RoadsView } = await import('../src/render/roadsView.js');
-  const { NatureView } = await import('../src/render/natureView.js');
-  const { DRESSINGS, dressRefund, dressRefundAll, roadRefund, streetPart, lookPart, BOULEVARD } = await import('../src/config.js');
+// 3j. free placement: a building stands anywhere, at any angle, its front
+// to a street within reach: placed facing the road by itself, turned by the
+// player (as far as it still faces a street, a park any way), moved to a new
+// spot and angle; its plot is a turned rectangle that nothing overlaps; its
+// model stays on its plot whatever the angle, its door at the front; the
+// angle is saved
+await block('3j free placement', async () => {
   const { runCommand } = await import('../src/commands.js');
-  const tw = World.createNew({ N: 64, seed: 31, name: 'Boulevard Town' });
-  tw.money = 1e6;
-  // a free patch, levelled
-  let o = null;
-  for (let z = 1; z < tw.N - 24 && !o; z++) for (let x = 1; x < tw.N - 20 && !o; x++) {
-    let free = true;
-    for (let dz = -1; dz < 23 && free; dz++) for (let dx = -1; dx < 19 && free; dx++) {
-      const X = x + dx, Z = z + dz;
-      if (tw.terrain.isWater(X, Z) || tw.roadAt(X, Z) || tw.railAt(X, Z) || tw.buildingOn(X, Z)) free = false;
+  const { doorPoint } = await import('../src/world/world.js');
+  const { auditTown } = await import('./audit.js');
+  // every one-plot building's model stays on its plot (and the verge it may
+  // come forward into), and its door at the front, at any angle
+  let tried = 0, worst = 0, at = '', doors = 0, wrongDoor = 0;
+  for (const [type, def] of Object.entries(BUILDINGS)) {
+    // (not one that reaches over the water, a pier, on purpose, nor a farm's fields)
+    if (def.size !== 1 || def.merged || def.needsWater || def.fields) continue;
+    for (const [i, a] of [-2.4, -0.7, 0.35, 1.1, 2.9].entries()) {
+      const front = i % 2 ? 0.16 : 0;
+      const b = { type, level: def.levels.length - 1, variant: 11 + i, size: 1, w: 1, d: 1, x: 10.3, z: 7.7, a, baseY: 0.5, minY: 0.5, front, rail: def.needsRail ? { k: 2 } : null };
+      const m = buildModel(b), R = rect(b.x, b.z, a, 0.5, 0.5);
+      tried++;
+      for (const [wx, wz] of m.foot) {
+        const [lx, lz] = toLocal(R, wx, wz), out = Math.max(Math.abs(lx) - 0.5, -lz - 0.5, lz - 0.5 - front);
+        if (out > worst) { worst = out; at = `${type} L${b.level} at ${a}`; }
+      }
+      // (an open-air place's door, a pavilion's on the courts, say, isn't the way in)
+      if (m.door && !def.outdoor && !def.park) {
+        doors++;
+        const wdx = m.door.dx * Math.cos(a) + m.door.dz * Math.sin(a), wdz = -m.door.dx * Math.sin(a) + m.door.dz * Math.cos(a);
+        if (wdx * Math.sin(a) + wdz * Math.cos(a) < 0.7) wrongDoor++;
+      }
     }
-    if (free) o = { x, z };
   }
-  ok(!!o, 'found a free patch for the boulevard checks');
-  const P = (x, z) => [o.x + x, o.z + z];
-  for (let z = -1; z <= 23; z++) for (let x = -1; x <= 19; x++) tw.terrain.setCh(o.x + x, o.z + z, 0.5);
-  // a stretch of river under one boulevard (x 4..6 of rows 18, 19)
-  for (let z = 17; z <= 21; z++) for (let x = 4; x <= 7; x++) tw.terrain.setCh(o.x + x, o.z + z, -0.3);
-  for (let z = -1; z <= 23; z++) for (let x = -1; x <= 19; x++) tw._clearTrees(o.x + x, o.z + z);
-  const line = (x0, z0, x1, z1) => { const out = []; for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) out.push(P(x, z)); return out; };
-  tw.setSandbox({ unlockAll: true });
-  // A: paved, rows 2-3 from x 0 to 12, a cobbled street across at x 6,
-  // turning the corner at x 11-12 down to row 12
-  tw.placeRoads(line(0, 2, 12, 3), 3);
-  tw.placeRoads(line(6, 0, 6, 6), 2);
-  tw.placeRoads(line(11, 4, 12, 12), 3);
-  // a 2 × 2 block, three dirt roads side by side, a river under a fourth
-  tw.placeRoads(line(15, 0, 16, 1), 2);
-  tw.placeRoads(line(0, 13, 6, 15), 1);
-  tw.placeRoads(line(0, 18, 10, 19), 3);
-  tw.setSandbox({ unlockAll: false });
-  const bit = (x, z) => tw.blvd[tw.idx(...P(x, z))];
-  ok((bit(3, 2) & 4) && (bit(3, 3) & 1) && !(bit(3, 2) & 11), 'two roads side by side are a boulevard: a median between the lanes, and nothing across the other sides');
-  ok(!bit(6, 2) && !bit(6, 3) && (bit(5, 2) & 4) && (bit(7, 3) & 1), 'where a street crosses, the lanes join (no median across the junction)');
-  ok(!bit(0, 2) && roadTile(tw, ...P(0, 2)).bend >= 0 && roadTile(tw, ...P(0, 3)).bend >= 0, 'at the dead end the lanes join in a turning loop round the median');
-  ok((bit(11, 2) & 4) && (bit(11, 3) & 3) === 3 && (bit(12, 3) & 8) && !bit(12, 2) && roadTile(tw, ...P(12, 2)).bend >= 0, `the boulevard turns the corner with its median (corner bits ${bit(11, 2)}, ${bit(11, 3)}, ${bit(12, 3)})`);
-  ok((bit(11, 7) & 2) && (bit(12, 7) & 8) && !bit(11, 12) && roadTile(tw, ...P(12, 12)).bend >= 0, 'and runs on north-south to its own turning loop');
-  ok(![[15, 0], [16, 0], [15, 1], [16, 1]].some(([x, z]) => bit(x, z)), 'a 2 × 2 block of road stays a square');
-  ok((bit(3, 13) & 4) && (bit(3, 14) & 5) === 5 && (bit(3, 15) & 1), 'three roads side by side: two medians, the middle lane between them');
-  ok(tw.terrain.isWater(...P(5, 18)) && (bit(5, 18) & 4) && !linked(tw, ...P(5, 18), 2) && linked(tw, ...P(5, 18), 1), 'over water the lanes cross on bridges of their own');
-  const ls = roadTile(tw, ...P(3, 2));
-  ok(ls.arms[2] === 0 && ls.arms[1] > 0 && ls.arms[3] > 0 && !ls.fillets.length && ls.bend < 0, 'a lane is laid as a straight street, with no arm across the median');
-  ok(surfaceAt(tw, o.x + 3.5, o.z + 3.0) === 0 && surfaceAt(tw, o.x + 3.5, o.z + 2.5) > 0, 'the median between the lanes is not road');
-  const lamps = [];
-  for (const [x, z] of line(1, 2, 10, 3)) { const l = plainLamp(tw, x, z); if (l) lamps.push([z, l.z]); }
-  ok(lamps.length && lamps.every(([z, lz]) => (z === o.z + 2 ? lz < z + 0.5 : lz > z + 0.5)), `the lanes' street lamps (${lamps.length}) stand on their outer verges`);
-  // track across a boulevard
-  tw.setSandbox({ unlockAll: true });
-  tw.placeRails(line(9, 0, 9, 5));
-  tw.setSandbox({ unlockAll: false });
-  ok(!bit(9, 2) && !bit(9, 3) && (bit(8, 2) & 4) && (bit(10, 2) & 4), 'a level crossing breaks the median for the track');
-  // derived, never saved: a load works it out again
-  const saved = JSON.stringify(serialize(tw));
-  const back = deserialize(JSON.parse(saved));
-  ok(!/blvd/.test(saved) && back.blvd.every((v, i) => v === tw.blvd[i]), 'boulevards are never saved, and a loaded town works them out again');
-  ok(findBoulevards(tw).every((v, i) => v === tw.blvd[i]), 'and finding them again gives the same');
-  // picking: a click picks every lane of it, its loops included
-  const A = boulevardTiles(tw, ...P(3, 2));
-  const key = (l) => l.map(([x, z]) => `${x - o.x},${z - o.z}`).sort().join(' ');
-  ok(A.length === 10 && A.some(([x, z]) => x === o.x + 1 && z === o.z + 3), `a boulevard between its junctions is both its lanes (${A.length} tiles)`);
-  ok(key(roadRun(tw, ...P(3, 3))).includes('0,2') && roadRun(tw, ...P(3, 3)).length === 12, 'a click picks both lanes and the turning loop');
-  // looks: priced, unlocked, researched; only on boulevards
-  const pop = (n) => Object.defineProperty(tw, 'unlockPop', { value: n, configurable: true });
-  const TREES = DRESSINGS.findIndex(d => d && d.key === 'btrees'), FLOWERS = DRESSINGS.findIndex(d => d && d.key === 'bflowers');
-  const TRAM = DRESSINGS.findIndex(d => d && d.key === 'btram'), PROM = DRESSINGS.findIndex(d => d && d.key === 'bprom'), HEDGE = DRESSINGS.findIndex(d => d && d.key === 'bhedge');
-  ok([TREES, FLOWERS, TRAM, PROM, HEDGE].every(k => k > 0 && DRESSINGS[k].blvd), 'five boulevard looks');
-  pop(0);
-  ok(!planDress(tw, A, TREES).n && /Unlocks at 25/.test(planDress(tw, A, TREES).blocked[0].reason) && planDress(tw, A, HEDGE).n === A.length, 'a tree-lined median waits for a village; a hedge can go in from the start');
-  pop(500);
-  ok(/Research Gardening first/.test(planDress(tw, A, FLOWERS).blocked[0].reason) && /Research Fountains first/.test(planDress(tw, A, PROM).blocked[0].reason), 'flower beds need Gardening, a promenade Fountains');
-  tw.research.done.push('gardening', 'fountains', 'railways');
-  const street = line(13, 0, 14, 0);
-  tw.setSandbox({ unlockAll: true }); tw.placeRoads(street, 3); tw.setSandbox({ unlockAll: false }); pop(500);
-  ok(/Only on boulevards/.test(planDress(tw, [P(6, 2), ...street], TREES).blocked[0].reason), 'a look only goes on a boulevard (not its junctions or a plain street)');
-  const dirt = boulevardTiles(tw, ...P(3, 14));
-  ok(/Only on paved/.test(planDress(tw, dirt, TRAM).blocked[0].reason) && /Not on dirt/.test(planDress(tw, dirt, PROM).blocked[0].reason) && planDress(tw, dirt, FLOWERS).n === dirt.length, 'a tram needs paving, a promenade cobbles at least; flowers grow anywhere');
-  ok(/median of its own/.test(planDress(tw, A, 4).blocked[0].reason), "a planted median can't go down a boulevard's lane");
-  // a house fronting the boulevard comes forward, and stays forward
-  tw.setSandbox({ unlockAll: true });
-  const H = tw.placeBuilding('house', ...P(3, 1), { instant: true }).building;
-  const shop = tw.placeBuilding('grocer', ...P(5, 1), { instant: true }).building;
-  tw.setSandbox({ unlockAll: false }); pop(500);
-  ok(H.front > 0 && H.access && H.access.z === o.z + 2, 'a house beside a boulevard comes forward to the verge, as on a street');
-  ok(shop.rot === 0 && shop.corner === 2, `a shop on the corner of the boulevard and the cross street turns its shopfront round the corner (corner ${shop.corner})`);
-  // what the neighbours think
-  const tg = { world: tw, speed: 0, _ev: {}, on(e, f) { (this._ev[e] ||= []).push(f); }, emit(e, d) { for (const f of this._ev[e] || []) f(d); } };
-  const sim = new Sim(tg);
-  sim.recompute();
-  const hi = tw.idx(H.x, H.z), with0 = sim.appeal[hi];
-  const keep = tw.blvd.slice(); tw.blvd.fill(0); sim.recompute(); const none = sim.appeal[hi]; tw.blvd.set(keep);
-  ok(with0 > none + BOULEVARD.appeal, `a boulevard is a little nicer to live by than a plain street (appeal ${none.toFixed(1)} → ${with0.toFixed(1)})`);
-  sim._budget();
-  const up0 = sim.budget.expense.roads, m0 = tw.money, plan = planDress(tw, A, TREES);
-  ok(plan.n === A.length && plan.cost === A.length * DRESSINGS[TREES].cost, `a tree-lined median costs $${DRESSINGS[TREES].cost} a lane tile ($${plan.cost})`);
-  const g2 = { world: tw, demo: false, emit() {} };
-  ok(runCommand(g2, { t: 'dress', kind: TREES, tiles: A }).ok && tw.money === m0 - plan.cost && A.every(([x, z]) => lookPart(tw.dress[tw.idx(x, z)]) === TREES), 'the look goes in through the dress command, and is paid for');
-  sim.recompute(); sim._budget();
-  ok(sim.appeal[hi] > with0 + 1 && Math.abs(sim.budget.expense.roads - up0 - A.length * DRESSINGS[TREES].upkeep) < 1e-6, `the neighbours like its trees (appeal ${with0.toFixed(1)} → ${sim.appeal[hi].toFixed(1)}), and they have their upkeep`);
-  ok(H.front > 0, "trees down the median don't send the house back from the verge");
-  let sp = boulevardSpots(tw);
-  ok(sp.trees.length === medianSegs(tw).filter(s => s.look === 'btrees').length && sp.lamps.length > 0, `a tree on every tile of the median (${sp.trees.length}) and lamps between (${sp.lamps.length})`);
-  ok(sp.trees.every(t => Math.abs(t.z - (o.z + 3)) < 0.05), 'standing down the middle of the median');
-  // a street dressing beside the look: hedges on the outer verges, trees down the middle
-  const both = applyDress(tw, A, 2);
-  sim.recompute(); sim._budget();
-  ok(both.ok && !both.refund && A.every(([x, z]) => lookPart(tw.dress[tw.idx(x, z)]) === TREES && streetPart(tw.dress[tw.idx(x, z)]) === 2), 'a boulevard can have a street dressing on its verges and a look down its median, both');
-  ok(Math.abs(sim.budget.expense.roads - up0 - A.length * (DRESSINGS[TREES].upkeep + DRESSINGS[2].upkeep)) < 1e-6 && dressSpots(tw).hedges.filter(p => p.z > o.z + 2 && p.z < o.z + 4).every(p => p.z < o.z + 2.5 || p.z > o.z + 3.5), 'with the upkeep of both, the hedges on the outer verges');
-  ok(runCommand(g2, { t: 'dress', kind: 0, tiles: A }).ok && A.every(([x, z]) => lookPart(tw.dress[tw.idx(x, z)]) === TREES && !streetPart(tw.dress[tw.idx(x, z)])) && !runCommand(g2, { t: 'dress', kind: 0, tiles: A, look: 'yes' }).ok, 'taking the dressing away leaves the look (the command takes look: true or false only)');
-  // street trees on the lanes keep to the outer verges
-  applyDress(tw, line(0, 18, 10, 19).filter(([x, z]) => !tw.terrain.isWater(x, z)), 1);
-  const st = dressSpots(tw).trees.filter(t => t.z > o.z + 17 && t.z < o.z + 21);
-  ok(st.length > 4 && st.every(t => t.z < o.z + 18.5 || t.z > o.z + 19.5), `an avenue's trees on a boulevard stand on its outer verges, not in the median (${st.length})`);
-  ok(!medianSegs(tw).some(s => s.alongX && s.z0 === o.z + 19 && s.x0 >= o.x + 4 && s.x0 <= o.x + 6), 'no median between the twin bridges');
-  // every look draws, in every season
-  const NS = boulevardTiles(tw, ...P(11, 7));
-  applyDress(tw, NS, PROM);
-  applyDress(tw, dirt, FLOWERS);
-  const view = new RoadsView(tw, scene);
-  const fin = (g) => [...g.attributes.position.array].every(Number.isFinite);
-  ok(fin(view.surface.geometry) && fin(view.props.geometry) && view.segs.length > 10 && view.fountains > 0, `boulevards draw cleanly: medians (${view.segs.length} pieces), lamps, fountains (${view.fountains}), statues and benches`);
-  const plain = view.surface.geometry.attributes.position.count;
-  applyDress(tw, A, TRAM);
-  view.rebuild();
-  ok(view.surface.geometry.attributes.position.count > plain && fin(view.props.geometry), 'a tram reservation paves its median and lays its rails');
-  ok(view.setSeason(3, 0) === true && view.setSeason(3, 0.2) === false, 'the fountains freeze over when winter comes');
-  view.dispose();
-  const nv = new NatureView(tw, scene);
-  const counts = [0, 1, 2, 3].map(s => { nv.setSeason(s, 0); return nv.meshes.bloom.count; });
-  ok(counts[1] > counts[3], `the flower beds bloom in summer and lie bare in winter (${counts.join(', ')} flowers)`);
-  nv.dispose();
-  // traffic keeps to its side: east on the south lane, west on the north
-  const { PathFinder } = await import('../src/sim/path.js');
-  const pf = new PathFinder(tw);
-  const east = pf.road(...P(1, 3), ...P(5, 3)), west = pf.road(...P(5, 2), ...P(1, 2));
-  ok(east.every(([, z]) => z === o.z + 3) && west.every(([, z]) => z === o.z + 2), 'traffic keeps to its side of the boulevard');
-  const wrong = pf.road(...P(1, 2), ...P(5, 2));
-  ok(wrong && wrong.some(([, z]) => z === o.z + 3), 'and crosses to the other lane rather than go the wrong way along one');
-  // the boulevard goes, and its look with it (a quarter back)
-  const south = line(1, 3, 5, 3), north = line(1, 2, 5, 2);
-  applyDress(tw, north, 3);   // lamps on the north lane's verge, which stay
-  const rm = planRoadEdit(tw, south, 'remove');
-  const want = south.reduce((s, [x, z]) => s + roadRefund(3, 0, false) + dressRefundAll(tw.dress[tw.idx(x, z)]), 0) + north.reduce((s, [x, z]) => s + dressRefund(lookPart(tw.dress[tw.idx(x, z)])), 0);
-  ok(rm.unlooked === 5 && rm.refund === want, `taking up one lane would leave the other a plain street, its look gone (${rm.unlooked} tiles, $${rm.refund} back)`);
-  const m1 = tw.money, r1 = applyRoadEdit(tw, south, 'remove');
-  ok(r1.ok && tw.money === m1 + rm.refund && north.every(([x, z]) => !tw.blvd[tw.idx(x, z)] && tw.dress[tw.idx(x, z)] === 3), 'and does, paying back what the plan said, the street lamps staying');
-  // a street laid across a boulevard takes the look off its junction
-  const before = NS.filter(([x, z]) => lookPart(tw.dress[tw.idx(x, z)]) === PROM).length, m2 = tw.money;
-  tw.setSandbox({ unlockAll: true });
-  const cross = tw.placeRoads(line(10, 8, 13, 8), 3);
-  tw.setSandbox({ unlockAll: false });
-  ok(!tw.blvd[tw.idx(...P(11, 8))] && !tw.dress[tw.idx(...P(11, 8))] && !tw.dress[tw.idx(...P(12, 8))] && tw.money === m2 - cross.spent + 2 * dressRefund(PROM), `a street laid across makes a junction there, and its look comes off (a quarter back; ${before} tiles had it)`);
-  ok(lookPart(tw.dress[tw.idx(...P(11, 7))]) === PROM && lookPart(tw.dress[tw.idx(...P(11, 9))]) === PROM, 'the rest of the boulevard keeps its look');
-  applyDress(tw, NS, 2);
-  const data2 = JSON.parse(JSON.stringify(serialize(tw))), saved2 = deserialize(data2);
-  ok(tw.dress.some(v => lookPart(v) && streetPart(v)) && saved2.dress.every((v, i) => v === tw.dress[i]), "saves keep each lane's look and its street dressing");
-  const raw = Buffer.from(data2.dress, 'base64'), at = tw.idx(...P(11, 7));
-  raw[at] = TREES;   // a look where a street's dressing goes: not something the game writes
-  data2.dress = raw.toString('base64');
-  ok(!deserialize(data2).dress[at], 'a load drops a dressing it does not know');
-}
+  ok(tried > 150 && worst < 0.003, `at any angle, every one-plot building stays on its plot and the verge it comes forward into (${tried} tried, at most ${worst.toFixed(4)} over${worst > 0.003 ? ': ' + at : ''})`);
+  ok(doors > 100 && !wrongDoor, `and its door faces out of its front (${doors} doors)`);
+  // in a town: a curving street, houses along it
+  const tw = World.createNew({ N: 48, seed: 61, name: 'Turnham' });
+  tw.money = 1e6;
+  tw.setSandbox({ unlockAll: true, instantBuild: true });
+  const o = openBox(tw, 12, 9, { x: 12, z: 12 }, 1.5);
+  levelBox(tw, o.x, o.z, 12, 9);
+  street(tw, [[o.x + 0.5, o.z + 4], [o.x + 4, o.z + 3], [o.x + 8, o.z + 5.5], [o.x + 11.5, o.z + 4.5]], 2);
+  const e = [...tw.roads.edges.values()].find(e => e.pts.some(([x, z]) => Math.abs(x - o.x - 6) < 0.5 && z > o.z + 3.5));
+  const s = e.len * 0.45, p = pointAt(e.pts, e.cum, s), nx = -p[4], nz = p[3];
+  // a cottage dropped beside the curve faces it by itself, square to it
+  const cx = p[0] + nx * (SETBACK + 0.5), cz = p[1] + nz * (SETBACK + 0.5);
+  const cg = { world: tw, demo: false };
+  const pr = runCommand(cg, { t: 'place', type: 'house', x: cx, z: cz });
+  const hb = pr.building, want = Math.atan2(-nx, -nz);
+  ok(pr.ok && Math.abs(wrapAngle(hb.a - want)) < 0.01 && Math.abs(Math.sin(2 * hb.a)) > 0.05 && hb.connected !== undefined && hb.access && hb.access.e === e.id, `a cottage put down beside a curving street turns to face it, square to the curve (${hb ? hb.a.toFixed(3) : pr.reason})`);
+  const dp = doorPoint(hb), [dlx, dlz] = toLocal(plotOf(hb), dp.x, dp.z);
+  ok(Math.abs(dlx) < 1e-6 && Math.abs(dlz - 0.5) < 1e-6, 'its door step is the middle of its front');
+  // inside its turned plot, and not the box round it
+  const [ix, iz] = toWorld(ownPlot(hb), 0.45, 0.45), [ox2, oz2] = toWorld(ownPlot(hb), 0.56, 0);
+  ok(tw.buildingAt(ix, iz) === hb && tw.buildingAt(ox2, oz2) !== hb, 'what stands where follows its turned plot');
+  // placed turned on purpose, and refused turned away from the street
+  const s2 = Math.min(e.len - 0.6, s + 1.6), p2 = pointAt(e.pts, e.cum, s2), x2 = p2[0] - p2[4] * (SETBACK + 0.5), z2 = p2[1] + p2[3] * (SETBACK + 0.5), a2 = Math.atan2(p2[4], -p2[3]);
+  const askew = runCommand(cg, { t: 'place', type: 'house', x: x2, z: z2, a: a2 + 0.3 });
+  ok(askew.ok && Math.abs(wrapAngle(askew.building.a - a2 - 0.3)) < 0.002, `a building can be placed turned a little from square to its street (${askew.reason || askew.building.a})`);
+  const away = tw.checkBuild('house', x2 + 3 * p2[3], z2 + 3 * p2[4], { a: a2 + PI / 2 });
+  ok(!away.ok && /street|road/i.test(away.reason), `turned to face away from every street, it is refused ("${away.reason}")`);
+  // turning: by the command, as far as it still faces a street
+  let refits = 0;
+  tw.on('building:refit', (b) => { if (b === hb) refits++; });
+  const a0 = hb.a;
+  ok(runCommand(cg, { t: 'turn', id: hb.id, a: a0 - 0.25 }).ok && Math.abs(wrapAngle(hb.a - a0 + 0.25)) < 0.002 && refits === 1 && hb.access, 'turned a little, it is rebuilt where it stands, still on its street');
+  ok(!runCommand(cg, { t: 'turn', id: hb.id, a: a0 + PI }).ok && !runCommand(cg, { t: 'turn', id: hb.id, a: 'west' }).ok, 'turned its back to the street, or by no angle at all, it is refused');
+  // a park needs no street: it turns any way
+  const gd = near(tw, 'garden', hb, { r: 3, conn: false });
+  ok(gd && tw.turnBuilding(gd.id, gd.a + 2.2).ok, 'a garden can be turned any way at all');
+  // turning into a neighbour is refused
+  const [nbx, nbz] = besideAt(hb, 'house', 1), nb = tw.placeBuilding('house', nbx, nbz, { a: hb.a });
+  ok(!nb.ok || !tw.turnBuilding(hb.id, hb.a + 0.6).ok, 'turning it into the plot next door is refused');
+  // moved, with its new angle, by the builders
+  tw.research.done.push('relocation');
+  const dest = findPlot(tw, 'house', { x: o.x + 10, z: o.z + 6 }, { r: 3 });
+  const mv = dest && runCommand(cg, { t: 'move', id: askew.building.id, x: dest.x, z: dest.z, a: dest.a });
+  ok(mv && mv.ok && Math.abs(wrapAngle(mv.building.a - dest.a)) < 0.002, 'a move takes it to a new spot at a new angle');
+  // nothing overlaps, and the angle is saved and loaded
+  const faults = [];
+  auditTown(tw, (m) => faults.push(m));
+  ok(!faults.length, `no plots overlap, turned or not${faults.length ? ': ' + faults.join('; ') : ''}`);
+  const back = deserialize(JSON.parse(JSON.stringify(serialize(tw))));
+  ok([...tw.buildings.values()].every(b => { const c = back.buildings.get(b.id); return c && c.a === b.a && c.x === b.x && c.z === b.z; }), 'where each building stands and its angle are saved and loaded');
+  ok(!runCommand(cg, { t: 'place', type: 'house', x: -3, z: 5 }).ok && !runCommand(cg, { t: 'place', type: 'house', x: 5, z: 5, a: 'north' }).ok, 'a place command off the map, or with no angle at all, is refused');
+});
 
 // 3z. every method the UI, game and input code call on themselves exists
 // (a missing one only shows up as a frozen game in the browser)
@@ -2085,7 +2041,7 @@ const placePair = (tw, ta, tb) => {
   const fsm = await import('node:fs');
   const missing = [];
   const esc = (s) => s.replace(/[$]/g, '[$]');
-  for (const f of ['src/ui/ui.js', 'src/game.js', 'src/ui/input.js', 'src/render/worldView.js', 'src/sim/construction.js', 'src/world/world.js', 'src/sim/sim.js', 'src/sim/agents.js', 'src/net/session.js', 'src/net/sync.js', 'src/net/cursors.js']) {
+  for (const f of ['src/ui/ui.js', 'src/game.js', 'src/ui/input.js', 'src/render/worldView.js', 'src/sim/construction.js', 'src/world/world.js', 'src/sim/sim.js', 'src/sim/agents.js', 'src/net/session.js', 'src/net/sync.js', 'src/net/cursors.js', 'src/world/net.js', 'src/sim/transit.js']) {
     const src = fsm.readFileSync(new URL('../' + f, import.meta.url), 'utf8');
     const called = new Set([...src.matchAll(/this\.([A-Za-z_$][\w$]*)\(/g)].map(m => m[1]));
     for (const name of called) {
@@ -2097,263 +2053,56 @@ const placePair = (tw, ta, tb) => {
   ok(!missing.length, 'no calls to missing methods' + (missing.length ? ': ' + missing.join(', ') : ''));
 }
 
-// 3j. diagonal streets: a drag at 45 degrees lays a street corner to corner,
-// linked across the tiles' shared corners and cut off from the roads it
-// brushes past; it meets the grid in junctions and corners and other
-// diagonals in crossings and turns, all laid from one field that agrees at
-// every tile edge; the network, villagers and coaches follow it; one-tile
-// buildings beside it turn to face it and nothing bigger may stand there;
-// boulevards, dressings and bridges keep to the grid; it saves, loads and
-// tidies itself; a town without any saves as it always did
-{
-  const { strokeTiles, tidyDiag, turnDiag, facingAngle } = await import('../src/world/diagonal.js');
-  const { roadTile, shapeOf, shapeAt, surfaceAt, fieldAt, linksOf, diagLinked, spillsOf, linked, HALF, CUT } = await import('../src/world/roadShape.js');
-  const { tilePolyline } = await import('../src/sim/path.js');
-  const { roadRun } = await import('../src/world/roadEdit.js');
-  const { planDress, plainLamp } = await import('../src/world/roadDress.js');
-  const { RoadsView } = await import('../src/render/roadsView.js');
-  const { runCommand } = await import('../src/commands.js');
-  const { doorPoint } = await import('../src/world/world.js');
-  const { DIAG_BOX } = await import('../src/render/buildings.js');
-  const key = (l) => l.map(([x, z]) => `${x},${z}`).join(' ');
-  ok(key(strokeTiles({ x: 0, z: 0 }, { x: 3, z: 3 })) === '0,0 1,1 2,2 3,3', 'a drag at 45 degrees runs diagonally');
-  ok(key(strokeTiles({ x: 0, z: 0 }, { x: 5, z: 3 })) === '0,0 1,1 2,2 3,3 4,3 5,3', 'nearer 45 degrees than the grid it runs diagonally as far as it goes, then straight on');
-  ok(key(strokeTiles({ x: 0, z: 0 }, { x: 6, z: 2 })) === '0,0 1,0 2,0 3,0 4,0 5,0 6,0 6,1 6,2' && key(strokeTiles({ x: 0, z: 0 }, { x: 3, z: 3 }, false)) === '0,0 1,0 2,0 3,0 3,1 3,2 3,3', 'nearer the grid, or with the tool on the grid only, it turns one corner as before');
-
-  const tw = World.createNew({ N: 64, seed: 77, name: 'Slantwick' });
-  tw.money = 1e6;
-  let o = null;
-  for (let z = 1; z < tw.N - 28 && !o; z++) for (let x = 1; x < tw.N - 28 && !o; x++) {
-    let free = true;
-    for (let dz = -1; dz < 27 && free; dz++) for (let dx = -1; dx < 27 && free; dx++) {
-      const X = x + dx, Z = z + dz;
-      if (tw.terrain.isWater(X, Z) || tw.roadAt(X, Z) || tw.railAt(X, Z) || tw.buildingOn(X, Z)) free = false;
-    }
-    if (free) o = { x, z };
-  }
-  ok(!!o, 'found a free patch for the diagonal checks');
-  const P = (x, z) => [o.x + x, o.z + z], T = (x, z) => ({ x: o.x + x, z: o.z + z });
-  for (let z = -1; z <= 27; z++) for (let x = -1; x <= 27; x++) tw.terrain.setCh(o.x + x, o.z + z, 0.5);
-  for (let z = -1; z <= 26; z++) for (let x = -1; x <= 26; x++) tw._clearTrees(o.x + x, o.z + z);
-  tw.setSandbox({ unlockAll: true });
-  const lay = (a, b, L, diag = true) => tw.placeRoads(strokeTiles(T(...a), T(...b), diag), L, { stroke: true });
-  // a paved street along row 12, and a cobbled diagonal from (2, 4) down across it to (18, 20)
-  lay([0, 12], [14, 12], 3);
-  const r1 = lay([2, 4], [18, 20], 2);
-  ok(r1.placed === 16 && r1.linked > 0 && tw.diagN === 16, `a diagonal is laid tile by tile, linked across each corner (${r1.placed} laid, ${tw.diagN} links)`);
-  let both = true;
-  for (let i = 0; i < 16; i++) both &&= diagLinked(tw, ...P(2 + i, 4 + i), 1) && diagLinked(tw, ...P(3 + i, 5 + i), 3);
-  ok(both, 'every link runs both ways');
-  const st = roadTile(tw, ...P(5, 7));
-  ok(st.sdf && st.arms.every(a => !a) && !st.diag[0] && !st.diag[2] && st.diag[1] === HALF[2] && st.diag[3] === HALF[2] && linksOf(tw, ...P(5, 7)).every(l => l[2]), 'a tile on the diagonal runs corner to corner, with no arm along the grid');
-  tw.placeRoads([P(6, 7)], 1);
-  ok(tw.roadAt(...P(6, 7)) && !linked(tw, ...P(6, 7), 3) && !linked(tw, ...P(6, 7), 2) && roadTile(tw, ...P(6, 7)).arms.every(a => !a) && spillsOf(tw, ...P(6, 7)) === 4, 'a road laid beside it is cut off from it: the diagonal passes its corner by');
-  tw.placeRoads(strokeTiles(T(6, 6), T(6, 7), false), 1, { stroke: true });
-  ok(linked(tw, ...P(6, 6), 2) && !linked(tw, ...P(6, 7), 3), 'a street drawn between two tiles joins them');
-  const jn = roadTile(tw, ...P(10, 12));
-  ok(jn.arms[1] === HALF[3] && jn.arms[3] === HALF[3] && jn.diag[3] === HALF[2] && jn.diag[1] === HALF[2] && !jn.arms[0] && !jn.arms[2], 'where it crosses the paved street, the street runs on and the diagonal crosses it');
-  ok(!linked(tw, ...P(9, 11), 2) && !linked(tw, ...P(11, 13), 0) && linked(tw, ...P(9, 12), 1) && spillsOf(tw, ...P(9, 12)) === 1 && spillsOf(tw, ...P(11, 12)) === 4, 'and the street beside the crossing keeps to itself, the diagonal spilling over its corners');
-  ok(surfaceAt(tw, o.x + 5.5, o.z + 7.5) > 0 && surfaceAt(tw, o.x + 6, o.z + 8) > 0 && surfaceAt(tw, o.x + 6.04, o.z + 7.96) > 0 && surfaceAt(tw, o.x + 5.9, o.z + 7.1) === 0, 'its road runs along the middle and over the corner into the tiles beside, with verge either side');
-  // a dirt diagonal crossing it on a tile; at its end a turn back the other
-  // way, which runs on diagonally and then turns onto the grid
-  lay([11, 19], [17, 13], 1);
-  lay([18, 20], [22, 13], 3);
-  const x6 = roadTile(tw, ...P(14, 16));
-  ok(x6.diag.every(Boolean) && x6.arms.every(a => !a), 'two diagonals cross on a tile');
-  const v = roadTile(tw, ...P(18, 20)), c = roadTile(tw, ...P(22, 16));
-  ok(v.diag[3] && v.diag[0] && !v.diag[1] && !v.arms.some(Boolean) && c.diag[2] && c.arms[0] && !c.arms[2], 'one turns back the other way, and turns again onto the grid');
-  // every tile edge a diagonal touches: both tiles lay the same road there
-  let edges = 0, clash = 0, worst = 0;
-  for (let z = -1; z < 25; z++) for (let x = -1; x < 25; x++) {
-    const [ax, az] = P(x, z);
-    for (const [dx, dz] of [[1, 0], [0, 1]]) {
-      const a = shapeOf(tw, ax, az), b = shapeOf(tw, ax + dx, az + dz);
-      if (!a || !b || !(a.sdf || b.sdf)) continue;
-      edges++;
-      for (let t = 0.01; t < 1; t += 0.02) {
-        const px = dx ? ax + 1 : ax + t, pz = dx ? az + t : az + 1;
-        if (a.sdf && b.sdf) {
-          // (near the road's edge, where it shows)
-          const fa = fieldAt(a.prims, px, pz)[0], fb = fieldAt(b.prims, px, pz)[0];
-          if (Math.min(Math.abs(fa), Math.abs(fb)) < 0.06) worst = Math.max(worst, Math.abs(fa - fb));
-        }
-        if (!!shapeAt(a, px, pz, 0) !== !!shapeAt(b, px, pz, 0)) {
-          const f = (a.sdf ? fieldAt(a.prims, px, pz) : fieldAt(b.prims, px, pz))[0];
-          if (Math.abs(f) > 0.004) clash++;
-        }
-      }
-    }
-  }
-  ok(edges > 40 && clash === 0 && worst < 0.002, `the road meets itself at every tile edge a diagonal touches (${edges} edges, at most ${worst.toFixed(4)} apart)`);
-  let bent = 0;
-  for (let s = 3; s <= 7; s += 0.01) for (const e of [HALF[2] - 0.004, HALF[2] + 0.004]) {
-    const px = o.x + s + e / Math.SQRT2 + 0.5, pz = o.z + 2 + s - e / Math.SQRT2 + 0.5;
-    if (!!surfaceAt(tw, px, pz) !== (e < HALF[2])) bent++;
-  }
-  ok(bent === 0, 'and its edges run straight, tile after tile');
-  // the network
-  tw.entry = { x: o.x, z: o.z + 12 };
-  tw.updateRoadNetwork();
-  ok([P(2, 4), P(22, 13), P(11, 19), P(17, 13)].every(p => tw.connected[tw.idx(...p)]) && !tw.connected[tw.idx(...P(6, 7))], 'the diagonals join the town, but not the road cut off beside one');
-  const pf = new PathFinder(tw);
-  const way = pf.road(...P(2, 4), ...P(18, 20));
-  ok(way && way.length === 17, `the way along it runs straight down the diagonal (${way && way.length} tiles)`);
-  const way2 = pf.road(...P(2, 4), ...P(0, 12)), way3 = pf.road(...P(11, 19), ...P(22, 13));
-  const stepOk = (p) => p.every((t, i) => !i || linksOf(tw, ...p[i - 1]).some(([x, z]) => x === t[0] && z === t[1]));
-  ok(way2 && way3 && stepOk(way2) && stepOk(way3) && way2.length === 19, `round its corners, only ever by a link (${way2 && way2.length}, ${way3 && way3.length} tiles)`);
-  const onRoad = (pts) => pts.every(([x, z]) => surfaceAt(tw, x, z) > 0);
-  ok([way2, way3].every(p => onRoad(tilePolyline(p, 0.08)) && onRoad(tilePolyline(p, -0.08))) && onRoad(tilePolyline(way2, 0.17)), 'villagers either side of the way, and coaches on a cobbled one, keep to the road, corners and all');
-  // buildings
-  const h1 = tw.placeBuilding('house', ...P(4, 5), { instant: true }).building;
-  const h2 = tw.placeBuilding('house', ...P(3, 6), { instant: true }).building;
-  const acc = (b) => `${b.access.x - o.x},${b.access.z - o.z}`;
-  ok(h1 && h2 && h1.diag === 3 && h2.diag === 1 && ['3,5', '4,6'].includes(acc(h1)) && ['3,5', '4,6'].includes(acc(h2)), 'a house either side of it turns to face it, its way in from the diagonal');
-  const dp = doorPoint(h1);
-  ok(surfaceAt(tw, dp.x, dp.z) === 0 && Math.hypot(dp.x - (o.x + 4), dp.z - (o.z + 6)) < 0.45 && h1.connected, 'its door step is at the pavement by the corner the street passes');
-  // the model fits between the street and the plots behind
-  const fit = {}, m = buildModel(h1, { fit });
-  m.geo.computeBoundingBox();
-  const bb = m.geo.boundingBox, th = facingAngle(h1), co = Math.cos(th), si = Math.sin(th), hx = h1.x + 0.5, hz = h1.z + 0.5;
-  const foot = [[bb.min.x, bb.min.z], [bb.max.x, bb.min.z], [bb.min.x, bb.max.z], [bb.max.x, bb.max.z]].map(([lx, lz]) => [hx + lx * co + lz * si, hz - lx * si + lz * co]);
-  const mine = new Set([`${h1.x},${h1.z}`, `${h1.x - 1},${h1.z}`, `${h1.x},${h1.z + 1}`]);
-  ok(bb.max.z <= DIAG_BOX.z1 + 0.02 && foot.every(([x, z]) => mine.has(`${Math.floor(x)},${Math.floor(z)}`) && !surfaceAt(tw, x, z)) && m.door && m.door.dz > 0.9, `turned 45 degrees, the house stands on its own plot and the verges beside it, off the road, its door to the street (shrunk to ${fit.k.toFixed(2)})`);
-  ok(!tw.checkBuild('plaza', ...P(8, 8)).ok && /diagonal/.test(tw.checkBuild('plaza', ...P(8, 8)).reason), 'nothing bigger than one tile may stand where a diagonal passes its corner');
-  ok(tw.placeBuilding('plaza', ...P(6, 0), { instant: true }).ok, 'a square beside where a diagonal will try to go');
-  const sk = tw.checkStroke(strokeTiles(T(9, 0), T(6, 3)), 2);
-  ok(!sk[2].ok && /corner/.test(sk[2].reason), 'nor may a diagonal pass the corner of anything bigger');
-  ok(!tw.expandOptions(h1).length && !tw.mergeOptions(h1).length, 'a house facing a diagonal neither grows onto the plot beside it nor joins its neighbour');
-  tw.removeRoad(...P(4, 6));
-  ok(!h1.diag && h1.access && h1.access.x === o.x + 3, 'with the diagonal gone it faces the street along the grid again');
-  lay([3, 5], [5, 7], 2);
-  ok(h1.diag === 3, 'and turns back when it is laid again');
-  // bridges, boulevards and dressings keep to the grid
-  for (let z = 22; z <= 25; z++) for (let x = 22; x <= 25; x++) tw.terrain.setCh(o.x + x, o.z + z, -0.4);
-  ok(tw.terrain.isWater(...P(23, 23)) && /grid/.test(tw.checkStroke(strokeTiles(T(21, 21), T(23, 23)), 1)[1].reason || ''), 'a diagonal does not cross water: bridges run along the grid');
-  lay([0, 20], [4, 24], 2);
-  lay([1, 20], [5, 24], 2);
-  ok([0, 1, 2, 3, 4].every(i => !tw.blvd[tw.idx(...P(i, 20 + i))] && !tw.blvd[tw.idx(...P(1 + i, 20 + i))]) && linksOf(tw, ...P(2, 21)).every(l => l[2]), 'two diagonals side by side stay two streets, not a boulevard');
-  const pd = planDress(tw, [P(5, 7)], 1);
-  ok(pd.n === 0 && /plain/.test(pd.blocked[0].reason), 'street dressings keep off diagonals');
-  const lamps = [];
-  for (let i = 0; i < 16; i++) { const [x, z] = P(2 + i, 4 + i), l = plainLamp(tw, x, z); if (l) lamps.push([l, x + 0.5, z + 0.5]); }
-  ok(lamps.length && lamps.every(([l, cx, cz]) => !surfaceAt(tw, l.x, l.z) && surfaceAt(tw, l.x + (cx - l.x) * 0.4, l.z + (cz - l.z) * 0.4)), `a cobbled diagonal has street lamps at the edge of its verge (${lamps.length})`);
-  ok(roadRun(tw, ...P(5, 7)).length === 8, 'picking a stretch of it follows the diagonal to the junction');
-  // water and the rest come along the streets
-  const well = tw.placeBuilding('well', ...P(8, 9), { instant: true }).building;
-  const tg = { world: tw, speed: 0, _ev: {}, on(e, f) { (this._ev[e] ||= []).push(f); }, emit(e, d) { for (const f of this._ev[e] || []) f(d); } };
-  const sim = new Sim(tg);
-  sim.recompute();
-  ok(well && well.diag && well.connected && sim.coverage.water[tw.idx(...P(14, 16))] === 1 && sim.coverage.water[tw.idx(...P(20, 18))] === 1, 'a well facing the diagonal feeds the mains along it');
-  // it draws
-  const rv = new RoadsView(tw, { add() {}, remove() {} });
-  const pos = rv.surface.geometry.attributes.position.array;
-  let nan = false, near = 0;
-  for (let i = 0; i < pos.length; i += 3) { if (!Number.isFinite(pos[i]) || !Number.isFinite(pos[i + 1])) nan = true; if (Math.abs(pos[i] - (o.x + 6)) < 0.2 && Math.abs(pos[i + 2] - (o.z + 8)) < 0.2) near++; }
-  ok(!nan && near > 6, `the road surface is laid across the corners (${pos.length / 9} triangles)`);
-  // commands, saves, turning
-  const cg = { world: tw, demo: false };
-  ok(runCommand(cg, { t: 'roads', tiles: [P(1, 1), P(3, 3)], level: 1, stroke: true }).reason === "That action isn't valid" && runCommand(cg, { t: 'roads', tiles: [P(0, 0), P(1, 1)], level: 1, stroke: true }).placed === 2 && diagLinked(tw, ...P(0, 0), 1), 'a drag sent as a command is checked step by step, and links what it lays');
-  const saved = serialize(tw), back = deserialize(JSON.parse(JSON.stringify(saved)));
-  ok(typeof saved.diag === 'string' && back.diagN === tw.diagN && back.diag.every((d, i) => d === tw.diag[i]) && back.buildings.get(h1.id).diag === 3 && !JSON.stringify(saved.buildings).includes('diag'), 'diagonals save and load, and the houses work out again which way to face');
-  ok(!('diag' in serialize(w)), 'a town without diagonals saves just as before');
-  const junk = JSON.parse(JSON.stringify(saved));
-  const raw = Buffer.from(junk.diag, 'base64');
-  for (let i = 0; i < raw.length; i += 7) raw[i] = 255;
-  junk.diag = raw.toString('base64');
-  const jw = deserialize(junk), d2 = jw.diag.slice();
-  tidyDiag(jw);
-  ok(jw.diag.every((d, i) => d === d2[i]) && jw.diag.every((d, i) => !d || jw.roads[i]) && [...jw.diag].every((d, i) => [0, 1, 2, 3].every(k => !(d & (1 << k)) || diagLinked(jw, i % jw.N, (i / jw.N) | 0, k))), 'a damaged save is tidied as it loads: links only between roads, both ways');
-  ok(turnDiag(1, 1) === 2 && turnDiag(8 | (CUT << 3), 1) === (1 | CUT) && turnDiag(0x5a, 4) === 0x5a && turnDiag(turnDiag(0x36, 1), 3) === 0x36, 'a turned town turns its diagonals with it');
-}
-
-// 3k. freeform: a building can be turned to any angle on its plot (up to 45
-// degrees either way from facing its street) and nudged on it; whatever the
-// turn, its model stays on its plot (and the verge it may come forward
-// into), its door turns with it, and its real footprint is a polygon in
-// world space. One beside the outside of a bend in the street squares itself
-// to the curve. Poses are placed, changed and squared up by commands, saved,
-// and checked
-{
-  const { cleanPose, poseRec, TURN_MAX, NUDGE } = await import('../src/world/pose.js');
-  const { facingAngle } = await import('../src/world/diagonal.js');
-  const { strokeTiles } = await import('../src/world/diagonal.js');
-  const { surfaceAt } = await import('../src/world/roadShape.js');
-  const { runCommand } = await import('../src/commands.js');
-  ok(cleanPose([0.3, 0.1, -0.05]).a === 0.3 && cleanPose([9, 9, -9]).a === Math.round(TURN_MAX * 1000) / 1000 && cleanPose([9, 9, -9]).x === NUDGE && cleanPose([0, 0, 0]) === null && cleanPose(['x', 0, 0]) === null && cleanPose(null) === null, 'a pose is kept within its limits, and none at all is no pose');
-  // every one-tile building, turned and nudged, on a plain plot and coming forward into the street
-  const turns = [-TURN_MAX, -0.35, 0.2, TURN_MAX], nudges = [[0, 0], [NUDGE, -NUDGE], [-0.1, 0.15]];
-  let tried = 0, worst = 0, at = '', doors = 0, wrongDoor = 0;
-  for (const [type, def] of Object.entries(BUILDINGS)) {
-    if (def.size !== 1 || def.merged || def.needsRail || def.fields || def.needsWater) continue;
-    for (const [i, a] of turns.entries()) {
-      const [x, z] = nudges[i % nudges.length], rot = i % 4, front = i % 2 ? 0.16 : 0;
-      const b = { type, level: def.levels.length - 1, variant: 11 + i, size: 1, w: 1, d: 1, x: 10, z: 10, baseY: 0.5, minY: 0.5, rot, front, pose: cleanPose([a, x, z]) };
-      const m = buildModel(b);
-      tried++;
-      // its footprint in the plot's own frame (turned back by its facing)
-      const th = (rot * Math.PI) / 2, co = Math.cos(th), si = Math.sin(th);
-      for (const [wx, wz] of m.foot) {
-        const dx = wx - 10.5, dz = wz - 10.5, lx = dx * co - dz * si, lz = dx * si + dz * co;
-        const out = Math.max(Math.abs(lx) - 0.5, -lz - 0.5, lz - 0.5 - front);
-        if (out > worst) { worst = out; at = `${type} L${b.level} turned ${a.toFixed(2)}`; }
-      }
-      // (an open-air place's door, a pavilion's on the courts, say, isn't the
-      // way in, and may face any way)
-      if (m.door && !def.outdoor && !def.park) {
-        doors++;
-        const ft = facingAngle(b) + b.pose.a, c2 = Math.cos(ft), s2 = Math.sin(ft);
-        const wdx = m.door.dx * c2 + m.door.dz * s2, wdz = -m.door.dx * s2 + m.door.dz * c2;
-        if (wdx * Math.sin(ft) + wdz * Math.cos(ft) < 0.7) wrongDoor++;
-      }
-    }
-  }
-  ok(tried > 150 && worst < 0.003, `turned and nudged, every one-tile building stays on its plot and the verge it comes forward into (${tried} tried, at most ${worst.toFixed(4)} over${worst > 0.003 ? ': ' + at : ''})`);
-  ok(doors > 100 && !wrongDoor, `and its door turns with it (${doors} doors)`);
-  // in a town: placed turned, turned again, squared up; saved
-  const tw = World.createNew({ N: 48, seed: 61, name: 'Turnham' });
-  tw.money = 1e6;
-  tw.setSandbox({ unlockAll: true });
-  for (const b of [...tw.buildings.values()]) tw.demolishBuilding(b.id);
-  for (let z = 0; z < 48; z++) for (let x = 0; x < 48; x++) { tw.terrain.setCh(x, z, 0.5); tw._clearTrees(x, z); }
-  for (let z = 0; z < 48; z++) for (let x = 0; x < 48; x++) if (tw.roadAt(x, z) && !(x === tw.entry.x && z === tw.entry.z)) tw.removeRoad(x, z);
-  // an L street: along row 10, turning north up column 14
-  tw.placeRoads(strokeTiles({ x: 4, z: 10 }, { x: 14, z: 10 }, false), 2, { stroke: true });
-  tw.placeRoads(strokeTiles({ x: 14, z: 10 }, { x: 14, z: 4 }, false), 2, { stroke: true });
-  const cg = { world: tw, demo: false };
-  const pr = runCommand(cg, { t: 'place', type: 'house', x: 8, z: 11, yaw: 0.5 });
-  const hb = pr.building;
-  ok(pr.ok && hb.pose && hb.pose.a === 0.5 && !runCommand(cg, { t: 'place', type: 'house', x: 9, z: 11, yaw: 1.2 }).ok, 'a building can be placed turned (and no further than 45 degrees)');
-  let refits = 0;
-  tw.on('building:refit', (b) => { if (b === hb) refits++; });
-  ok(runCommand(cg, { t: 'pose', id: hb.id, pose: [-0.3, 0.12, -0.08] }).ok && hb.pose.a === -0.3 && hb.pose.x === 0.12 && hb.pose.z === -0.08 && refits === 1, 'turned and nudged again, it is rebuilt where it now stands');
-  ok(!runCommand(cg, { t: 'pose', id: hb.id, pose: [0, 0.5, 0] }).ok && !runCommand(cg, { t: 'pose', id: hb.id, pose: [0, 0] }).ok, 'a nudge off its plot, or a pose that makes no sense, is refused');
-  const saved = serialize(tw), back = deserialize(JSON.parse(JSON.stringify(saved)));
-  ok(JSON.stringify(back.buildings.get(hb.id).pose) === JSON.stringify(hb.pose) && JSON.stringify(poseRec(hb)) === JSON.stringify([-0.3, 0.12, -0.08]), 'its pose is saved and loaded');
-  const plain = JSON.parse(JSON.stringify(saved));
-  for (const rec of plain.buildings) rec.length = Math.min(rec.length, 15);
-  ok(!deserialize(plain).buildings.get(hb.id).pose && saved.buildings.filter(r => r.length > 15).length === 1, 'only a building with a pose saves one, and older saves load square');
-  ok(runCommand(cg, { t: 'pose', id: hb.id, pose: null }).ok && !hb.pose, 'squared up, it faces its street again');
-  // the outside of the bend: squared to its curve, on its plot and off the road
-  const bh = tw.placeBuilding('house', 14, 11, { instant: true }).building, bm = buildModel(bh);
-  ok(Math.abs(Math.abs(bh.curve) - 0.322) < 0.002 && !bm.foot.some(([x, z]) => surfaceAt(tw, x, z)) && bm.foot.every(([x, z]) => x > 13.99 && x < 15.01 && z > 10.83 && z < 12.01), `a house on the outside of a bend turns to sit square to the curve (${(bh.curve * 180 / Math.PI).toFixed(1)} degrees), on its plot and off the road`);
-  ok(!JSON.stringify(serialize(tw).buildings).includes('0.322') && deserialize(JSON.parse(JSON.stringify(serialize(tw)))).buildings.get(bh.id).curve === bh.curve, 'its turn comes from the street, so it is never saved, and a load works it out again');
-  tw.placeRoads(strokeTiles({ x: 14, z: 10 }, { x: 18, z: 10 }, false), 2, { stroke: true });
-  ok(!bh.curve, 'with the bend now a junction, it faces the street square again');
-}
-
 // 4. save round-trip
-const data = serialize(w);
-const json = JSON.stringify(data);
-const w2 = deserialize(JSON.parse(json));
-ok(w2.buildings.size === w.buildings.size, `save round-trip buildings (${w.buildings.size}) — ${(json.length / 1024).toFixed(0)} KB`);
-ok(w2.residents.size === w.residents.size, `save round-trip residents (${w.residents.size})`);
-ok(w2.trees.length === w.trees.length, `save round-trip trees (${w.trees.length})`);
-ok(w2.lines.length === w.lines.length, 'save round-trip lines');
-ok(JSON.stringify(w2.research.done) === JSON.stringify(w.research.done), 'save round-trip research');
-ok([...w.buildings.values()].every(b => { const c = w2.buildings.get(b.id); return c && c.type === b.type && fw(c) === fw(b) && fd(c) === fd(b) && (c.look || null) === (b.look || null) && JSON.stringify(c.leases || []) === JSON.stringify(b.leases || []); }), 'save round-trip plots, styles and land deals');
-let same = true;
-for (let i = 0; i < w.terrain.H.length; i++) if (Math.abs(w.terrain.H[i] - w2.terrain.H[i]) > 0.001) same = false;
-ok(same, 'save round-trip heights');
+{
+  const data = serialize(w);
+  const json = JSON.stringify(data);
+  const w2 = deserialize(JSON.parse(json));
+  ok(data.version === 2, `saves are version ${data.version}, roads and track as curves`);
+  ok(w2.buildings.size === w.buildings.size, `save round-trip buildings (${w.buildings.size}) — ${(json.length / 1024).toFixed(0)} KB`);
+  ok(w2.residents.size === w.residents.size, `save round-trip residents (${w.residents.size})`);
+  ok(w2.trees.length === w.trees.length, `save round-trip trees (${w.trees.length})`);
+  ok(w2.lines.length === w.lines.length, 'save round-trip lines');
+  ok(JSON.stringify(w2.research.done) === JSON.stringify(w.research.done), 'save round-trip research');
+  const sig = (b) => JSON.stringify([b.type, b.x, b.z, b.a, b.w, b.d, b.look || null, b.leases && b.leases.length ? b.leases : [], b.ext && (b.ext.x0 || b.ext.x1 || b.ext.z0 || b.ext.z1) ? b.ext : null]);
+  const diff = [...w.buildings.values()].filter(b => !w2.buildings.get(b.id) || sig(w2.buildings.get(b.id)) !== sig(b));
+  ok(!diff.length, `save round-trip plots, angles, styles and land deals${diff.length ? ': ' + diff.slice(0, 2).map(b => sig(b) + ' → ' + (w2.buildings.get(b.id) ? sig(w2.buildings.get(b.id)) : 'gone')).join('; ') : ''}`);
+  ok(JSON.stringify(w2.roads.toRec()) === JSON.stringify(w.roads.toRec()) && w2.roads.edges.size === w.roads.edges.size, `save round-trip roads (${w.roads.edges.size} stretches, ${w.roads.nodes.size} junctions and ends)`);
+  ok([...w.buildings.values()].every(b => { const c = w2.buildings.get(b.id); return !!c.access === !!b.access && c.connected === b.connected; }), 'and every building finds its way to the street again');
+  let same = true;
+  for (let i = 0; i < w.terrain.H.length; i++) if (Math.abs(w.terrain.H[i] - w2.terrain.H[i]) > 0.001) same = false;
+  ok(same, 'save round-trip heights');
+}
+
+// 4b. a town saved by the main game, on its grid of squares, loads here: its
+// plots become rectangles facing the four ways, its road squares curves
+// through their middles, its fields squares of farmland, and nothing overlaps
+await block('4b saves from the grid', async () => {
+  const fsm = await import('node:fs');
+  const { auditTown } = await import('./audit.js');
+  const old = JSON.parse(fsm.readFileSync(new URL('./fixtures/grid-town.json', import.meta.url), 'utf8'));
+  ok(old.version === 1 && Array.isArray(old.buildings), `the main game's save (version ${old.version}, ${old.buildings.length} buildings)`);
+  const tw = deserialize(JSON.parse(JSON.stringify(old)));
+  ok(tw.buildings.size === old.buildings.length, `every building comes over (${tw.buildings.size})`);
+  const square = [...tw.buildings.values()].filter(b => Math.abs(Math.sin(2 * b.a)) < 1e-3).length;
+  ok(square >= tw.buildings.size - 3, `each standing as it did, facing one of the four ways (${square} of ${tw.buildings.size}; any others turned to reach their street)`);
+  const faults = [];
+  auditTown(tw, (m) => faults.push(m));
+  ok(!faults.length, `nothing overlaps, nor stands on a road${faults.length ? ': ' + faults.slice(0, 5).join('; ') : ''}`);
+  const built = [...tw.buildings.values()].filter(b => !BUILDINGS[b.type].park), conn = built.filter(b => b.connected).length;
+  ok(conn === built.length, `and reaches its street as it did (${conn} of the ${built.length} that aren't parks on the roads to the way out)`);
+  ok(tw.roads.edges.size > 5 && [...tw.roads.edges.values()].every(e => e.level === 2) && tw.connected.size === tw.roads.nodes.size, `the streets come over as curves (${tw.roads.edges.size} stretches), cobbled as they were, all reaching the way out`);
+  const oldFields = old.buildings.filter(r => BUILDINGS[r[1]] && BUILDINGS[r[1]].fields).length;
+  ok(tw.parcels.size > 0 && [...tw.parcels.values()].every(f => tw.buildings.get(f.farm)) && oldFields > 0, `its fields come over as farmland squares (${tw.parcels.size})`);
+  ok(tw.residents.size === (old.residents || []).length && Math.round(tw.money) === Math.round(old.state.money), 'with its people and its money');
+  // and saves in the new way, and loads again the same
+  const again = serialize(tw), back = deserialize(JSON.parse(JSON.stringify(again)));
+  ok(again.version === 2 && back.buildings.size === tw.buildings.size && JSON.stringify(back.roads.toRec()) === JSON.stringify(tw.roads.toRec()), 'saved again, it is a gridless save, and loads the same');
+  // a sim runs on it
+  const g = listen(back), sim = new Sim(g);
+  sim.recompute();
+  ok(Number.isFinite(sim.happiness) && back.population > 0, `the sim runs on it (happiness ${Math.round(sim.happiness)})`);
+});
 
 // 5. snow: only in winter; a fall lays fresh snow on roads and roofs, and it
 // melts away again within the day (the same for everyone from the weather)
@@ -2383,24 +2132,25 @@ ok(same, 'save round-trip heights');
   ok(seasonBlend(1, 12) === 0 && seasonBlend(D / 2, 0) === 0 && seasonBlend(D, 23.9) > 0.97 && jump < 0.03, `seasons hold for half their days, then turn gradually (largest step in a quarter hour ${jump.toFixed(3)})`);
 }
 
-// ---- on a slope no building is buried in the hill (world.js floorHeight)
+// ---- on a slope no building is buried in the hill (world.js floorHeight),
+// whichever way it is turned
 {
-  const { floorHeight } = await import('../src/world/world.js');
-  const w = World.createNew({ N: 48, seed: 174231, name: 'Hillby' }), t = w.terrain;
+  const { floorHeight, groundUnder } = await import('../src/world/world.js');
+  const { rectSamples } = await import('../src/world/geom.js');
+  const hw = World.createNew({ N: 48, seed: 174231, name: 'Hillby' }), t = hw.terrain;
   let worst = 0, door = 0, n = 0;
   for (const [type, W, D] of [['house', 1, 1], ['terrace', 2, 1], ['quadrangle', 2, 2]]) {
-    for (let z = 2; z < 44; z += 2) for (let x = 2; x < 44; x += 2) for (let rot = 0; rot < 4; rot++) {
-      let lo = Infinity, hi = -Infinity;
-      for (let dz = 0; dz < D; dz++) for (let dx = 0; dx < W; dx++) { lo = Math.min(lo, t.tileMin(x + dx, z + dz)); hi = Math.max(hi, t.tileMax(x + dx, z + dz)); }
-      if (!(hi > lo) || hi - lo > 1.1 || [0, 1].some(i => t.isWater(x + i, z))) continue;
-      const f = floorHeight(t, type, x, z, W, D, rot, lo, hi);
+    for (let z = 3; z < 45; z += 2) for (let x = 3; x < 45; x += 2) for (const a of [0, PI / 2, 0.6, -2.2]) {
+      const R = rect(x + 0.3, z + 0.7, a, W / 2, D / 2), g = groundUnder(t, R);
+      if (g.water || !(g.maxH > g.minH) || g.maxH - g.minH > 1.1) continue;
+      const f = floorHeight(t, type, R, g.minH, g.maxH);
       n++;
-      for (const [u, v] of [[0.08, 0.08], [W - 0.08, 0.08], [0.08, D - 0.08], [W - 0.08, D - 0.08], [W / 2, D / 2]]) worst = Math.max(worst, t.heightAt(x + u, z + v) - f);
-      const [ddx, ddz] = [[0, 1], [1, 0], [0, -1], [-1, 0]][rot];
-      door = Math.max(door, t.heightAt(x + W / 2 + (ddx * W) / 2, z + D / 2 + (ddz * D) / 2) - f);
+      for (const [px, pz] of [...rectSamples(R, 0.25, 0.08), [R.cx, R.cz]]) worst = Math.max(worst, t.heightAt(px, pz) - f);
+      const [dx, dz] = toWorld(R, 0, R.hd);
+      door = Math.max(door, t.heightAt(dx, dz) - f);
     }
   }
-  ok(n > 500 && worst < 0.012 && door < 0.025, `on sloping ground no building's walls are buried (${n} plots and facings: the ground stands at most ${worst.toFixed(3)} above the floor, ${door.toFixed(3)} at the door)`);
+  ok(n > 500 && worst < 0.012 && door < 0.025, `on sloping ground no building's walls are buried, at any angle (${n} plots and turns: the ground stands at most ${worst.toFixed(3)} above the floor, ${door.toFixed(3)} at the door)`);
 }
 
 // ---- saves in the browser are packed (src/save/pack.js)

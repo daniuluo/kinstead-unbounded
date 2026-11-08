@@ -5,7 +5,7 @@ import { Terrain } from '../world/terrain.js';
 import { Net } from '../world/net.js';
 import { BUILDINGS, TECHS } from '../defs.js';
 import { titleFor, dressValid } from '../config.js';
-import { rect } from '../world/geom.js';
+import { rect, roundAngle } from '../world/geom.js';
 import { fromGrid } from './fromGrid.js';
 import { cleanText, cleanColor, hasKey, newTownId, isTownId } from '../util/text.js';
 import { pack, unpack } from './pack.js';
@@ -125,7 +125,8 @@ export function deserialize(data) {
       if (b.access || BUILDINGS[b.type].park) continue;
       const a = w.faceRoad(b.x, b.z, 1.6);
       if (a == null) continue;
-      if (w.accessFor(ownPlot({ ...b, a }))) { b.a = a; w._file(b); }
+      const R = ownPlot({ ...b, a });
+      if (w.accessFor(R) && !w._plotBlock(R, { except: [b], fields: true })) { b.a = roundAngle(a); w._file(b); }
     }
     w.updateRoadNetwork();
   }
