@@ -13,8 +13,8 @@ import { CONFIG } from '../config.js';
 import { PARK_MODELS, parkTree, blooms, spot } from './parks.js';
 import { CIVIC_MODELS } from './civic.js';
 import { formOf, planOf, roofFor, gableRoof, mansardRoof, gambrelRoof, parapetRoof, shapedGable, dormers, mansardDormers, porchOf, tallBay, balcony, turret, crest, wallGable, tower, bellcote } from './forms.js';
-import { facingAngle } from '../world/diagonal.js';
-import { poseJitter } from '../world/pose.js';
+import { ownPlot } from '../world/world.js';
+import { toWorld } from '../world/geom.js';
 
 const fw = (b) => b.w ?? b.size, fd = (b) => b.d ?? b.size;
 
@@ -7804,16 +7804,9 @@ const hasExt = (b) => !!(b.ext && (b.ext.x0 || b.ext.x1 || b.ext.z0 || b.ext.z1)
 const MIRRORED = new Set(['builder', 'lumber', 'workshop', 'joinery', 'contractor', 'craftshouse', 'brewhouse', 'foundry', 'timberworks', 'watchhouse', 'inn', 'teagarden', 'fishmarket', 'coachinginn', 'well', 'pump', 'powerplant', 'coachstop', 'musichall', 'markethall', 'deptstore', 'arcade']);
 
 // The part of the world a building may use, in its own local frame: its plot,
-// grown or shrunk by any garden land bought from or sold to a neighbour.
-// A building facing a diagonal street stands turned 45 degrees on its plot
-// (b.diag, see world/diagonal.js), its front at the pavement where the
-// street passes the plot's corner: in its own frame the plot is a diamond
-// (|x| + |z| <= 0.707) with the street's edge across its front point. The
-// largest square there that clears the plots behind keeps it to this box.
-export const DIAG_BOX = { x0: -0.36, x1: 0.36, z0: -0.343, z1: 0.377 };
-
+// grown or shrunk by any garden land bought from or sold to a neighbour
+// (b.ext, in its own frame: x0 its -x side, x1 +x, z0 its back, z1 its front).
 function plotBox(b, Ex, Ez) {
-  if (b.diag) return { ...DIAG_BOX };
   const box = landBox(b, Ex, Ez);
   // the front may come forward into the street's verge (b.front, set by the world)
   if (b.front) box.z1 += b.front;
@@ -7822,29 +7815,17 @@ function plotBox(b, Ex, Ez) {
 
 function landBox(b, Ex, Ez) {
   if (!hasExt(b)) return { x0: -Ex, x1: Ex, z0: -Ez, z1: Ez };
-  const e = b.ext, W = fw(b) / 2, D = fd(b) / 2;
-  const th = (b.rot * Math.PI) / 2, co = Math.cos(th), si = Math.sin(th);
-  const pts = [[-W - e.x0, -D - e.z0], [W + e.x1, -D - e.z0], [W + e.x1, D + e.z1], [-W - e.x0, D + e.z1]]
-    .map(([dx, dz]) => [dx * co - dz * si, dx * si + dz * co]);
-  const r = (v) => Math.round(v * 1e6) / 1e6;
-  return {
-    x0: r(Math.min(...pts.map(p => p[0]))), x1: r(Math.max(...pts.map(p => p[0]))),
-    z0: r(Math.min(...pts.map(p => p[1]))), z1: r(Math.max(...pts.map(p => p[1]))),
-  };
+  const e = b.ext;
+  return { x0: -Ex - e.x0, x1: Ex + e.x1, z0: -Ez - e.z0, z1: Ez + e.z1 };
 }
 
-// Small per-building yaw and offset so streets don't look ruled with a pencil
-// (or the turn and nudge the player gave it, or its turn to a curved street:
-// see world/pose.js).
-export function jitterOf(b) {
-  const p = poseJitter(b);
-  if (p) return p;
-  if (b.size > 1 || b.type === 'plaza' || b.type === 'station' || hasExt(b) || b.diag) return { yaw: 0, ox: 0, oz: 0 };
-  const h1 = hash2(b.variant & 0xffff, b.variant >>> 16, 31), h2 = hash2(b.variant & 0xffff, b.variant >>> 16, 32), h3 = hash2(b.variant & 0xffff, b.variant >>> 16, 33);
-  return { yaw: (h1 - 0.5) * 0.12, ox: (h2 - 0.5) * 0.04, oz: (h3 - 0.5) * 0.04 };
-}
+// A building stands on its plot exactly as the player set it down: at its
+// middle, facing the way it faces (no small random turn or offset: a town
+// without a grid has all the turns it needs).
+export function jitterOf() { return { yaw: 0, ox: 0, oz: 0 }; }
 
-// Outdoor area (fields, lawns, squares) in world coordinates, or null.
+// Outdoor area (fields, lawns, squares) as a wander area in the building's
+// own frame ([x0, z0, x1, z1, its plot]: see sim/agents.js inArea), or null.
 // Must match the c.work rectangles set by the models above.
 export function workArea(b) {
   let r = null;
@@ -7852,14 +7833,7 @@ export function workArea(b) {
   else if (b.type === 'garden' || b.type === 'playground' || b.type === 'courts') r = [-0.4, -0.4, 0.4, 0.4];
   else if (b.type === 'plaza' || b.type === 'sportsground') r = [-0.85, -0.85, 0.85, 0.85];
   if (!r) return null;
-  const E = b.size / 2, j = jitterOf(b);
-  // (turned to a diagonal, the model is fitted to DIAG_BOX: about three quarters the size)
-  if (b.diag) r = r.map((v, i) => v * 0.75 + (i % 2 ? 0.017 : 0));
-  const th = facingAngle(b) + j.yaw, co = Math.cos(th), si = Math.sin(th);
-  const cx = b.x + fw(b) / 2 + j.ox, cz = b.z + fd(b) / 2 + j.oz;
-  const pts = [[r[0], r[1]], [r[2], r[3]], ...(b.diag ? [[r[0], r[3]], [r[2], r[1]]] : [])].map(([lx, lz]) => [cx + lx * co + lz * si, cz - lx * si + lz * co]);
-  const xs = pts.map(p => p[0]), zs = pts.map(p => p[1]);
-  return [Math.min(...xs), Math.min(...zs), Math.max(...xs), Math.max(...zs)];
+  return [r[0], r[1], r[2], r[3], ownPlot(b)];
 }
 
 export function buildModel(b, opts = {}) {
@@ -7869,12 +7843,11 @@ export function buildModel(b, opts = {}) {
   const form = formOf(b.variant, pal);
   const rng = new RNG((b.variant ^ (b.level * 0x9E3779B1)) >>> 0);
   const E = b.size / 2;
-  // half-extents of the plot in the model's own (rotated) frame
-  const odd = (b.rot & 1) === 1;
-  const Ex = (odd ? fd(b) : fw(b)) / 2, Ez = (odd ? fw(b) : fd(b)) / 2;
-  const jit = opts.flat ? { yaw: 0, ox: 0, oz: 0 } : jitterOf(b);
-  const th = facingAngle(b) + jit.yaw, co = Math.cos(th), si = Math.sin(th);
-  const cx = b.x + fw(b) / 2 + jit.ox, cz = b.z + fd(b) / 2 + jit.oz;
+  // half-extents of the plot in the model's own frame (along its street, and deep)
+  const Ex = b.w / 2, Ez = b.d / 2;
+  const jit = { yaw: 0, ox: 0, oz: 0 };
+  const th = opts.flat ? 0 : b.a || 0, co = Math.cos(th), si = Math.sin(th);
+  const cx = b.x, cz = b.z;
   const ground = opts.ground;
   const makeCtx = (gb, rng) => {
   const c = {
@@ -7890,9 +7863,9 @@ export function buildModel(b, opts = {}) {
     lift: b.lift || 0,   // a gondola station standing taller (worked out by transit.js)
     cables: b.cables ? b.cables.map(a => a - th) : null,   // the headings its cables leave on, in this frame (transit.js)
     // an interchange's berths: where each is and the headings its cables leave on, in this frame (transit.js)
-    berths: b.berths ? b.berths.map(B => { const dx = B.x - b.x - fw(b) / 2, dz = B.z - b.z - fd(b) / 2; return { x: dx * co - dz * si, z: dx * si + dz * co, cables: B.cables.map(a => a - th), tint: B.tint || null }; }) : null,
+    berths: b.berths ? b.berths.map(B => { const dx = B.x - b.x, dz = B.z - b.z; return { x: dx * co - dz * si, z: dx * si + dz * co, cables: B.cables.map(a => a - th), tint: B.tint || null }; }) : null,
     tint: b.tint || null,   // a gondola station's line's colour, which it wears (transit.js)
-    railK: b.rail ? ((b.rail.dir - b.rot + 4) % 4) : 2,
+    railK: b.rail ? b.rail.k : 2,
     // ground height (relative to the current frame) under local point (x, z)
     gy(x, z) {
       if (!ground) return 0;
@@ -7971,8 +7944,8 @@ export function buildModel(b, opts = {}) {
   }
   if (own && geo) {
     // turned about the middle of its own footprint, and nudged as it was
-    const t = (b.rot * Math.PI) / 2, co = Math.cos(t), si = Math.sin(t), { x: px, z: pz } = annex.pc;
-    const ox = own.ox * co - own.oz * si, oz = own.ox * si + own.oz * co, cy = Math.cos(own.yaw), sy = Math.sin(own.yaw);
+    const { x: px, z: pz } = annex.pc;
+    const ox = own.ox, oz = own.oz, cy = Math.cos(own.yaw), sy = Math.sin(own.yaw);
     geo.translate(-px, 0, -pz); geo.rotateY(own.yaw); geo.translate(px + ox, 0, pz + oz); geo.computeBoundingSphere();
     const mv = (p) => { const x = p.x - px, z = p.z - pz; p.x = px + ox + x * cy + z * sy; p.z = pz + oz - x * sy + z * cy; };
     c.smoke.forEach(mv); c.glows.forEach(mv); c.spots.forEach(mv);

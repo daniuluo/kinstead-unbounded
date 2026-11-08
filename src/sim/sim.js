@@ -3,7 +3,8 @@
 import { CONFIG, ROAD_LEVELS, TITLES, titleFor, seasonOf, DRESSINGS, BOULEVARD, streetPart, lookPart } from '../config.js';
 import { BUILDINGS, SERVICES, TRANSIT, servicesOf, needsOf, hasFields, produceOf, researchOf, visitOf } from '../defs.js';
 import { RNG, hash2 } from '../util/rng.js';
-import { fw, fd, isOpen, capOf, sizeK, householdCap, seatOf, civicQuarter } from '../world/world.js';
+import { isOpen, capOf, sizeK, householdCap, seatOf, civicQuarter, plotOf } from '../world/world.js';
+import { grow, inRect, aabbOf, pointAt } from '../world/geom.js';
 import { firstName, lastName } from '../util/names.js';
 import { settleDay, startingWealth, yearsOf, eduOf, arrivingEdu, YEAR_DAYS, stageForAge, hasTrait, familyOf, householdsIn } from './people.js';
 
@@ -13,12 +14,14 @@ const SERVICE_KEYS = Object.keys(SERVICES);
 // no need to count the ones in.)
 const takesHousehold = (w, b) => { const H = householdCap(b); return H === Infinity || householdsIn(w, b) < H; };
 
-// The tiles around a building's middle out to a whole radius R, for each
-// footprint: offsets from its corner and how far each tile's centre is,
-// nearest first. Worked out once, so a reach or a look only has to be
-// compared, not measured, each time the town is recomputed.
+// The town's coverage, appeal and pollution are kept as maps of the ground,
+// a value for each unit square (as the terrain's mesh is): fields sampled
+// where each building stands, not squares anything is built on. A
+// building's own value is the one under its middle (cellOf).
+export const cellOf = (N, x, z) => Math.min(N - 1, Math.max(0, Math.floor(z))) * N + Math.min(N - 1, Math.max(0, Math.floor(x)));
+// (unused: kept so older imports of discOf still find it)
 const DISCS = new Map();
-function discOf(w, d, R) {
+export function discOf(w, d, R) {
   const key = (R * 64 + w) * 64 + d;
   let m = DISCS.get(key);
   if (m) return m;
@@ -168,10 +171,7 @@ export class Sim {
       const L = BUILDINGS[b.type].levels[b.level];
       b.powered = !!(isOpen(b) && b.connected && this.powerShare > 0 && (L.kw || hash2(b.id, 11, 5) < this.powerShare));
       if (!b.powered) continue;
-      for (let dz = -1; dz <= fd(b); dz++) for (let dx = -1; dx <= fw(b); dx++) {
-        const x = b.x + dx, z = b.z + dz;
-        if (x >= 0 && z >= 0 && x < N && z < N) P[z * N + x] = 1;
-      }
+      this._mark(P, grow(plotOf(b), 1));
     }
     // Water: wells, towers and pumps (some need power and hands too) feed
     // the mains under the streets, which reach every road-connected building
@@ -189,10 +189,10 @@ export class Sim {
     // the mains (for the water overlay): every connected street, and the
     // buildings with running water
     const Wc = this.coverage.water;
-    if (wSup > 0) for (let i = 0; i < N * N; i++) if (w.roads[i] && w.connected[i]) Wc[i] = 1;
+    if (wSup > 0) for (const e of w.roads.edges.values()) if (w.connected.has(e.a)) this._along(e, 0.5, (i) => { Wc[i] = 1; });
     for (const b of w.buildings.values()) {
       if (b.wet !== 2) continue;
-      for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) Wc[(b.z + dz) * N + b.x + dx] = 1;
+      this._mark(Wc, plotOf(b));
     }
     const A = this.appeal, Pol = this.pollution;
     for (const b of w.buildings.values()) {
@@ -217,30 +217,30 @@ export class Sim {
     }
     this._lights();
     // streets with their power lines underground look tidier
-    const buried = w.buried;
-    if (buried) for (let z = 0; z < N; z++) for (let x = 0; x < N; x++) {
-      if (!buried[z * N + x] || !w.roads[z * N + x]) continue;
-      for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
-        const nx = x + dx, nz = z + dz;
-        if (nx >= 0 && nz >= 0 && nx < N && nz < N) this.appeal[nz * N + nx] += 0.8;
-      }
-    }
-    // dressed streets cheer the homes and shops beside them (lamps only
-    // as much as the town can light them), and a boulevard a little before
-    // it has any look of its own
-    const dress = w.dress, blvd = w.blvd;
-    if (dress) for (let z = 0; z < N; z++) for (let x = 0; x < N; x++) {
-      const v = dress[z * N + x], D = DRESSINGS[streetPart(v)], E = DRESSINGS[lookPart(v)], lane = blvd && blvd[z * N + x] && w.roads[z * N + x];
-      if ((!D && !E && !lane) || !w.roads[z * N + x]) continue;
-      const a = (D ? D.appeal * (D.key === 'lamps' ? 0.4 + 0.6 * (this.lampShare ?? 0) : 1) : 0) + (E ? E.appeal : 0) + (lane ? BOULEVARD.appeal : 0);
+    // (a unit of street at a time, over the ground either side of it)
+    const beside = (e, a) => this._along(e, 1, (i) => {
+      const x = i % N, z = (i / N) | 0;
       for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
         const nx = x + dx, nz = z + dz;
         if (nx >= 0 && nz >= 0 && nx < N && nz < N) this.appeal[nz * N + nx] += a;
       }
+    });
+    for (const e of w.roads.edges.values()) if (e.buried) beside(e, 0.8);
+    // dressed streets cheer the homes and shops beside them (lamps only
+    // as much as the town can light them), and a boulevard a little before
+    // it has any look of its own
+    for (const e of w.roads.edges.values()) {
+      const v = e.dress, D = DRESSINGS[streetPart(v)], E = DRESSINGS[lookPart(v)];
+      if (!D && !E) continue;
+      const a = (D ? D.appeal * (D.key === 'lamps' ? 0.4 + 0.6 * (this.lampShare ?? 0) : 1) : 0) + (E ? E.appeal : 0);
+      beside(e, a);
     }
+    void BOULEVARD;
     // trees and water make places pleasant
+    const TC = this._tc && this._tc.length === N * N ? this._tc.fill(0) : (this._tc = new Uint8Array(N * N));
+    for (const tr of w.trees) { const i = cellOf(N, tr.x, tr.z); if (TC[i] < 255) TC[i]++; }
     for (let z = 0; z < N; z++) for (let x = 0; x < N; x++) {
-      const tc = w.treeCount[z * N + x];
+      const tc = TC[z * N + x];
       if (tc) {
         for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
           const nx = x + dx, nz = z + dz;
@@ -250,42 +250,43 @@ export class Sim {
     }
   }
 
-  // The tiles whose centres lie within r of building b's middle, into
-  // this._ti (tile index) and this._td (distance); returns how many.
+  // The squares of ground whose middles lie within r of building b's
+  // middle, into this._ti (index) and this._td (distance); returns how many.
   _within(b, r) {
     if (!(r >= 0)) return 0;
-    const N = this.world.N, m = discOf(fw(b), fd(b), Math.ceil(r));
-    if (this._ti.length < m.n) { this._ti = new Int32Array(m.n); this._td = new Float64Array(m.n); }
-    const ti = this._ti, td = this._td, D = m.d, DX = m.dx, DZ = m.dz;
+    const N = this.world.N, cx = b.x, cz = b.z;
+    const x0 = Math.max(0, Math.floor(cx - r - 0.5)), x1 = Math.min(N - 1, Math.ceil(cx + r)), z0 = Math.max(0, Math.floor(cz - r - 0.5)), z1 = Math.min(N - 1, Math.ceil(cz + r));
+    const most = Math.max(0, (x1 - x0 + 1) * (z1 - z0 + 1));
+    if (this._ti.length < most) { this._ti = new Int32Array(most); this._td = new Float64Array(most); }
+    const ti = this._ti, td = this._td;
     let n = 0;
-    for (let k = 0; k < m.n; k++) {
-      const d = D[k];
-      if (d > r) break;
-      const x = b.x + DX[k], z = b.z + DZ[k];
-      if (x < 0 || z < 0 || x >= N || z >= N) continue;
-      ti[n] = z * N + x; td[n] = d; n++;
+    for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) {
+      const d = Math.hypot(x + 0.5 - cx, z + 0.5 - cz);
+      if (d <= r) { ti[n] = z * N + x; td[n] = d; n++; }
     }
     return n;
   }
 
-  // Mark the same tiles in each of the maps (coverage), a row at a time.
+  // Mark the same squares in each of the maps (coverage).
   _cover(b, r, maps) {
-    if (!(r >= 0)) return;
-    const N = this.world.N, m = discOf(fw(b), fd(b), Math.ceil(r));
-    for (const row of m.rows) {
-      const z = b.z + row.dz;
-      if (z < 0 || z >= N) continue;
-      // how many of the row lie within r
-      const D = row.d;
-      let p = 0, hi = row.n;
-      while (p < hi) { const mid = (p + hi) >> 1; if (D[mid] <= r) p = mid + 1; else hi = mid; }
-      if (!p) continue;
-      if (row.ok[p]) {
-        const x0 = Math.max(0, b.x + row.span[2 * p]), x1 = Math.min(N - 1, b.x + row.span[2 * p + 1]);
-        if (x0 <= x1) for (const C of maps) C.fill(1, z * N + x0, z * N + x1 + 1);
-      } else {
-        for (let k = 0; k < p; k++) { const x = b.x + row.dx[k]; if (x >= 0 && x < N) for (const C of maps) C[z * N + x] = 1; }
-      }
+    const n = this._within(b, r), ti = this._ti;
+    for (const C of maps) for (let k = 0; k < n; k++) C[ti[k]] = 1;
+  }
+
+  // Mark the squares of ground a rectangle covers (their middles in it).
+  _mark(C, R) {
+    const N = this.world.N, [x0, z0, x1, z1] = aabbOf(R);
+    for (let z = Math.max(0, Math.floor(z0)); z <= Math.min(N - 1, Math.floor(z1)); z++) for (let x = Math.max(0, Math.floor(x0)); x <= Math.min(N - 1, Math.floor(x1)); x++) {
+      if (inRect(R, x + 0.5, z + 0.5, 0.5)) C[z * N + x] = 1;
+    }
+  }
+  // Call fn with the index of the square under each point every step along
+  // a road edge (each square once).
+  _along(e, step, fn) {
+    const N = this.world.N, seen = new Set();
+    for (let s = 0; s <= e.len + 1e-9; s += step) {
+      const p = pointAt(e.pts, e.cum, s), i = cellOf(N, p[0], p[1]);
+      if (!seen.has(i)) { seen.add(i); fn(i); }
     }
   }
 
@@ -374,21 +375,21 @@ export class Sim {
       if (!isOpen(o)) continue;
       const def = BUILDINGS[o.type];
       if (!(def.shop || def.leisure || def.play || def.stop || def.potter)) continue;
-      const at = { o, x: o.x + fw(o) / 2, z: o.z + fd(o) / 2, r: (def.levels[o.level].radius || 0) + 0.5 };
+      const at = { o, x: o.x, z: o.z, r: (def.levels[o.level].radius || 0) + 0.5 };
       if (def.shop || def.leisure) shops.push(at);
       if (def.play) play.push(at);
       if (def.potter) potter.push(at);
       if (def.stop) stops.push(at);
     }
     const near = (list, b, radius) => {
-      const cx = b.x + fw(b) / 2, cz = b.z + fd(b) / 2;
+      const cx = b.x, cz = b.z;
       for (const p of list) if (p.o !== b && Math.hypot(p.x - cx, p.z - cz) <= (radius ?? p.r)) return true;
       return false;
     };
     for (const b of w.buildings.values()) {
       const def = BUILDINGS[b.type];
       if (!def.levels[b.level].housing) continue;
-      const i = (b.z) * N + b.x;
+      const i = cellOf(N, b.x, b.z);
       const f = {};
       let h = 42;
       for (const s of SERVICE_KEYS) f[s] = !!this.coverage[s][i];
@@ -693,10 +694,9 @@ export class Sim {
         else exp.buildings += Math.round(L.upkeep * sizeK(b));
       }
     }
-    for (let i = 0; i < w.roads.length; i++) {
-      if (w.roads[i]) exp.roads += ROAD_LEVELS[w.roads[i]].upkeep + (w.dress && w.dress[i] ? (DRESSINGS[streetPart(w.dress[i])]?.upkeep || 0) + (DRESSINGS[lookPart(w.dress[i])]?.upkeep || 0) : 0);
-      if (w.rails[i]) exp.roads += 0.25;
-    }
+    // (a road's upkeep, and its dressing's, by its length)
+    for (const e of w.roads.edges.values()) exp.roads += e.len * (ROAD_LEVELS[e.level].upkeep + (e.dress ? (DRESSINGS[streetPart(e.dress)]?.upkeep || 0) + (DRESSINGS[lookPart(e.dress)]?.upkeep || 0) : 0));
+    for (const e of w.rails.edges.values()) exp.roads += e.len * 0.25;
     for (const line of w.lines) exp.transit += TRANSIT[line.mode].upkeep * line.vehicles;
     const sum = (o) => Object.values(o).reduce((a, b) => a + b, 0);
     this.budget = { income: inc, expense: exp, net: sum(inc) - sum(exp), totalIn: sum(inc), totalOut: sum(exp) };
@@ -713,12 +713,8 @@ export class Sim {
   }
 
   _treesNear(b, r) {
-    const w = this.world;
-    let n = 0;
-    for (let z = b.z - r; z <= b.z + fd(b) - 1 + r; z++) for (let x = b.x - r; x <= b.x + fw(b) - 1 + r; x++) {
-      if (w.inBounds(x, z)) n += w.treeCount[w.idx(x, z)];
-    }
-    return n;
+    const R = grow(plotOf(b), r);
+    return this.world.treeIx.query(aabbOf(R)).filter(tr => inRect(R, tr.x, tr.z)).length;
   }
 
   _demand() {

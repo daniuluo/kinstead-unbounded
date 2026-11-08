@@ -7,9 +7,9 @@ import { BUILDINGS, TRANSIT, LINE_COLORS, GONDOLA_COLORS, stopOf } from '../defs
 import { CONFIG } from '../config.js';
 import { GeoBuilder } from '../render/geo.js';
 import { MAT } from '../render/materials.js';
-import { tilePolyline, smoothPolyline } from './path.js';
-import { bridgeDeckY, isOpen, fw, fd } from '../world/world.js';
-import { curvesAt } from '../world/roadShape.js';
+import { routeCentre, offsetPath, smoothPolyline } from './path.js';
+import { bridgeDeckY, isOpen, plotOf, ownPlot, HALF } from '../world/world.js';
+import { rect, rectsOverlap, aabbOf, toWorld, angleOf, angDiff } from '../world/geom.js';
 
 const WARM = [1.7, 1.2, 0.55];
 
@@ -238,7 +238,8 @@ const GAP = 0.05, GAP_FOOT = 0.04, RING_WAIT = 3, THROUGH = 2.5, BACK = 0.35;
 const CART_GIVE_UP = 30;
 let serial = 0;
 const CAR_SPACING = 0.56;   // distance between train car centres along the track
-const STEP = [[0, 1], [1, 0], [0, -1], [-1, 0]];
+// the sharpest a train may turn through a switch or a joint in the track
+const RAIL_TURN = (60 * Math.PI) / 180;
 // Gondolas: the two cables run G_OFF either side of the line, G_CABLE above a
 // station's floor (its deck is level with a cabin's floor, G_HANG lower; see
 // MODELS.gondola), or up to G_LIFT higher where a station stands taller to
@@ -282,10 +283,9 @@ export class Transit {
     this.cartPlan = [];
     this.held = new Map();   // a bit of a junction or turning place → the vehicles with a claim on it (see _knot, _cell, _through)
     this.wants = new Map();  // ...and the one who has waited longest for a way through it
-    this._knots = new Map(); // (what each road tile is, see _knot)
-    this._turns = new Set(); // (where a line turns back on itself)
+    this._knots = new Map(); // (what each road junction is, see _zoneAt)
+    this._turns = [];        // (where a line turns back on itself: [x, z])
     this.world.on('roads', () => this._knots.clear());
-    this._curve = (x, z, outside) => curvesAt(this.world, x, z, outside);   // (round a bend in the road as it's laid, as the villagers do)
     this.dirty = true;
     this.geoCache = new Map();
     this.cables = new Map();   // gondola line id → its drawn cable, pylons and bullwheels
@@ -425,7 +425,7 @@ export class Transit {
     for (let i = 0; i + 1 < route.pts.length; i++) {
       const [ax, az] = route.pts[i], [bx, bz] = route.pts[i + 1], L = Math.hypot(bx - ax, bz - az) || 1e-6, nx = -(bz - az) / L, nz = (bx - ax) / L;
       for (let u = 0; u <= L; u += 0.2) for (const o of [-0.1, 0, 0.1]) {
-        const x = ax + ((bx - ax) * u) / L + nx * o, z = az + ((bz - az) * u) / L + nz * o, b = w.inBounds(Math.floor(x), Math.floor(z)) && w.buildingOn(Math.floor(x), Math.floor(z));
+        const x = ax + ((bx - ax) * u) / L + nx * o, z = az + ((bz - az) * u) / L + nz * o, b = w.buildingAt(x, z);
         if (b && !mine.has(b.id) && stopOf(b, 'gondola')) return `Its cable would pass over the ${BUILDINGS[b.type].levels[b.level].name} of another line: pick other stations`;
       }
     }
@@ -468,37 +468,37 @@ export class Transit {
     const stops = line.stops.map(id => w.buildings.get(id)).filter(Boolean);
     if (stops.length < 2) return null;
     if (line.mode === 'gondola') return stops.every(b => stopOf(b, 'gondola')) ? this._cableRoute(stops, lifts, this._ends(line, stops), line) : null;
-    const stopTiles = stops.map(b => this._stopTile(b, line.mode));
-    if (stopTiles.some(t => !t)) return null;
-    let tiles = [];
-    let stopIdx = [];
-    if (line.mode === 'rail') {
-      const loop = this._railLoop(stopTiles);
+    const stopAt = stops.map(b => this._stopTile(b, line.mode));
+    if (stopAt.some(t => !t)) return null;
+    const rail = line.mode === 'rail';
+    // the middle of the road (or track) round the whole loop, stop to stop
+    let C = [];
+    if (rail) {
+      const loop = this._railLoop(stopAt);
       if (!loop) return null;
-      ({ tiles, stopIdx } = loop);
+      C = loop;
     } else {
       for (let i = 0; i < stops.length; i++) {
-        const a = stopTiles[i], b = stopTiles[(i + 1) % stops.length];
-        const leg = paths.road(a.x, a.z, b.x, b.z);
+        const leg = paths.road(stopAt[i], stopAt[(i + 1) % stops.length]);
         if (!leg) return null;
-        stopIdx.push(tiles.length ? tiles.length - 1 : 0);
-        tiles = tiles.length ? tiles.concat(leg.slice(1)) : leg.slice();
+        for (const q of routeCentre(w.roads, leg)) {
+          const last = C[C.length - 1];
+          if (!last || Math.abs(last[0] - q[0]) + Math.abs(last[1] - q[1]) > 1e-6) C.push(q);
+        }
+      }
+      if (C.length < 2) return null;
+      // (where it turns back, at the end of the line, it swings right across
+      // the road: one at a time there, as in a junction, see _zoneAt)
+      const n = C.length;
+      for (let i = 0; i < n; i++) {
+        const a = C[(i - 1 + n) % n], b = C[i], c = C[(i + 1) % n];
+        const d1x = b[0] - a[0], d1z = b[1] - a[1], d2x = c[0] - b[0], d2z = c[1] - b[1], L1 = Math.hypot(d1x, d1z), L2 = Math.hypot(d2x, d2z);
+        if (L1 > 1e-6 && L2 > 1e-6 && (d1x * d2x + d1z * d2z) / (L1 * L2) < -0.9) this._turns.push([b[0], b[1]]);
       }
     }
-    const rail = line.mode === 'rail';
-    // (where it turns back, at the end of the line, it swings right across
-    // the road and out over the tiles either side: one at a time there, as
-    // in a junction, see _knot)
-    // (the route a loop, its last tile its first: the turn there too)
-    const T = tiles.length;
-    if (!rail) for (let i = 0; i < T - 1; i++) {
-      const prev = i ? tiles[i - 1] : tiles[0][0] === tiles[T - 1][0] && tiles[0][1] === tiles[T - 1][1] && T > 2 ? tiles[T - 2] : null;
-      if (!prev) continue;
-      const [px, pz] = prev, [x, z] = tiles[i];
-      if (px !== tiles[i + 1][0] || pz !== tiles[i + 1][1]) continue;
-      for (const [tx, tz] of [[x, z], [px, pz], [2 * x - px, 2 * z - pz]]) if (this.world.inBounds(tx, tz) && this.world.roadAt(tx, tz)) this._turns.add(this.world.idx(tx, tz));
-    }
-    let pts = tilePolyline(tiles, rail ? 0 : LANE, null, null, this._curve);
+    // (round the loop: its first point again at its end, the turn there too)
+    if (Math.hypot(C[0][0] - C[C.length - 1][0], C[0][1] - C[C.length - 1][1]) > 1e-6) C.push(C[0].slice());
+    let pts = rail ? C.map(p => [p[0], p[1]]) : offsetPath([C[C.length - 2], ...C, C[1]], LANE).slice(1, -1);
     pts = smoothPolyline(pts, rail ? 0.5 : 0.3, rail ? 6 : 4);
     const cum = [0];
     for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
@@ -508,8 +508,7 @@ export class Transit {
     const marks = [];
     let from = 0;
     for (let i = 0; i < stops.length; i++) {
-      const tl = tiles[stopIdx[i]];
-      const cx = tl[0] + 0.5, cz = tl[1] + 0.5;
+      const cx = stopAt[i].x, cz = stopAt[i].z;
       let best = from, bd = Infinity;
       for (let k = from; k < pts.length; k++) {
         const d = Math.hypot(pts[k][0] - cx, pts[k][1] - cz);
@@ -524,7 +523,7 @@ export class Transit {
 
   // Where a gondola line's cable ends at each of its stations (stops,
   // buildings): the middle of a plain one, its own berth at an interchange.
-  _ends(line, stops) { return stops.map(b => this.berthPoint(b, line) || [b.x + fw(b) / 2, b.z + fd(b) / 2]); }
+  _ends(line, stops) { return stops.map(b => this.berthPoint(b, line) || [b.x, b.z]); }
 
   // At an interchange (def.hub), the middle of the berth a gondola line calls
   // at ([x, z]), or null (a plain station, or no berth free for it). The
@@ -533,7 +532,7 @@ export class Transit {
   berthPoint(b, line) {
     const def = b && BUILDINGS[b.type];
     if (!def || !def.hub) return null;
-    const w = this.world, cx = b.x + fw(b) / 2, cz = b.z + fd(b) / 2;
+    const w = this.world, cx = b.x, cz = b.z, R = ownPlot(b);
     const lines = w.lines.filter(l => l.mode === 'gondola' && l.stops.includes(b.id));
     if (!lines.includes(line)) lines.push(line);
     lines.sort((p, q) => p.id - q.id);
@@ -546,73 +545,88 @@ export class Transit {
         for (const j of [i - 1, i + 1]) {
           const o = w.buildings.get(l.stops[j]);
           if (!o || o === b) continue;
-          const ox = o.x + fw(o) / 2 - cx, oz = o.z + fd(o) / 2 - cz, L = Math.hypot(ox, oz) || 1;
+          const ox = o.x - cx, oz = o.z - cz, L = Math.hypot(ox, oz) || 1;
           dx += ox / L; dz += oz / L;
         }
       });
       let k = free[0], best = -Infinity;
-      for (const f of free) { const s = HUB_BERTHS[f][0] * dx + HUB_BERTHS[f][1] * dz; if (s > best + 1e-9) { best = s; k = f; } }
-      if (l === line) return [cx + HUB_BERTHS[k][0], cz + HUB_BERTHS[k][1]];
+      // (the berths turn with the building)
+      const at = (f) => toWorld(R, HUB_BERTHS[f][0], HUB_BERTHS[f][1]);
+      for (const f of free) { const [bx, bz] = at(f), s = (bx - cx) * dx + (bz - cz) * dz; if (s > best + 1e-9) { best = s; k = f; } }
+      if (l === line) return at(k);
       free.splice(free.indexOf(k), 1);
     }
     return null;
   }
 
   // A closed route through every station (in order) that a train can drive
-  // without ever reversing: a search over (tile, direction of travel) that
-  // never allows a U-turn, and that must come back into the first station
-  // heading the same way it set off. Null if the track has no such loop.
-  _railLoop(stopTiles) {
-    const w = this.world, N = w.N;
+  // without ever reversing: legs over (edge, way along it) that never turn
+  // back, through switches no sharper than RAIL_TURN, coming back into the
+  // first station heading the same way it set off. The middle of the track
+  // along it ([[x, z]]), or null if the track has no such loop.
+  _railLoop(stops) {
     let best = null;
-    for (let d0 = 0; d0 < 4; d0++) {
-      const s0 = stopTiles[0];
-      let cur = { i: s0.z * N + s0.x, d: d0 };
-      let tiles = [[s0.x, s0.z]];
-      const stopIdx = [0];
-      let ok = true;
-      for (let k = 1; k <= stopTiles.length; k++) {
-        const g = stopTiles[k % stopTiles.length];
-        const leg = this._railLeg(cur, g.z * N + g.x, k === stopTiles.length ? d0 : -1);
+    for (const d0 of [1, -1]) {
+      let cur = { e: stops[0].e, s: stops[0].s, d: d0 }, pieces = [], len = 0, ok = true;
+      for (let k = 1; k <= stops.length; k++) {
+        const g = stops[k % stops.length];
+        const leg = this._railLeg(cur, g, k === stops.length ? d0 : 0);
         if (!leg) { ok = false; break; }
-        tiles = tiles.concat(leg.tiles.slice(1));
-        if (k < stopTiles.length) stopIdx.push(tiles.length - 1);
-        cur = { i: g.z * N + g.x, d: leg.dir };
+        pieces = pieces.concat(leg.pieces); len += leg.len;
+        cur = { e: g.e, s: g.s, d: leg.d };
       }
-      if (ok && (!best || tiles.length < best.tiles.length)) best = { tiles, stopIdx };
+      if (ok && (!best || len < best.len)) best = { pieces, len };
     }
-    return best;
+    if (!best) return null;
+    const C = routeCentre(this.world.rails, { pieces: best.pieces });
+    return C.length >= 2 ? C : null;
   }
 
-  _railLeg(start, goal, goalDir) {
-    const w = this.world, N = w.N, rails = w.rails;
-    const n4 = N * N * 4;
-    if (!this._prev || this._prev.length !== n4) { this._prev = new Int32Array(n4); this._seen = new Uint32Array(n4); this._stamp = 0; }
-    const prev = this._prev, seen = this._seen, stamp = ++this._stamp;
-    const s0 = start.i * 4 + start.d;
-    seen[s0] = stamp; prev[s0] = -1;
-    const q = [s0];
-    for (let qi = 0; qi < q.length; qi++) {
-      const st = q[qi], i = st >> 2, d = st & 3;
-      const x = i % N, z = (i / N) | 0;
-      for (let m = 0; m < 4; m++) {
-        if (m === ((d + 2) & 3)) continue;           // no reversing
-        const nx = x + STEP[m][0], nz = z + STEP[m][1];
-        if (nx < 0 || nz < 0 || nx >= N || nz >= N) continue;
-        const ni = nz * N + nx;
-        if (!rails[ni]) continue;
-        const ns = ni * 4 + m;
-        if (seen[ns] === stamp) continue;
-        seen[ns] = stamp; prev[ns] = st;
-        if (ni === goal && (goalDir < 0 || m === goalDir)) {
-          const out = [];
-          for (let k = ns; k !== -1; k = prev[k]) { const ti = k >> 2; out.push([ti % N, (ti / N) | 0]); }
-          return { tiles: out.reverse(), dir: m };
+  // The way along the track from a (edge, s, heading d: 1 along the edge, -1
+  // against it) to goal (edge, s), arriving heading gd (0: either way):
+  // { pieces, len, d (the heading it arrives at) }, or null.
+  _railLeg(a, goal, gd) {
+    const net = this.world.rails, ea = net.edges.get(a.e), eg = net.edges.get(goal.e);
+    if (!ea || !eg) return null;
+    // straight on along the same edge
+    if (a.e === goal.e && (goal.s - a.s) * a.d > 1e-6 && (!gd || gd === a.d)) return { pieces: [{ e: a.e, s0: a.s, s1: goal.s }], len: Math.abs(goal.s - a.s), d: a.d };
+    // a search over (edge, heading) from the end of a's edge it is heading for
+    const key = (e, d) => e + ':' + d, dist = new Map(), prev = new Map(), q = [];
+    const first = { e: a.e, d: a.d, c: a.d > 0 ? ea.len - a.s : a.s };
+    dist.set(key(a.e, a.d), first.c); prev.set(key(a.e, a.d), null);
+    q.push(first);
+    let found = null;
+    while (q.length) {
+      q.sort((p, r) => p.c - r.c);
+      const st = q.shift(), k = key(st.e, st.d);
+      if (st.c > dist.get(k) + 1e-9) continue;
+      const e = net.edges.get(st.e), n = st.d > 0 ? e.b : e.a;
+      // the way it arrives at the node
+      const hin = net.dirAt(e, n) + Math.PI;
+      for (const id of net.nodes.get(n).edges) {
+        const f = net.edges.get(id), d = f.a === n ? 1 : -1;
+        if (id === st.e && f.a !== f.b) continue;
+        if (angDiff(net.dirAt(f, n), hin) > RAIL_TURN) continue;
+        const kk = key(id, d);
+        // into the goal's edge, heading the right way: done
+        if (id === goal.e && (!gd || gd === d)) {
+          const c = st.c + (d > 0 ? goal.s : f.len - goal.s);
+          if (!found || c < found.c) found = { c, from: k, e: id, d };
         }
-        q.push(ns);
+        const c = st.c + f.len;
+        if (c < (dist.get(kk) ?? Infinity)) { dist.set(kk, c); prev.set(kk, k); q.push({ e: id, d, c }); }
       }
     }
-    return null;
+    if (!found) return null;
+    // trace back
+    const pieces = [{ e: found.e, s0: found.d > 0 ? 0 : net.edges.get(found.e).len, s1: goal.s }];
+    for (let k = found.from; k; k = prev.get(k)) {
+      const [id, d] = k.split(':').map(Number), e = net.edges.get(id);
+      const isFirst = prev.get(k) == null;
+      pieces.push({ e: id, s0: isFirst ? a.s : d > 0 ? 0 : e.len, s1: d > 0 ? e.len : 0 });
+    }
+    pieces.reverse();
+    return { pieces, len: found.c, d: found.d };
   }
 
   // ------------------------------------------------------------ gondolas
@@ -631,7 +645,7 @@ export class Transit {
   // (it passes over or well under older lines' cables, see _overCables).
   _cableRoute(stops, lifts = null, ends = null, line = null) {
     const n = stops.length;
-    const P = ends || stops.map(b => [b.x + fw(b) / 2, b.z + fd(b) / 2]);
+    const P = ends || stops.map(b => [b.x, b.z]);
     // a station's height, shared by the spans either side of it (and by
     // every visit to it, should a line come back through it)
     const ref = new Map();
@@ -719,21 +733,18 @@ export class Transit {
     // G_OFF out, and every building on a tile any of that stretch touches
     // (the stretch a quarter tile long, HL either way, and HW either side)
     const NS = Math.max(1, Math.ceil(L / 0.25)), req = [], by = [];
-    const HL = L / NS / 2, HW = G_OFF + 0.16, ra = 0.5 * (Math.abs(ux) + Math.abs(uz));
-    const ex = Math.abs(ux) * HL + Math.abs(uz) * HW, ez = Math.abs(uz) * HL + Math.abs(ux) * HW;
+    const HL = L / NS / 2, HW = G_OFF + 0.16, ha = angleOf(ux, uz);
     for (let k = 0; k <= NS; k++) {
       const [x0, z0] = at((L * k) / NS);
       let need = -Infinity, what = null;
       for (const o of [-0.3, -0.15, 0, 0.15, 0.3]) {
         const x = x0 - uz * o, z = z0 + ux * o;
-        if (w.inBounds(Math.floor(x), Math.floor(z))) need = Math.max(need, Math.max(t.heightAt(x, z), CONFIG.WATER_LEVEL) + G_GROUND);
+        if (w.inBounds(x, z)) need = Math.max(need, Math.max(t.heightAt(x, z), CONFIG.WATER_LEVEL) + G_GROUND);
       }
-      for (let tz = Math.floor(z0 - ez); tz <= Math.floor(z0 + ez); tz++) for (let tx = Math.floor(x0 - ex); tx <= Math.floor(x0 + ex); tx++) {
-        const ob = w.inBounds(tx, tz) && w.buildingOn(tx, tz);
-        if (!ob || ob === A || ob === B) continue;
-        // (the tile and the stretch overlapping along the line and across it)
-        const cx = tx + 0.5 - x0, cz = tz + 0.5 - z0;
-        if (Math.abs(cx * ux + cz * uz) > HL + ra || Math.abs(cz * ux - cx * uz) > HW + ra) continue;
+      // (every plot the stretch passes over)
+      const S = rect(x0, z0, ha, HW, HL);
+      for (const ob of w.plots.query(aabbOf(S))) {
+        if (ob === A || ob === B || !rectsOverlap(S, plotOf(ob), 0)) continue;
         const h = this._topOf(ob) + G_ROOF;
         if (h > need) { need = h; what = ob; }
       }
@@ -897,8 +908,8 @@ export class Transit {
     for (const b of w.buildings.values()) {
       if (!stopOf(b, 'gondola')) continue;
       if (BUILDINGS[b.type].hub) {
-        const cx = b.x + fw(b) / 2, cz = b.z + fd(b) / 2;
-        const berths = HUB_BERTHS.map(([ox, oz]) => { const key = `${b.id}:${cx + ox},${cz + oz}`; return { x: cx + ox, z: cz + oz, cables: (out.get(key) || []).sort((p, q) => p - q), tint: tint.get(key) || null }; });
+        const R = ownPlot(b);
+        const berths = HUB_BERTHS.map(([ox, oz]) => { const [bx, bz] = toWorld(R, ox, oz), key = `${b.id}:${bx},${bz}`; return { x: bx, z: bz, cables: (out.get(key) || []).sort((p, q) => p - q), tint: tint.get(key) || null }; });
         if (JSON.stringify(berths) === JSON.stringify(b.berths || null)) continue;
         b.berths = berths;
         w.emit('building:refit', b);
@@ -913,17 +924,17 @@ export class Transit {
   }
 
   // Can a pylon stand at (x, z), and how good a spot is it: 0 open ground,
-  // 1 a field or a park, 2 the verge of a road (near the edge of its tile);
-  // -1 not at all (on a building, in the road, on track or in water).
+  // 1 a field or a park, 2 the verge of a road; -1 not at all (on a
+  // building, in the road, on track or in water).
   _pylonSpot(x, z) {
-    const w = this.world, tx = Math.floor(x), tz = Math.floor(z);
-    if (!w.inBounds(tx, tz)) return -1;
-    const i = w.idx(tx, tz);
-    if (w.rails[i] || w.terrain.isWater(tx, tz)) return -1;
-    const b = w.buildingOn(tx, tz);
+    const w = this.world;
+    if (!w.inBounds(x, z) || x < 0.2 || z < 0.2 || x > w.N - 0.2 || z > w.N - 0.2) return -1;
+    if (w.railAt(x, z, 0.12) || w.waterAt(x, z)) return -1;
+    const b = w.buildingAt(x, z);
     if (b) return BUILDINGS[b.type].park ? 1 : -1;
-    if (w.roadAt(tx, tz)) return Math.max(Math.abs(x - tx - 0.5), Math.abs(z - tz - 0.5)) > 0.38 ? 2 : -1;
-    return w.fields && w.fields[i] >= 0 ? 1 : 0;
+    if (w.roadAt(x, z, 0.1)) return -1;
+    if (w.roadAt(x, z, 0.3)) return 2;
+    return w.fieldAt(x, z) ? 1 : 0;
   }
 
   // How high a building reaches: the top of its model as drawn, or a fair
@@ -936,7 +947,7 @@ export class Transit {
       return (b.baseY || 0) + g.boundingBox.max.y;
     }
     const def = BUILDINGS[b.type];
-    return (b.baseY || 0) + (def.park ? 0.35 : 0.55 + 0.2 * (b.level + 1) * Math.sqrt(fw(b) * fd(b)));
+    return (b.baseY || 0) + (def.park ? 0.35 : 0.55 + 0.2 * (b.level + 1) * Math.sqrt(b.w * b.d));
   }
 
   // Each gondola line's cables, pylons and bullwheels, drawn again only when
@@ -1027,9 +1038,8 @@ export class Transit {
 
   _height(mode, x, z) {
     const w = this.world;
-    const tx = Math.floor(x), tz = Math.floor(z);
-    if (w.inBounds(tx, tz) && w.terrain.isWater(tx, tz)) return bridgeDeckY() + (mode === 'rail' ? 0.045 : 0);
-    if (mode !== 'rail') { const r = w.rampHeight(x, z); if (r != null) return r + 0.02; }
+    if (mode !== 'rail') { const r = w.roadHeight(x, z); if (r != null) return r + 0.012; }
+    if (w.waterAt(x, z)) return bridgeDeckY() + (mode === 'rail' ? 0.045 : 0);
     return w.terrain.heightAt(x, z) + (mode === 'rail' ? 0.06 : 0.03);
   }
 
@@ -1079,7 +1089,7 @@ export class Transit {
     }
     this._exits();
     this.routes.clear();
-    this._turns.clear(); this._knots.clear();
+    this._turns = []; this._knots.clear();
     for (const line of w.lines) {
       // (a gondola line with its stations held at those heights; it doesn't
       // run while something stands in the cable's way)
@@ -1518,30 +1528,47 @@ export class Transit {
   // vehicle in one at a time, the first to come, so none meets another
   // crossing or turning in it. 1 for a junction, 2 for a bend, 0 otherwise
   // (kept till the roads change).
-  _knot(tx, tz) {
-    const w = this.world;
-    if (!w.inBounds(tx, tz) || !w.roadAt(tx, tz)) return 0;
-    const k = w.idx(tx, tz);
-    if (this._knots.has(k)) return this._knots.get(k);
-    const road = (x, z) => w.inBounds(x, z) && !!w.roadAt(x, z);
-    let r;
-    if ((w.diag && w.diag[k]) || this._turns.has(k)) r = 1;
-    else {
-      const on = STEP.map(([dx, dz]) => road(tx + dx, tz + dz) && !(road(tx + dx - dz, tz + dz + dx) && road(tx - dz, tz + dx) && road(tx + dx + dz, tz + dz - dx) && road(tx + dz, tz - dx)));
-      const n = on.filter(Boolean).length;
-      r = n !== 2 ? 1 : (on[0] && on[2]) || (on[1] && on[3]) ? 0 : 2;
-    }
-    this._knots.set(k, r);
-    return r;
+  // A road junction: a node of the network where other than two roads
+  // meet, or two at a sharp bend (zone kind 1 a junction, 2 a bend), as
+  // { r (how far round it the zone reaches), kind }, or null (kept till the
+  // roads change).
+  _knotOf(n) {
+    if (this._knots.has(n.id)) return this._knots.get(n.id);
+    const net = this.world.roads, es = n.edges.map(id => net.edges.get(id));
+    let kind = 0;
+    if (es.length === 1) kind = 0;
+    else if (es.length !== 2) kind = 1;
+    else if (Math.PI - angDiff(net.dirAt(es[0], n.id), net.dirAt(es[1], n.id)) > 0.6) kind = 2;
+    const out = kind ? { r: Math.max(...es.map(e => HALF[e.level])) + 0.3, kind } : null;
+    this._knots.set(n.id, out);
+    return out;
   }
+  // The junction zone (x, z) is in: a junction's own (round its node), or
+  // a turning place where a line turns back; { k (its key), kind (1 a
+  // junction or turning place, 2 a bend), x, z (its middle) }, or null.
+  _zoneAt(x, z) {
+    const w = this.world;
+    for (const n of w.roads.nodeIx.near(x, z, 0.65)) {
+      const K = this._knotOf(n);
+      if (K && Math.hypot(n.x - x, n.z - z) < K.r) return { k: n.id, kind: K.kind, x: n.x, z: n.z };
+    }
+    for (let i = 0; i < this._turns.length; i++) {
+      const [tx, tz] = this._turns[i];
+      if (Math.hypot(tx - x, tz - z) < 0.48) return { k: 1e6 + i, kind: 1, x: tx, z: tz };
+    }
+    return null;
+  }
+  _knot(x, z) { const Z = this._zoneAt(x, z); return Z ? Z.kind : 0; }
 
-  // The quarter of a quarter of a junction tile (x, z) is in, as a key for
-  // claims on it (-1 off a junction): two vehicles may be in one junction at
-  // once, so long as their ways through it don't cross.
+  // The bit of a junction zone (x, z) is in (an eighth of a unit square
+  // round its middle, as a key for claims on it; -1 off a junction): two
+  // vehicles may be in one junction at once, so long as their ways through
+  // it don't cross.
   _cell(x, z) {
-    const tx = Math.floor(x), tz = Math.floor(z);
-    if (!this._knot(tx, tz)) return -1;
-    return this.world.idx(tx, tz) * 16 + Math.min(3, Math.floor((x - tx) * 4)) + Math.min(3, Math.floor((z - tz) * 4)) * 4;
+    const Z = this._zoneAt(x, z);
+    if (!Z) return -1;
+    const i = Math.max(0, Math.min(7, Math.floor((x - Z.x + 0.6) / 0.15))), j = Math.max(0, Math.min(7, Math.floor((z - Z.z + 0.6) / 0.15)));
+    return Z.k * 64 + j * 8 + i;
   }
 
   // The bits of junction a vehicle's piece o stands on: it keeps its claim
@@ -1590,14 +1617,14 @@ export class Transit {
     let out = -1;   // (how far on it's out the other side)
     for (let d = 0; d <= THROUGH; d += 0.1) {
       if (!loop && sF + d > route.length) break;
-      const q = this._sample(route, sF + d), tx = Math.floor(q.x), tz = Math.floor(q.z);
-      if (!this._knot(tx, tz)) { if (tiles.length) { out = d; break; } if (d > reach) break; continue; }
-      const k = w.idx(tx, tz);
+      const q = this._sample(route, sF + d), Z = this._zoneAt(q.x, q.z);
+      if (!Z) { if (tiles.length) { out = d; break; } if (d > reach) break; continue; }
+      const k = Z.k;
       let t = tiles[tiles.length - 1];
       // (back into one it passed through already, as round a turning place
       // just beyond a junction: the way back is claimed when it gets there)
       if (t && t.k !== k && tiles.some(o => o.k === k)) break;
-      if (!t || t.k !== k) tiles.push(t = { k, d, h0: q.heading, bend: this._knot(tx, tz) === 2, cells: new Map() });
+      if (!t || t.k !== k) tiles.push(t = { k, d, h0: q.heading, bend: Z.kind === 2, cells: new Map() });
       t.h1 = q.heading;
       // (all it will stand on, its front there: corners, sides and middle)
       const p = rail ? this._sample(route, sF + d - f0) : this._pose(route, sF + d - f0, f0, b0), hx = Math.sin(p.heading), hz = Math.cos(p.heading);
@@ -1762,7 +1789,7 @@ export class Transit {
     // (in a ring, one in the junction already, waiting only for its turn
     // at the rest of it, goes on through and out, its way clear of the
     // others' bodies: the ring is of claims, not of bodies)
-    const inside = this._knot(Math.floor(px + hx * f), Math.floor(pz + hz * f));
+    const inside = this._knot(px + hx * f, pz + hz * f);
     if (!air && route && ring !== 2 && !(ring && inside && /junction/.test(v.why || ''))) {
       const r = this._through(v, route, s0 + f, look + 0.15, t);
       if (r && r.room < room) { room = r.room; by = r.by; why = r.why; }
@@ -1808,9 +1835,8 @@ export class Transit {
   // arrival; returns false if there is no road between the two plots.
   haul(A, B, onArrive) {
     if (!A.access || !B.access) return false;
-    const tiles = this.game.paths.road(A.access.x, A.access.z, B.access.x, B.access.z);
-    if (!tiles || tiles.length < 2) return false;
-    const pts = smoothPolyline(tilePolyline(tiles, LANE, null, null, this._curve), 0.3, 3);
+    const pts = this._cartWay(A, B);
+    if (!pts) return false;
     const cum = [0];
     for (let k = 1; k < pts.length; k++) cum.push(cum[k - 1] + Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]));
     const mesh = new THREE.Mesh(this._geo('cartmaterials', () => cartModel('materials')), MAT.building);
@@ -1829,9 +1855,8 @@ export class Transit {
         this.cartPlan.splice(i, 1);
         const A = w.buildings.get(c.from), B = w.buildings.get(c.to);
         if (!A || !B || !A.access || !B.access || this.carts.length > 30) continue;
-        const tiles = this.game.paths.road(A.access.x, A.access.z, B.access.x, B.access.z);
-        if (!tiles || tiles.length < 2) continue;
-        const pts = smoothPolyline(tilePolyline(tiles, LANE, null, null, this._curve), 0.3, 3);
+        const pts = this._cartWay(A, B);
+        if (!pts) continue;
         const cum = [0];
         for (let k = 1; k < pts.length; k++) cum.push(cum[k - 1] + Math.hypot(pts[k][0] - pts[k - 1][0], pts[k][1] - pts[k - 1][1]));
         // (not on top of another vehicle: it waits till the road there is clear)
@@ -1875,6 +1900,15 @@ export class Transit {
       c.placed = true;
       this._poseLegs(c.legs, c.gait, speed > 0 && step > 0, dt * speed);
     }
+  }
+
+  // A cart's way from building A's street to B's, in its lane, or null.
+  _cartWay(A, B) {
+    const route = this.game.paths.road(A.access, B.access);
+    if (!route) return null;
+    const C = routeCentre(this.world.roads, route);
+    if (C.length < 2 || route.len < 0.3) return null;
+    return smoothPolyline(offsetPath(C, LANE), 0.3, 3);
   }
 
   routeRibbons() {

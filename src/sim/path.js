@@ -1,191 +1,154 @@
-// Breadth-first pathfinding over the road and rail grids, with a small cache.
-// In a town with boulevards (world.blvd) or diagonal streets (world.diag),
-// roads are searched by cost instead: a step along the grid costs 2 and one
-// across a corner 3 (about as much further as it is), and traffic keeps to
-// its side of a boulevard: a lane runs one way, with the median on its left
-// (everyone keeps right), and going the wrong way along it, or across the
-// median, costs more than going round. A road cut off from a diagonal
-// passing by (see diagonal.js) is never stepped onto from it.
+// Finding the way along the road network (net.js), with a small cache.
+//
+// A place on the network is { e (edge id), s (how far along it) }, as a
+// building's way to its street (b.access), or { node }. A way from one to
+// another (a Route) is the stretches of edge it runs along in turn,
+// { pieces: [{ e, s0, s1 }] } (s1 < s0: against the edge's own way), its
+// length, and the nodes it passes. Shortest by length (Dijkstra: towns have
+// a few hundred junctions at most).
+//
+// routeLine turns a route into the line someone walks or drives: the roads'
+// own curves end to end, moved over to the right-hand side of the road,
+// mitred where it turns at a junction and round the end where it turns
+// back on itself.
 
-const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-// the world.blvd bit for each of DIRS, and for the side to the left of it
-const BIT = [2, 8, 4, 1], LEFT = [1, 4, 2, 8], RIGHT = [4, 1, 8, 2];
-// world.diag: the cut bit for the side each of DIRS crosses, and on the far
-// side; the diagonal links (roadShape.js CORNERS: NE, SE, SW, NW)
-const CUT = [32, 128, 64, 16], CUT_BACK = [128, 32, 16, 64];
-const CORNERS = [[1, -1], [1, 1], [-1, 1], [-1, -1]];
-const TURN = 6;   // segments in a walker's quarter-circle turn
+import { slice, cumulative, pointAt } from '../world/geom.js';
 
 export class PathFinder {
   constructor(world) {
     this.world = world;
-    const n = world.N * world.N;
-    this.prev = new Int32Array(n);
-    this.seen = new Uint32Array(n);
-    this.stamp = 0;
     this.cache = new Map();
-    this.lanes = null;   // whether the town has boulevards (worked out when needed)
-    const clear = () => { this.cache.clear(); this.lanes = null; };
+    const clear = () => this.cache.clear();
     world.on('roads', clear);
     world.on('rails', clear);
   }
 
-  road(sx, sz, gx, gz) { return this._find(this.world.roads, 'r', sx, sz, gx, gz); }
-  rail(sx, sz, gx, gz) { return this._find(this.world.rails, 'l', sx, sz, gx, gz); }
+  road(a, b) { return this._find(this.world.roads, 'r', a, b); }
+  rail(a, b) { return this._find(this.world.rails, 'l', a, b); }
 
-  _find(grid, tag, sx, sz, gx, gz) {
-    const w = this.world, N = w.N;
-    const s = sz * N + sx, g = gz * N + gx;
-    if (!grid[s] || !grid[g]) return null;
-    if (s === g) return [[sx, sz]];
-    const key = tag + s + ':' + g;
+  // (a place as the edges and nodes it reaches first: [[node, cost, piece]])
+  _starts(net, p) {
+    if (!p) return null;
+    if (p.node != null) return net.nodes.has(p.node) ? [[p.node, 0, null]] : null;
+    const e = net.edges.get(p.e);
+    if (!e) return null;
+    const s = Math.max(0, Math.min(e.len, p.s));
+    return [[e.a, s, { e: e.id, s0: s, s1: 0 }], [e.b, e.len - s, { e: e.id, s0: s, s1: e.len }]];
+  }
+
+  _find(net, tag, a, b) {
+    if (!a || !b) return null;
+    const key = tag + (a.node != null ? 'n' + a.node : a.e + ':' + Math.round(a.s * 100)) + '>' + (b.node != null ? 'n' + b.node : b.e + ':' + Math.round(b.s * 100));
     const hit = this.cache.get(key);
     if (hit !== undefined) return hit;
-    if (tag === 'r') {
-      if (this.lanes === null) this.lanes = !!(w.blvd && w.blvd.some(Boolean)) || w.diagN > 0;
-      if (this.lanes) return this._keep(this._lanes(grid, s, g), key);
+    const S = this._starts(net, a), G = this._starts(net, b);
+    if (!S || !G) return this._keep(key, null);
+    let best = null;
+    // the same edge: straight along it
+    if (a.e != null && a.e === b.e) {
+      const e = net.edges.get(a.e);
+      best = { cost: Math.abs(b.s - a.s), pieces: [{ e: e.id, s0: a.s, s1: b.s }], nodes: [] };
     }
-    const stamp = ++this.stamp;
-    const prev = this.prev, seen = this.seen;
-    const q = [s];
-    seen[s] = stamp; prev[s] = -1;
-    let found = false;
-    for (let qi = 0; qi < q.length; qi++) {
-      const i = q[qi];
-      if (i === g) { found = true; break; }
-      const x = i % N, z = (i / N) | 0;
-      for (const [dx, dz] of DIRS) {
-        const nx = x + dx, nz = z + dz;
-        if (nx < 0 || nz < 0 || nx >= N || nz >= N) continue;
-        const ni = nz * N + nx;
-        if (seen[ni] === stamp || !grid[ni]) continue;
-        seen[ni] = stamp; prev[ni] = i; q.push(ni);
+    // a node to node search from the starts
+    const dist = new Map(), prev = new Map(), heap = new Heap();
+    for (const [n, c, pc] of S) if (!(dist.get(n) <= c)) { dist.set(n, c); prev.set(n, { from: null, pc }); heap.push(c, n); }
+    const goal = new Map();
+    for (const [n, c, pc] of G) goal.set(n, goal.has(n) ? (goal.get(n).c <= c ? goal.get(n) : { c, pc }) : { c, pc });
+    const done = new Set();
+    while (heap.size) {
+      const [d, n] = heap.pop();
+      if (done.has(n) || d > dist.get(n)) continue;
+      done.add(n);
+      if (best && d >= best.cost) break;
+      const g = goal.get(n);
+      if (g && (!best || d + g.c < best.cost)) {
+        // trace back
+        const pieces = [], nodes = [];
+        let k = n;
+        while (k != null) { const p = prev.get(k); nodes.push(k); if (p.pc) pieces.push(p.pc); k = p.from; }
+        pieces.reverse(); nodes.reverse();
+        if (g.pc) pieces.push({ e: g.pc.e, s0: g.pc.s1, s1: g.pc.s0 });
+        best = { cost: d + g.c, pieces, nodes };
+      }
+      const N = net.nodes.get(n);
+      for (const id of N.edges) {
+        const e = net.edges.get(id), o = net.other(e, n), nd = d + e.len;
+        if (done.has(o) || nd >= (dist.get(o) ?? Infinity)) continue;
+        dist.set(o, nd);
+        prev.set(o, { from: n, pc: e.a === n ? { e: id, s0: 0, s1: e.len } : { e: id, s0: e.len, s1: 0 } });
+        heap.push(nd, o);
       }
     }
-    return this._keep(found ? this._trace(g) : null, key);
+    if (!best) return this._keep(key, null);
+    // (no stretch of nothing: a piece from the end of an edge to the same end)
+    best.pieces = best.pieces.filter(p => Math.abs(p.s1 - p.s0) > 1e-6);
+    best.len = best.cost;
+    best.net = net;
+    return this._keep(key, best);
   }
 
-  _trace(g) {
-    const N = this.world.N, path = [];
-    for (let i = g; i !== -1; i = this.prev[i]) path.push([i % N, (i / N) | 0]);
-    return path.reverse();
-  }
-
-  _keep(path, key) {
+  _keep(key, v) {
     if (this.cache.size > 4000) this.cache.clear();
-    this.cache.set(key, path);
-    return path;
-  }
-
-  // The cheapest way along the roads from tile s to tile g when there are
-  // boulevards or diagonals: a step costs 2 (3 across a corner), 4 across a
-  // median, 6 the wrong way along a lane (with its median on the right).
-  // Dial's algorithm: a ring of eight buckets by cost, as no step costs more
-  // than 6.
-  _lanes(grid, s, g) {
-    const w = this.world, N = w.N, B = w.blvd, D = w.diag, prev = this.prev, seen = this.seen;
-    if (!this.dist || this.dist.length !== N * N) { this.dist = new Int32Array(N * N); this.done = new Uint32Array(N * N); }
-    const dist = this.dist, done = this.done, stamp = ++this.stamp;
-    const bk = [[s], [], [], [], [], [], [], []];
-    seen[s] = stamp; dist[s] = 0; prev[s] = -1;
-    let left = 1;
-    for (let d = 0; left > 0; d++) {
-      const b = bk[d & 7];
-      while (b.length) {
-        const i = b.pop();
-        left--;
-        if (dist[i] !== d || done[i] === stamp) continue;
-        done[i] = stamp;
-        if (i === g) return this._trace(g);
-        const x = i % N, z = (i / N) | 0, m = B[i], c = D[i];
-        for (let k = 0; k < 4; k++) {
-          const nx = x + DIRS[k][0], nz = z + DIRS[k][1];
-          if (nx < 0 || nz < 0 || nx >= N || nz >= N) continue;
-          const ni = nz * N + nx;
-          if (!grid[ni] || done[ni] === stamp || (c & CUT[k]) || (D[ni] & CUT_BACK[k])) continue;
-          const nd = d + (m & BIT[k] ? 4 : (m & RIGHT[k]) && !(m & LEFT[k]) ? 6 : 2);
-          if (seen[ni] === stamp && dist[ni] <= nd) continue;
-          seen[ni] = stamp; dist[ni] = nd; prev[ni] = i;
-          bk[nd & 7].push(ni);
-          left++;
-        }
-        if (c & 15) for (let k = 0; k < 4; k++) {
-          if (!(c & (1 << k))) continue;
-          const nx = x + CORNERS[k][0], nz = z + CORNERS[k][1];
-          if (nx < 0 || nz < 0 || nx >= N || nz >= N) continue;
-          const ni = nz * N + nx;
-          if (!grid[ni] || done[ni] === stamp || !(D[ni] & (1 << ((k + 2) & 3)))) continue;
-          const nd = d + 3;
-          if (seen[ni] === stamp && dist[ni] <= nd) continue;
-          seen[ni] = stamp; dist[ni] = nd; prev[ni] = i;
-          bk[nd & 7].push(ni);
-          left++;
-        }
-      }
-    }
-    return null;
+    this.cache.set(key, v);
+    return v;
   }
 }
 
-// Turn a tile path into a smooth world-space polyline offset to the right-hand side.
-// round(x, z, outside), if given, says whether a turn on that tile may
-// follow the road's curve: a quarter circle round the inside tile corner (as
-// the road surface is laid), tighter on the inside lane and wider on the
-// outside (a turn across the other lane, outside true).
-// A step across a corner (a diagonal street) runs straight from centre to
-// centre; turns onto and off it are mitred.
-export function tilePolyline(tiles, offset = 0, start = null, end = null, round = null) {
-  const pts = [];
-  if (start) pts.push([start.x, start.z]);
-  const n = tiles.length;
+// The middle of the road along a route, end to end (no offset): [[x, z]].
+export function routeCentre(net, route) {
+  const out = [];
+  for (const p of route.pieces) {
+    const e = net.edges.get(p.e);
+    if (!e) continue;
+    const part = slice(e.pts, e.cum, p.s0, p.s1);
+    for (const q of part) {
+      const last = out[out.length - 1];
+      if (!last || Math.abs(last[0] - q[0]) + Math.abs(last[1] - q[1]) > 1e-6) out.push(q);
+    }
+  }
+  return out;
+}
+
+// The way someone goes along a route, `offset` to the right of the road's
+// middle (negative: the left), from start and to end ({ x, z }) if given.
+export function routeLine(net, route, offset = 0, start = null, end = null) {
+  const C = route ? routeCentre(net, route) : [];
+  const pts = offsetPath(C, offset);
+  if (start) pts.unshift([start.x, start.z]);
+  if (end) pts.push([end.x, end.z]);
+  return pts;
+}
+
+// A line moved `off` to its right, mitred at its bends (the mitre capped
+// where a turn is sharp) and round the far side where it turns back.
+export function offsetPath(C, off) {
+  const n = C.length;
+  if (!off || n < 2) return C.map(p => [p[0], p[1]]);
+  const out = [];
+  const dir = (a, b) => { const dx = b[0] - a[0], dz = b[1] - a[1], L = Math.hypot(dx, dz) || 1; return [dx / L, dz / L]; };
   for (let i = 0; i < n; i++) {
-    const [x, z] = tiles[i];
-    const cx = x + 0.5, cz = z + 0.5;
-    if (offset === 0 || n === 1) { pts.push([cx, cz]); continue; }
-    const prev = i > 0 ? tiles[i - 1] : null, next = i < n - 1 ? tiles[i + 1] : null;
-    let d1 = prev ? [x - prev[0], z - prev[1]] : [next[0] - x, next[1] - z];
-    let d2 = next ? [next[0] - x, next[1] - z] : d1;
-    if (d1[0] && d1[1] || d2[0] && d2[1]) {
-      // a diagonal: unit directions, and the right-hand offsets of both
-      // meeting at a mitre; a sharper turn than a right angle is cut across
-      // (a mitre would reach off the road), and one back on itself goes round
-      const l1 = Math.hypot(d1[0], d1[1]), l2 = Math.hypot(d2[0], d2[1]);
-      d1 = [d1[0] / l1, d1[1] / l1]; d2 = [d2[0] / l2, d2[1] / l2];
-      const r1 = [-d1[1], d1[0]], r2 = [-d2[1], d2[0]], dot = r1[0] * r2[0] + r1[1] * r2[1];
-      if (dot < -0.99) {
-        pts.push([cx + (r1[0] + d1[0]) * offset, cz + (r1[1] + d1[1]) * offset]);
-        pts.push([cx + (r2[0] + d1[0]) * offset, cz + (r2[1] + d1[1]) * offset]);
-      } else if (dot < -1e-6) {
-        pts.push([cx + r1[0] * offset, cz + r1[1] * offset]);
-        pts.push([cx + r2[0] * offset, cz + r2[1] * offset]);
-      } else {
-        const k = offset / (1 + dot);
-        pts.push([cx + (r1[0] + r2[0]) * k, cz + (r1[1] + r2[1]) * k]);
+    const p = C[i];
+    const d1 = i > 0 ? dir(C[i - 1], p) : dir(p, C[1]);
+    const d2 = i < n - 1 ? dir(p, C[i + 1]) : d1;
+    const r1 = [-d1[1], d1[0]], r2 = [-d2[1], d2[0]];
+    const dot = d1[0] * d2[0] + d1[1] * d2[1];
+    if (dot < -0.9) {
+      // turning back: round the end, beyond it (the far side from the right)
+      // (a half circle from its right to its left, through the point beyond the end)
+      const steps = 6, R = Math.abs(off);
+      for (let k = 0; k <= steps; k++) {
+        const t = (Math.PI * k) / steps, c = Math.cos(t), s = Math.sin(t);
+        out.push([p[0] + r1[0] * off * c + d1[0] * R * s, p[1] + r1[1] * off * c + d1[1] * R * s]);
       }
       continue;
     }
-    // right-hand normal of direction (dx,dz) is (-dz, dx)
-    const r1 = [-d1[1], d1[0]], r2 = [-d2[1], d2[0]];
-    if (d1[0] === d2[0] && d1[1] === d2[1]) pts.push([cx + r1[0] * offset, cz + r1[1] * offset]);
-    else if (d1[0] === -d2[0] && d1[1] === -d2[1]) {
-      pts.push([cx + r1[0] * offset + d1[0] * offset, cz + r1[1] * offset + d1[1] * offset]);
-      pts.push([cx + r2[0] * offset + d1[0] * offset, cz + r2[1] * offset + d1[1] * offset]);
-    } else if (round && round(x, z, !(d2[0] === r1[0] && d2[1] === r1[1]))) {
-      const ox = cx + (d2[0] - d1[0]) * 0.5, oz = cz + (d2[1] - d1[1]) * 0.5;
-      const R = 0.5 + (d2[0] === r1[0] && d2[1] === r1[1] ? -offset : offset);
-      const a0 = Math.atan2(cz - d1[1] * 0.5 + r1[1] * offset - oz, cx - d1[0] * 0.5 + r1[0] * offset - ox);
-      let da = Math.atan2(cz + d2[1] * 0.5 + r2[1] * offset - oz, cx + d2[0] * 0.5 + r2[0] * offset - ox) - a0;
-      if (da > Math.PI) da -= Math.PI * 2;
-      if (da < -Math.PI) da += Math.PI * 2;
-      for (let k = 0; k <= TURN; k++) {
-        const a = a0 + (da * k) / TURN, px = ox + Math.cos(a) * R, pz = oz + Math.sin(a) * R;
-        const last = pts[pts.length - 1];
-        if (!last || Math.abs(last[0] - px) + Math.abs(last[1] - pz) > 1e-6) pts.push([px, pz]);
-      }
-    } else pts.push([cx + (r1[0] + r2[0]) * offset, cz + (r1[1] + r2[1]) * offset]);
+    let mx = r1[0] + r2[0], mz = r1[1] + r2[1];
+    const ml = Math.hypot(mx, mz) || 1;
+    mx /= ml; mz /= ml;
+    const k = Math.min(2.2, 1 / Math.max(0.4, mx * r1[0] + mz * r1[1]));
+    out.push([p[0] + mx * off * k, p[1] + mz * off * k]);
   }
-  if (end) pts.push([end.x, end.z]);
-  return pts;
+  return out;
 }
 
 // Round off sharp corners with a short quadratic curve (for coaches and trains).
@@ -196,7 +159,10 @@ export function smoothPolyline(pts, radius = 0.35, steps = 4) {
     const [ax, az] = pts[i - 1], [bx, bz] = pts[i], [cx, cz] = pts[i + 1];
     const l1 = Math.hypot(bx - ax, bz - az), l2 = Math.hypot(cx - bx, cz - bz);
     const cross = (bx - ax) * (cz - bz) - (bz - az) * (cx - bx);
-    if (Math.abs(cross) < 1e-6 || l1 < 1e-6 || l2 < 1e-6) { out.push(pts[i]); continue; }
+    if (Math.abs(cross) < 1e-6 * l1 * l2 || l1 < 1e-6 || l2 < 1e-6) { out.push(pts[i]); continue; }
+    // (a gentle bend in a curve needs no rounding)
+    const dot = ((bx - ax) * (cx - bx) + (bz - az) * (cz - bz)) / (l1 * l2);
+    if (dot > 0.995) { out.push(pts[i]); continue; }
     const r = Math.min(radius, l1 / 2, l2 / 2);
     const p0 = [bx - ((bx - ax) / l1) * r, bz - ((bz - az) / l1) * r];
     const p2 = [bx + ((cx - bx) / l2) * r, bz + ((cz - bz) / l2) * r];
@@ -213,4 +179,37 @@ export function polyLength(pts) {
   let L = 0;
   for (let i = 1; i < pts.length; i++) L += Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
   return L;
+}
+
+// Points every `step` along a route's middle, for what it climbs:
+// [[x, z]] (the ends included).
+export function routeSamples(net, route, step = 1) {
+  const C = routeCentre(net, route);
+  if (C.length < 2) return C;
+  const cum = cumulative(C), L = cum[cum.length - 1], n = Math.max(1, Math.round(L / step)), out = [];
+  for (let k = 0; k <= n; k++) { const p = pointAt(C, cum, (L * k) / n); out.push([p[0], p[1]]); }
+  return out;
+}
+
+class Heap {
+  constructor() { this.k = []; this.v = []; }
+  get size() { return this.k.length; }
+  push(key, val) {
+    const k = this.k, v = this.v; let i = k.length; k.push(key); v.push(val);
+    while (i > 0) { const p = (i - 1) >> 1; if (k[p] <= k[i]) break; [k[p], k[i]] = [k[i], k[p]]; [v[p], v[i]] = [v[i], v[p]]; i = p; }
+  }
+  pop() {
+    const k = this.k, v = this.v, top = [k[0], v[0]], lk = k.pop(), lv = v.pop();
+    if (k.length) {
+      k[0] = lk; v[0] = lv; let i = 0;
+      for (;;) {
+        const l = 2 * i + 1, r = l + 1; let m = i;
+        if (l < k.length && k[l] < k[m]) m = l;
+        if (r < k.length && k[r] < k[m]) m = r;
+        if (m === i) break;
+        [k[m], k[i]] = [k[i], k[m]]; [v[m], v[i]] = [v[i], v[m]]; i = m;
+      }
+    }
+    return top;
+  }
 }

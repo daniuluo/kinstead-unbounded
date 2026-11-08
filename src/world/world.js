@@ -1,49 +1,73 @@
 // World state and the rules for changing it (placing, upgrading, bulldozing).
 // Rendering and simulation listen to the events emitted here.
+//
+// Kinstead without a grid: a building stands on a plot that is a rectangle
+// anywhere, at any angle (b.x, b.z its middle, b.a the way its front faces,
+// b.w × b.d its width along the street and its depth, in its own frame).
+// Roads and railway track are networks of curves (net.js). Nothing is laid
+// out on squares: rules ask what is near (an index of plots, road and track
+// curves, farm fields and trees) and measure.
 
-import { CONFIG, ROAD_LEVELS, BRIDGE_MULT, TREE_COST, CLEAR_COST, TERRAFORM_COST, roadRefund, dressRefund, dressRefundAll, streetPart, lookPart, packDress, DRESSINGS } from '../config.js';
+import { CONFIG, ROAD_LEVELS, BRIDGE_MULT, TREE_COST, CLEAR_COST, TERRAFORM_COST, ROAD_SALVAGE, dressRefund, streetPart, lookPart, DRESSINGS } from '../config.js';
 import { BUILDINGS, unlockOf, RAIL_COST, workNeeded, TECHS, STYLE_TECH, MERGES, LARGE, ESTATE, GRAND, KINDS, REKIND, kindOf, techForLevel, growsInto, plotName, isSmallPark, BURY_COST, FARM_JOIN, PRODUCE, produceOf, hasFields, choosesProduce, CORNER_SHOPS, CIVIC_QUARTER, seatWorth, SEAT_RESTYLE } from '../defs.js';
 const STYLE_TECH_OF = (look) => STYLE_TECH[look] || null;
 import { generateTerrain } from './terrain.js';
-import { findBoulevards, dressFits } from './boulevard.js';
-import { SIDES, CORNERS, CUT, spillsOf, diagLinked, roadTile, cornerFrame } from './roadShape.js';
-import { tidyDiag, linkStroke, isStroke, cornerTo, diagCapable, facingCorner, sideTo } from './diagonal.js';
-import { cleanPose } from './pose.js';
+import { rect, grow, toLocal, toWorld, inRect, aabbOf, rectsOverlap, rectSamples, segRectDist, segDist, segCross, Index, spline, simplify, tightest, cumulative, pointAt, polyLength, angleOf, wrapAngle, resample } from './geom.js';
+import { Net, edgeHeights, heightOn, wetOn, MIN_EDGE } from './net.js';
 import { newTownId } from '../util/text.js';
 import { RNG, hash2, makeNoise2D, fbm } from '../util/rng.js';
 
-// rot index → direction the building faces (its door side)
-export const DIRS = [[0, 1], [1, 0], [0, -1], [-1, 0]];
-// the world.blvd bit for the side of a tile towards (dx, dz) (N 1, E 2, S 4, W 8)
-export const sideBit = (dx, dz) => (dz < 0 ? 1 : dx > 0 ? 2 : dz > 0 ? 4 : 8);
+// Half the width of each level of road (its roadway), and of railway track.
+export const HALF = [0, 0.16, 0.215, 0.27];
+export const RAIL_HALF = 0.13;
+// How far a plot's front may stand back from the edge of the road it faces
+// and still be reached from it, and how far back from the roadway any plot
+// must keep (the verge and its kerb).
+export const REACH = 0.45, VERGE = 0.06;
+// How far a plot's front usually stands from the middle of its street: what
+// the town's own builders (and the founders) go by, as when the town was
+// laid out on squares.
+export const SETBACK = 0.5;
 
-// Footprint in tiles along world x / z (merged buildings can be 2×1).
-export const fw = (b) => b.w ?? b.size;
-export const fd = (b) => b.d ?? b.size;
+// The plot of building b, as a rectangle (geom.js), garden strips bought
+// or sold (b.ext, in its own frame: x0 its left, x1 its right, z0 its back,
+// z1 its front) included.
+export function plotOf(b) {
+  const e = b.ext;
+  if (!e || !(e.x0 || e.x1 || e.z0 || e.z1)) return rect(b.x, b.z, b.a, b.w / 2, b.d / 2);
+  const [cx, cz] = toWorld(rect(b.x, b.z, b.a, 0, 0), (e.x1 - e.x0) / 2, (e.z1 - e.z0) / 2);
+  return rect(cx, cz, b.a, b.w / 2 + (e.x0 + e.x1) / 2, b.d / 2 + (e.z0 + e.z1) / 2);
+}
+// The plot as it is without garden deals (the building's own land).
+export const ownPlot = (b) => rect(b.x, b.z, b.a, b.w / 2, b.d / 2);
+// A type's own plot, w along the street and d deep: a joined building's is
+// a double plot, side by side.
+export function sizeOf(type) {
+  const def = BUILDINGS[type];
+  return def.merged ? [2, 1] : [def.size, def.size];
+}
 
-// A farm's own field: the back row of its plot, behind the farmyard (an
-// orchard's trees fill its whole plot, so it has none). Farmland is this
-// and the farm's fields beyond the plot.
+// A farm's own field: the back half of its plot, behind the farmyard (an
+// orchard's trees fill its whole plot, so it has none), as a rectangle, or
+// null. Farmland is this and the farm's fields beyond the plot.
 export function homeField(b) {
   const def = BUILDINGS[b.type];
-  if (!def || !def.fields || def.fruit) return [];
-  const [fx, fz] = DIRS[b.rot] || DIRS[0], cx = b.x + fw(b) / 2, cz = b.z + fd(b) / 2, out = [];
-  for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) {
-    if ((b.x + dx + 0.5 - cx) * fx + (b.z + dz + 0.5 - cz) * fz < 0) out.push([b.x + dx, b.z + dz]);
-  }
-  return out;
+  if (!def || !def.fields || def.fruit) return null;
+  const P = ownPlot(b), [cx, cz] = toWorld(P, 0, -b.d / 4);
+  return rect(cx, cz, b.a, b.w / 2, b.d / 4);
 }
-// A farm's farmland, as tile indices: its fields, and its own field behind
-// the yard once the farm stands (not while it is going up or coming down).
+// A farm's farmland: its fields (parcels), and its own field behind the yard
+// once the farm stands (not while it is going up or coming down), as
+// rectangles.
 export function farmlandOf(w, farm) {
-  const land = new Set((w.fieldTiles && w.fieldTiles.get(farm.id)) || []);
-  if (!farm.con || farm.con.kind === 'upgrade') for (const [x, z] of homeField(farm)) land.add(z * w.N + x);
+  const land = (w.fieldsOf ? w.fieldsOf(farm.id) : []).map(f => f.rect);
+  const h = homeField(farm);
+  if (h && (!farm.con || farm.con.kind === 'upgrade')) land.push(h);
   return land;
 }
-// how far tile (x, z) lies in front of building b's front edge (> 0: in front)
+// how far point (x, z) lies in front of building b's front edge (> 0: in front)
 export function aheadOf(b, x, z) {
-  const [fx, fz] = DIRS[b.rot] || DIRS[0], cx = b.x + fw(b) / 2, cz = b.z + fd(b) / 2;
-  return (x + 0.5 - cx) * fx + (z + 0.5 - cz) * fz - (fx ? fw(b) : fd(b)) / 2;
+  return toLocal(ownPlot(b), x, z)[1] - b.d / 2;
 }
 
 // A building does its job unless it is a fresh building site or being taken
@@ -58,28 +82,37 @@ const RESTYLE = 0.3;
 // tiles a type's own footprint covers: 1, 2 (joined, 2×1) or 4 (2×2)
 const baseAreaOf = (type) => (BUILDINGS[type].merged ? 2 : BUILDINGS[type].size ** 2);
 const baseArea = (b) => baseAreaOf(b.type);
-export const isExpanded = (b) => fw(b) * fd(b) > baseArea(b);
-// How high a building's floor sits on a plot whose ground runs from minH to
-// maxH. On a slope it stands on the highest ground under its walls (a little
-// in from the plot's edges, where they stand), so no wall is buried in the
-// hillside, and never below the ground at its front door (so the door stays
-// at street level). Where the hill falls away, what is left showing is drawn
-// as a stone lower floor (see footing in render/buildings.js). Buildings that
-// must meet track or water exactly, and parks, keep to the top.
+
+export const isExpanded = (b) => b.w * b.d > baseArea(b);
+// How high a building's floor sits on its plot (rectangle R, the ground under
+// it running from minH to maxH). On a slope it stands on the highest ground
+// under its walls (a little in from the plot's edges, where they stand), so
+// no wall is buried in the hillside, and never below the ground at its front
+// door (so the door stays at street level). Where the hill falls away, what
+// is left showing is drawn as a stone lower floor (see footing in
+// render/buildings.js). Buildings that must meet track or water exactly, and
+// parks, keep to the top.
 const WALL_IN = 0.05;
-export function floorHeight(terrain, type, x, z, w, d, rot, minH, maxH) {
+export function floorHeight(terrain, type, R, minH, maxH) {
   const def = BUILDINGS[type];
   if (!def || def.needsRail || def.needsWater || def.park || !(maxH > minH)) return maxH;
-  const [dx, dz] = DIRS[rot] || [0, 1];
-  const front = terrain.heightAt(x + w / 2 + (dx * w) / 2, z + d / 2 + (dz * d) / 2);
+  const [fx, fz] = toWorld(R, 0, R.hd);
+  const front = terrain.heightAt(fx, fz);
   let walls = -Infinity;
-  const us = [WALL_IN, w / 2, w - WALL_IN], vs = [WALL_IN, d / 2, d - WALL_IN];
-  for (let i = 1; i < w; i++) us.push(i);
-  for (let i = 1; i < d; i++) vs.push(i);
-  for (const u of us) for (const v of vs) walls = Math.max(walls, terrain.heightAt(x + u, z + v));
+  for (const [x, z] of rectSamples(R, 0.5, WALL_IN)) walls = Math.max(walls, terrain.heightAt(x, z));
   return Math.min(maxH, Math.max(minH, front - 0.02, walls - 0.005));
 }
-// each extra plot's worth of ground adds half as much again
+// The lowest and highest ground under a rectangle, and whether any of it is
+// water.
+export function groundUnder(terrain, R, step = 0.25) {
+  let minH = Infinity, maxH = -Infinity, water = false;
+  for (const [x, z] of rectSamples(R, step)) {
+    const h = terrain.heightAt(x, z);
+    minH = Math.min(minH, h); maxH = Math.max(maxH, h);
+    if (h < CONFIG.WATER_LEVEL + 0.05) water = true;
+  }
+  return { minH, maxH, water };
+}
 export function capOf(b, key) {
   const v = BUILDINGS[b.type].levels[b.level][key] || 0;
   const k = sizeK(b);
@@ -105,7 +138,7 @@ export function sizeKFor(type, w, d) {
 }
 // A building whose plot has grown but which hasn't been built out across it
 // yet (b.spare: the footprint it does cover) is still its old size.
-export const sizeK = (b) => (b.spare ? sizeKFor(b.type, b.spare.w, b.spare.d) : sizeKFor(b.type, fw(b), fd(b)));
+export const sizeK = (b) => (b.spare ? sizeKFor(b.type, b.spare.w, b.spare.d) : sizeKFor(b.type, b.w, b.d));
 // b.spare as saved or sent: [w, d, sx, sz] (or { w, d, sx, sz }), only if
 // smaller than the plot. sx, sz: which end of the plot the building stands
 // at, in its own frame (sx across it, sz from back to front: -1, 0 or 1);
@@ -116,35 +149,25 @@ export function spareOf(s, w, d) {
   const side = (v) => v === -1 || v === 0 || v === 1;
   return side(sx) && side(sz) ? { w: sw, d: sd, sx, sz } : { w: sw, d: sd };
 }
-// The tiles a building stands on while it covers only part of its grown
-// plot (b.spare with its end known), or null.
+// The part of a grown plot a building stands on while it covers only part
+// of it (b.spare with its end known), as a rectangle, or null.
 export function spareRect(b) {
   const s = b.spare;
   if (!s || s.sx == null) return null;
-  const W = fw(b), D = fd(b), odd = (b.rot & 1) === 1;
-  const Ex = (odd ? D : W) / 2, Ez = (odd ? W : D) / 2, lw = odd ? s.d : s.w, ld = odd ? s.w : s.d;
-  const lx = s.sx * (Ex - lw / 2), lz = s.sz * (Ez - ld / 2);
-  const th = (b.rot * Math.PI) / 2, co = Math.cos(th), si = Math.sin(th);
-  return { x: Math.round(b.x + W / 2 + lx * co + lz * si - s.w / 2), z: Math.round(b.z + D / 2 - lx * si + lz * co - s.d / 2), w: s.w, d: s.d };
+  const lx = s.sx * (b.w - s.w) / 2, lz = s.sz * (b.d - s.d) / 2;
+  const [cx, cz] = toWorld(ownPlot(b), lx, lz);
+  return rect(cx, cz, b.a, s.w / 2, s.d / 2);
 }
 // A building's floor (b.baseY) and the lowest ground under its plot
 // (b.minY). On a grown plot it hasn't been built across yet, the floor is
-// the one over the tiles it stands on, so taking land beside or behind it
+// the one over the part it stands on, so taking land beside or behind it
 // neither lifts nor sinks it.
 export function setFloor(terrain, b) {
-  let minH = Infinity, maxH = -Infinity;
-  for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) {
-    minH = Math.min(minH, terrain.tileMin(b.x + dx, b.z + dz));
-    maxH = Math.max(maxH, terrain.tileMax(b.x + dx, b.z + dz));
-  }
+  const g = groundUnder(terrain, ownPlot(b));
   const r = spareRect(b);
-  if (!r) { b.baseY = floorHeight(terrain, b.type, b.x, b.z, fw(b), fd(b), b.rot, minH, maxH); b.minY = minH; return; }
-  let lo = Infinity, hi = -Infinity;
-  for (let dz = 0; dz < r.d; dz++) for (let dx = 0; dx < r.w; dx++) {
-    lo = Math.min(lo, terrain.tileMin(r.x + dx, r.z + dz));
-    hi = Math.max(hi, terrain.tileMax(r.x + dx, r.z + dz));
-  }
-  b.baseY = floorHeight(terrain, b.type, r.x, r.z, r.w, r.d, b.rot, lo, hi); b.minY = minH;
+  if (!r) { b.baseY = floorHeight(terrain, b.type, ownPlot(b), g.minH, g.maxH); b.minY = g.minH; return; }
+  const h = groundUnder(terrain, r);
+  b.baseY = floorHeight(terrain, b.type, r, h.minH, h.maxH); b.minY = g.minH;
 }
 // A level's figures for a building of that size: capacities, outputs, upkeep, price.
 const SCALED = ['housing', 'jobs', 'seats', 'supply', 'kw', 'upkeep', 'cost'];
@@ -201,20 +224,15 @@ export class World {
     this.N = N;
     this.seed = seed;
     this.terrain = terrain;
-    this.roads = new Uint8Array(N * N);
-    this.rails = new Uint8Array(N * N);
-    this.buried = new Uint8Array(N * N);   // 1: the power line along this street is underground
-    this.dress = new Uint8Array(N * N);    // how the street is dressed, and a boulevard lane's look (see packDress in config.js)
-    this.blvd = new Uint8Array(N * N);     // boulevards: the sides of each tile with a median across them (from the roads, never saved; see boulevard.js)
-    this.diag = new Uint8Array(N * N);     // diagonal streets: links across tile corners, and roads beside them cut off (see diagonal.js)
-    this.diagN = 0;                        // how many diagonal links there are (kept by tidyDiag)
-    this.fields = new Int32Array(N * N).fill(-1);   // the farm a tile is a field of (-1: none)
-    this.fieldTiles = new Map();           // farm id → its field tiles (kept by _countFields)
+    this.roads = new Net('road');
+    this.rails = new Net('rail');
+    this.parcels = new Map();          // farm fields: id → { id, farm, x, z, a, rect }
     this.lines = [];
     this.sandbox = { infiniteMoney: false, unlockAll: false, freeUpgrades: false, instantBuild: false };
-    this.buildingAt = new Int32Array(N * N).fill(-1);
-    this.connected = new Uint8Array(N * N);
-    this.treeCount = new Uint8Array(N * N);
+    this.plots = new Index(2);         // the buildings, filed by where their plots reach
+    this.fieldIx = new Index(2);
+    this.treeIx = new Index(2);
+    this.connected = new Set();        // the road nodes joined to the way out of the valley
     this.buildings = new Map();
     this.residents = new Map();
     this.trees = [];
@@ -223,7 +241,7 @@ export class World {
     this.day = 1;
     this.hours = 7;
     this.nextId = 1;
-    this.entry = { x: 0, z: 0 };
+    this.entry = { node: -1, x: 0, z: 0 };
     this.townName = 'Kinstead';
     this.history = [];
     this.titleIdx = 0;
@@ -237,15 +255,26 @@ export class World {
   emit(evt, data) { for (const fn of this._listeners[evt] || []) fn(data); }
 
   // ------------------------------------------------------------- basics
-  idx(x, z) { return z * this.N + x; }
-  inBounds(x, z) { return x >= 0 && z >= 0 && x < this.N && z < this.N; }
-  roadAt(x, z) { return this.inBounds(x, z) ? this.roads[z * this.N + x] : 0; }
-  railAt(x, z) { return this.inBounds(x, z) ? this.rails[z * this.N + x] : 0; }
-  buildingOn(x, z) {
-    if (!this.inBounds(x, z)) return null;
-    const id = this.buildingAt[z * this.N + x];
-    return id >= 0 ? this.buildings.get(id) : null;
+  inBounds(x, z) { return x >= 0 && z >= 0 && x <= this.N && z <= this.N; }
+  waterAt(x, z) { return this.terrain.heightAt(x, z) < CONFIG.WATER_LEVEL + 0.05; }
+  // The building whose plot (x, z) is on, or null.
+  buildingAt(x, z) {
+    for (const b of this.plots.near(x, z, 0)) if (inRect(plotOf(b), x, z)) return b;
+    return null;
   }
+  // The buildings whose plots reach within r of (x, z).
+  buildingsNear(x, z, r) { return this.plots.near(x, z, r).filter(b => segRectDist(plotOf(b), x, z, x, z) <= r); }
+  // The road under (x, z) (within its roadway, and pad more): { e, s, d, ... }
+  // as Net.nearest, or null.
+  roadAt(x, z, pad = 0) {
+    const h = this.roads.nearest(x, z, HALF[3] + pad);
+    return h && h.d <= HALF[h.e.level] + pad ? h : null;
+  }
+  railAt(x, z, pad = 0) {
+    const h = this.rails.nearest(x, z, RAIL_HALF + pad);
+    return h && h.d <= RAIL_HALF + pad ? h : null;
+  }
+  _file(b) { this.plots.add(b, aabbOf(plotOf(b))); }
   get population() { return this.residents.size; }
   // population used for unlocks (sandbox can unlock everything)
   get unlockPop() { return this.sandbox.unlockAll ? Infinity : this.residents.size; }
@@ -292,113 +321,143 @@ export class World {
     this.emit('research:done', id);
   }
 
-  // Walkable surface height (roads hover slightly, bridges float over water,
-  // and the road ramps up or down to meet a bridge deck).
+  // Walkable surface height: the ground, the road (which climbs onto a
+  // bridge's deck over water), or the water's surface.
   walkHeight(x, z) {
-    const tx = Math.floor(x), tz = Math.floor(z);
-    if (this.inBounds(tx, tz) && this.roads[tz * this.N + tx]) {
-      if (this.terrain.isWater(tx, tz)) return bridgeDeckY();
-      const r = this.rampHeight(x, z);
-      if (r != null) return r + 0.02;
-    }
+    const r = this.roadHeight(x, z);
+    if (r != null) return r;
     return Math.max(this.terrain.heightAt(x, z) + 0.03, CONFIG.WATER_LEVEL - 0.05);
   }
-
-  // Within RAMP of a bridge, a land road climbs (or drops) smoothly from the
-  // bank to the deck. Surface height there, or null off any ramp.
-  rampHeight(x, z) {
-    const tx = Math.floor(x), tz = Math.floor(z);
-    if (!this.inBounds(tx, tz) || !this.roads[this.idx(tx, tz)] || this.terrain.isWater(tx, tz)) return null;
-    const deck = bridgeDeckY(), med = this.blvd[this.idx(tx, tz)];
-    let best = null;
-    for (const [dx, dz] of DIRS) {
-      const nx = tx + dx, nz = tz + dz;
-      if (!this.inBounds(nx, nz) || !this.roads[this.idx(nx, nz)] || !this.terrain.isWater(nx, nz)) continue;
-      if (med & sideBit(dx, dz)) continue;   // a boulevard's other lane, not a bridge this one climbs to
-      const d = dx > 0 ? tx + 1 - x : dx < 0 ? x - tx : dz > 0 ? tz + 1 - z : z - tz;
-      if (d >= RAMP) continue;
-      const fx = dx ? (dx > 0 ? tx + 1 - RAMP : tx + RAMP) : x, fz = dz ? (dz > 0 ? tz + 1 - RAMP : tz + RAMP) : z;
-      const bank = this.terrain.heightAt(fx, fz) + 0.012;
-      const k = Math.max(0, d) / RAMP, s = k * k * (3 - 2 * k);
-      const y = deck + (bank - deck) * s;
-      best = best == null ? y : Math.max(best, y);
-    }
-    return best;
+  // The road's own surface at (x, z) where it isn't the ground's (on a bridge
+  // and the ramps up to it), or null.
+  roadHeight(x, z) {
+    const h = this.roads.nearest(x, z, HALF[3] + 0.05);
+    if (!h || h.d > HALF[h.e.level] + 0.05) return null;
+    const hy = this._heights(h.e), y = heightOn(hy, h.s);
+    const g = this.terrain.heightAt(x, z) + 0.012;
+    return Math.abs(y - g) > 0.004 || wetOn(hy, h.s) ? y + 0.008 : null;
   }
+  _heights(e) { return edgeHeights(e, this.terrain, bridgeDeckY(), (x, z) => this.waterAt(x, z), RAMP); }
 
   // ------------------------------------------------------------ buildings
-  findAccess(x, z, w, d = w) {
-    const out = [];
-    const push = (ax, az, rot) => {
-      if (this.roadAt(ax, az)) out.push({ x: ax, z: az, rot, conn: this.connected[this.idx(ax, az)] });
-    };
-    for (let k = 0; k < w; k++) { push(x + k, z + d, 0); push(x + k, z - 1, 2); }
-    for (let k = 0; k < d; k++) { push(x + w, z + k, 1); push(x - 1, z + k, 3); }
-    // connected roads first; then prefer facing the street along the long side
-    const long = (rot) => (rot % 2 === 0 ? w : d);
-    out.sort((a, b) => (b.conn - a.conn) || (long(b.rot) - long(a.rot)));
-    return out;
+  // The way a plot at (x, z) would face its nearest road (as the player
+  // sees it while placing): towards the road, square to it. null with no
+  // road within r.
+  faceRoad(x, z, r = 2.5) {
+    const h = this.roads.nearest(x, z, r);
+    if (!h) return null;
+    const nx = -h.dz, nz = h.dx, s = (h.x - x) * nx + (h.z - z) * nz >= 0 ? 1 : -1;
+    return angleOf(nx * s, nz * s);
+  }
+  // Where a plot of half-depth hd facing angle a, its front SETBACK from the
+  // middle of the road it faces, would stand for a point (x, z) near it:
+  // { x, z, a }, or null with no road near (lining up with a street, for the
+  // town's own builders, and the player when they want it).
+  alongRoad(x, z, hd, r = 2.5) {
+    const h = this.roads.nearest(x, z, r);
+    if (!h) return null;
+    const nx = -h.dz, nz = h.dx, s = (x - h.x) * nx + (z - h.z) * nz >= 0 ? 1 : -1;
+    const off = SETBACK + hd;
+    return { x: h.x + nx * s * off, z: h.z + nz * s * off, a: angleOf(-nx * s, -nz * s) };
+  }
+
+  // The road a plot reaches from its front: the nearest point of any road
+  // to the middle of its front edge, if that is within REACH of the road's
+  // edge and ahead of the plot: { e (edge id), s, x, z, conn }, or null.
+  accessFor(R) {
+    const [fx, fz] = toWorld(R, 0, R.hd);
+    let best = null;
+    for (const { e, d } of this.roads.within(fx, fz, REACH + HALF[3])) {
+      if (d - HALF[e.level] > REACH) continue;
+      const h = this.roads.nearest(fx, fz, d + 1e-6, (x) => x === e);
+      if (!h) continue;
+      const ahead = (h.x - fx) * R.ux + (h.z - fz) * R.uz;
+      if (ahead < -0.02 || (d > 0.05 && ahead < 0.4 * d)) continue;
+      if (!best || d - HALF[e.level] < best.gap) best = { e: e.id, s: h.s, x: h.x, z: h.z, gap: d - HALF[e.level] };
+    }
+    if (!best) return null;
+    const e = this.roads.edges.get(best.e);
+    return { e: best.e, s: best.s, x: best.x, z: best.z, conn: this.connected.has(e.a) };
+  }
+
+  // Why a plot can't be here (rectangle R), or null: off the map, on
+  // another plot, the road, track, farm fields or water, or too steep.
+  // except: buildings it may stand over (itself, when moving; those it takes in).
+  _plotBlock(R, opts = {}) {
+    const N = this.N;
+    for (const [x, z] of R.pts) if (x < 0 || z < 0 || x > N || z > N) return 'Out of bounds';
+    const box = aabbOf(R);
+    for (const o of this.plots.query(box)) {
+      if (opts.except && opts.except.includes(o)) continue;
+      if (rectsOverlap(R, plotOf(o), 0.004)) return `The ${BUILDINGS[o.type].levels[o.level].name.toLowerCase()} is in the way`;
+    }
+    const pad = [box[0] - 0.3, box[1] - 0.3, box[2] + 0.3, box[3] + 0.3];
+    for (const sg of this.roads.segsIn(pad)) {
+      const p = sg.e.pts[sg.i], q = sg.e.pts[sg.i + 1];
+      if (segRectDist(R, p[0], p[1], q[0], q[1]) < HALF[sg.e.level] + VERGE) return 'A road is in the way';
+    }
+    for (const sg of this.rails.segsIn(pad)) {
+      const p = sg.e.pts[sg.i], q = sg.e.pts[sg.i + 1];
+      if (segRectDist(R, p[0], p[1], q[0], q[1]) < RAIL_HALF + 0.02) return 'Railway track is in the way';
+    }
+    if (!opts.fields) for (const f of this.fieldIx.query(box)) if (rectsOverlap(R, f.rect, 0.004)) return 'Farm fields: take them out of the farm first';
+    return null;
   }
 
   checkBuild(type, x, z, opts = {}) {
     const def = BUILDINGS[type];
-    const W = opts.w ?? def.size, D = opts.d ?? def.size;
+    const [w0, d0] = sizeOf(type);
+    const W = opts.w ?? w0, D = opts.d ?? d0;
+    const a = opts.a ?? this.faceRoad(x, z) ?? 0;
+    const R = rect(x, z, a, W / 2, D / 2);
     const t = this.terrain;
     let reason = null;
     if (!opts.ignoreUnlock && this.unlockPop < unlockOf(type, 0)) reason = `Unlocks at ${unlockOf(type, 0)} villagers`;
     if (!reason && !opts.ignoreUnlock && !this.hasTech(def.tech)) reason = `Research ${this.techName(def.tech)} first`;
     // (one seat of government, whichever it has grown into)
     if (def.unique && !opts.ignoreUnique) for (const b of this.buildings.values()) if (b.type === type || (def.seat && BUILDINGS[b.type].seat)) { reason = 'Only one allowed'; break; }
-    let minH = Infinity, maxH = -Infinity, trees = 0;
-    for (let dz = 0; dz < D && !reason; dz++) {
-      for (let dx = 0; dx < W; dx++) {
-        const tx = x + dx, tz = z + dz;
-        if (!this.inBounds(tx, tz)) { reason = 'Out of bounds'; break; }
-        const i = this.idx(tx, tz);
-        if (t.isWater(tx, tz)) { reason = "Can't build on water"; break; }
-        if (this.roads[i]) { reason = 'A road is in the way'; break; }
-        if (this.rails[i]) { reason = 'Railway track is in the way'; break; }
-        if (this.buildingAt[i] >= 0) { reason = 'Occupied'; break; }
-        if (this.fields[i] >= 0) { reason = 'Farm fields: take them out of the farm first'; break; }
-        minH = Math.min(minH, t.tileMin(tx, tz));
-        maxH = Math.max(maxH, t.tileMax(tx, tz));
-        trees += this.treeCount[i];
-      }
+    if (!reason) reason = this._plotBlock(R, opts);
+    let g = { minH: 0, maxH: 0, water: false };
+    if (!reason) {
+      g = groundUnder(t, R);
+      if (g.water) reason = "Can't build on water";
+      else if (g.maxH - g.minH > (Math.max(W, D) === 1 ? 0.9 : 1.1)) reason = 'Too steep here';
     }
-    if (!reason && maxH - minH > (Math.max(W, D) === 1 ? 0.9 : 1.1)) reason = 'Too steep here';
-    let access = reason ? [] : this.findAccess(x, z, W, D);
-    // a diagonal passing a corner of the plot: only a one-tile building, which
-    // turns to face it (its way in one of the two tiles the diagonal links)
-    if (!reason && this.diagN) {
-      let sp = 0;
-      for (let dz = 0; dz < D; dz++) for (let dx = 0; dx < W; dx++) sp |= spillsOf(this, x + dx, z + dz);
-      if (sp && !diagCapable({ type, w: W, d: D, size: Math.max(W, D) })) reason = 'A diagonal street passes the corner of this plot: only a one-tile building can stand here';
-      else if (sp) {
-        const pair = this._diagPair({ x, z }, facingCorner(sp, access.length ? access[0].rot : 0));
-        const near = access.filter(a => pair.some(([px, pz]) => px === a.x && pz === a.z));
-        if (near.length) access = near;
-      }
-    }
-    if (!reason && !def.park && !access.length) reason = 'Needs a road next to it';
+    const access = reason ? null : this.accessFor(R);
+    if (!reason && !def.park && !access) reason = this.faceRoad(x, z, 1.5) == null ? 'Needs a road in front of it' : 'Turn it to face the street (Z / C), close enough to reach it';
     if (!reason && def.needsWater) {
-      const ring = [];
-      for (let k = -1; k <= W; k++) ring.push([x + k, z - 1], [x + k, z + D]);
-      for (let k = 0; k < D; k++) ring.push([x - 1, z + k], [x + W, z + k]);
-      if (!ring.some(([ax, az]) => this.inBounds(ax, az) && t.isWater(ax, az))) reason = 'Must be next to water';
+      const ring = rectSamples(grow(R, 0.45), 0.3).filter(([px, pz]) => !inRect(R, px, pz, 0.2));
+      if (!ring.some(([px, pz]) => this.waterAt(px, pz))) reason = 'Must be next to water';
     }
-    const rail = !reason && def.needsRail ? this.findRail(x, z, W, D) : null;
-    if (!reason && def.needsRail && !rail) reason = 'Needs railway track next to it';
+    const rail = !reason && def.needsRail ? this.findRail(R) : null;
+    if (!reason && def.needsRail && !rail) reason = 'Needs railway track alongside it';
+    const trees = reason ? 0 : this._treesIn(grow(R, 0.05)).length;
     const cost = (opts.baseCost ?? def.levels[0].cost) + trees * CLEAR_COST;
     if (!reason && !opts.ignoreMoney && this.money < cost) reason = 'Not enough money';
-    return { ok: !reason, reason, cost, access, minH, maxH, trees, rail };
+    return { ok: !reason, reason, cost, access, minH: g.minH, maxH: g.maxH, trees, rail, rect: R, a, w: W, d: D };
   }
 
-  findRail(x, z, w, d = w) {
-    const cand = [];
-    for (let k = 0; k < w; k++) cand.push([x + k, z + d, 0], [x + k, z - 1, 2]);
-    for (let k = 0; k < d; k++) cand.push([x + w, z + k, 1], [x - 1, z + k, 3]);
-    for (const [ax, az, dir] of cand) if (this.railAt(ax, az)) return { x: ax, z: az, dir };
-    return null;
+  // Track running alongside one of a plot's sides (within reach of it, and
+  // more or less along it): { e, s, x, z, k (the side, as seen from the
+  // plot's front: 0 in front, 1 its right... in its own frame: 0 +z, 1 +x,
+  // 2 -z, 3 -x) }, or null.
+  findRail(R) {
+    let best = null;
+    for (const { e, d } of this.rails.within(R.cx, R.cz, Math.max(R.hw, R.hd) + 0.9)) {
+      const h = this.rails.nearest(R.cx, R.cz, d + Math.max(R.hw, R.hd) + 0.9, (x) => x === e);
+      if (!h) continue;
+      const [lx, lz] = toLocal(R, h.x, h.z);
+      const side = Math.abs(lz) / R.hd > Math.abs(lx) / R.hw ? (lz > 0 ? 0 : 2) : lx > 0 ? 1 : 3;
+      const gap = side & 1 ? Math.abs(lx) - R.hw : Math.abs(lz) - R.hd;
+      if (gap > 0.75 || gap < 0) continue;
+      // (along the side: the track's way within 30 degrees of it)
+      const [ax, az] = side & 1 ? [R.ux, R.uz] : [R.ex, R.ez];
+      if (Math.abs(h.dx * ax + h.dz * az) < 0.86) continue;
+      if (!best || gap < best.gap) best = { e: e.id, s: h.s, x: h.x, z: h.z, k: side, gap };
+    }
+    if (!best) return null;
+    delete best.gap;
+    return best;
   }
 
   // New buildings start as a building site (see Construction) unless placed
@@ -425,57 +484,53 @@ export class World {
   }
 
   _record(type, x, z, chk, o = {}) {
-    const def = BUILDINGS[type];
-    const w = o.w ?? def.size, d = o.d ?? def.size;
     const variant = o.variant ?? ((Math.random() * 1e9) | 0);
-    const pick = chk.access.length ? chk.access[(o.accessIndex || 0) % chk.access.length] : null;
+    const pick = chk.access;
+    const r = (v) => Math.round(v * 1000) / 1000;
     const b = {
-      id: this.newId(), type, level: o.level || 0, x, z, size: Math.max(w, d), w, d, flavor: o.flavor || null, look: o.look || null,
-      rot: pick ? pick.rot : variant % 4,
+      id: this.newId(), type, level: o.level || 0, x: r(x), z: r(z), a: r(wrapAngle(chk.a)), w: chk.w, d: chk.d, size: Math.max(chk.w, chk.d), flavor: o.flavor || null, look: o.look || null,
       variant,
-      access: pick ? { x: pick.x, z: pick.z } : null,
-      rail: chk.rail ? { x: chk.rail.x, z: chk.rail.z, dir: chk.rail.dir } : null,
-      baseY: floorHeight(this.terrain, type, x, z, w, d, pick ? pick.rot : variant % 4, chk.minH, chk.maxH), minY: chk.minH,
+      access: pick ? { e: pick.e, s: pick.s, x: pick.x, z: pick.z } : null,
+      rail: chk.rail ? { ...chk.rail } : null,
+      baseY: floorHeight(this.terrain, type, chk.rect, chk.minH, chk.maxH), minY: chk.minH,
       built: this.day,
       residents: [], workers: [],
-      connected: !!(pick && this.connected[this.idx(pick.x, pick.z)]),
+      connected: !!(pick && pick.conn),
       happiness: o.happiness ?? 60, factors: o.factors ?? null,
       con: null,
     };
-    // turned or nudged on its plot (see pose.js): as asked, or as it stood
-    const p = cleanPose(o.pose || (o.yaw ? [o.yaw, 0, 0] : null));
-    if (p) b.pose = p;
     return b;
   }
 
-  // A building comes forward into the street when every tile along its
-  // front is road.
-  // The tiles in front of a building's plot (or of part of it).
-  _frontTiles(b, part = null) {
-    const [dx, dz] = DIRS[b.rot];
-    const r = part || { x: b.x, z: b.z, w: fw(b), d: fd(b) }, tiles = [];
-    if (dz) for (let k = 0; k < r.w; k++) tiles.push([r.x + k, dz > 0 ? r.z + r.d : r.z - 1]);
-    else for (let k = 0; k < r.d; k++) tiles.push([dx > 0 ? r.x + r.w : r.x - 1, r.z + k]);
-    return tiles;
+  // ------------------------------------------- the street round a building
+  // Road near a world point, as far as the edge of its roadway: how far
+  // beyond the edge it is (negative on it), or Infinity with none within r.
+  _gap(x, z, r = 0.8) {
+    let g = Infinity;
+    for (const { e, d } of this.roads.within(x, z, r + HALF[3])) g = Math.min(g, d - HALF[e.level]);
+    return g;
   }
-
+  // How far a building may come forward into the verge in front of it: the
+  // street runs the whole width of its front (or its own part's, `part`),
+  // no street trees or hedges stand there, and no neighbour's plot.
   _frontOf(b, part = null) {
     if (!b.access) return 0;
-    const tiles = this._frontTiles(b, part);
-    if (!tiles.every(([x, z]) => this.roadAt(x, z))) return 0;
-    // street trees and hedges take the verge, so it stays behind them
-    if (this.dress && tiles.some(([x, z]) => (DRESSINGS[streetPart(this.dress[this.idx(x, z)])] || {}).verge)) return 0;
-    // two buildings on a street corner facing the same road tile would meet
-    // in its corner, so neither of them comes forward there. Nor does one
-    // whose garden strip (b.ext) widens its front past a building on the corner.
-    const [dx, dz] = DIRS[b.rot], e = b.ext || {}, ax = dz ? 'x' : 'z';
-    for (const [x, z] of tiles) for (const s of [-1, 1]) {
-      const o = this.buildingOn(x + (dz ? s : 0), z + (dx ? s : 0));
-      if (!o || o === b) continue;
-      if (e[ax + (s < 0 ? '0' : '1')] > 0) return 0;
-      if (o.access && this._frontTiles(o).some(([fx, fz]) => fx === x && fz === z)) return 0;
+    const R = part || plotOf(b);
+    let room = Infinity;
+    for (const u of [-0.42, 0, 0.42]) {
+      const [x, z] = toWorld(R, u * R.hw * 2, R.hd + 0.02);
+      const g = this._gap(x, z, REACH + 0.1);
+      if (g > REACH) return 0;
+      room = Math.min(room, g);
     }
-    return FRONT;
+    const e = this.roads.edges.get(b.access.e);
+    if (e && (DRESSINGS[streetPart(e.dress)] || {}).verge) return 0;
+    const f = Math.min(FRONT, Math.max(0, room - 0.06));
+    if (f < 0.02) return 0;
+    const [cx, cz] = toWorld(R, 0, f / 2);
+    const out = rect(cx, cz, R.a, R.hw, R.hd + f / 2);
+    for (const o of this.plots.query(aabbOf(out))) if (o !== b && rectsOverlap(out, plotOf(o), 0.004)) return 0;
+    return Math.round(f * 1000) / 1000;
   }
 
   // A shop on a street corner: the street it faces turns the corner at one
@@ -484,16 +539,12 @@ export class World {
   // Such a shop carries its shopfront round onto the side street.
   _cornerOf(b) {
     if (!b.access || !CORNER_SHOPS.has(b.type)) return 0;
-    const [fx, fz] = DIRS[b.rot], [rx, rz] = DIRS[(b.rot + 1) % 4];
+    const R = ownPlot(b);
     let m = 0;
     for (const [bit, s] of [[1, -1], [2, 1]]) {
-      // the plot's tile at that end of its front: the street ahead of it and the road beside it
-      let at = null, best = -Infinity;
-      for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) {
-        const x = b.x + dx, z = b.z + dz, v = (x * fx + z * fz) * 1000 + s * (x * rx + z * rz);
-        if (v > best) { best = v; at = [x, z]; }
-      }
-      if (this.roadAt(at[0] + fx, at[1] + fz) && this.roadAt(at[0] + s * rx, at[1] + s * rz)) m |= bit;
+      // (its left as seen from the street is its own -x)
+      const [x, z] = toWorld(R, s * (R.hw + 0.2), R.hd - Math.min(0.3, R.hd * 0.5));
+      if (this._gap(x, z) < 0.3) m |= bit;
     }
     return m;
   }
@@ -503,16 +554,11 @@ export class World {
   // walls there get windows and a door rather than a blank face.
   _sidesOf(b) {
     if (!b.access) return 0;
-    const [fx, fz] = DIRS[b.rot], [rx, rz] = DIRS[(b.rot + 1) % 4];
+    const R = ownPlot(b);
     let m = 0;
-    for (const [bit, ax, az] of [[1, -rx, -rz], [2, rx, rz], [4, -fx, -fz]]) {
-      // the plot's tiles along that side, and the road beyond them
-      let best = -Infinity;
-      for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) best = Math.max(best, (b.x + dx) * ax + (b.z + dz) * az);
-      for (let dz = 0; dz < fd(b) && !(m & bit); dz++) for (let dx = 0; dx < fw(b); dx++) {
-        const x = b.x + dx, z = b.z + dz;
-        if (x * ax + z * az === best && this.roadAt(x + ax, z + az)) { m |= bit; break; }
-      }
+    for (const [bit, lx, lz] of [[1, -R.hw - 0.25, 0], [2, R.hw + 0.25, 0], [4, 0, -R.hd - 0.25]]) {
+      const [x, z] = toWorld(R, lx, lz);
+      if (this._gap(x, z) < 0.3) m |= bit;
     }
     return m;
   }
@@ -528,20 +574,9 @@ export class World {
   _updateFronts(except = null) {
     const refit = [];
     for (const b of this.buildings.values()) {
-      // a building with a diagonal past its plot's corner faces it, turned
-      // 45 degrees (b.diag: 1 + the corner), its way to the street one of the
-      // two road tiles the diagonal links; it never comes forward, and gives
-      // up any garden land it bought or sold (the plots no longer line up)
-      const dq = this._diagOf(b), dg = dq + 1;
-      if (dg && dg !== (b.diag || 0)) {
-        if (b.leases && b.leases.length) this._dissolveLeases(b);
-        this._diagAccess(b, dq);
-      }
-      const f = dg ? 0 : this._frontOf(b), r = dg ? null : spareRect(b), own = r ? this._frontOf(b, r) : undefined;
-      const cn = dg ? 0 : this._cornerOf(b), sd = dg ? this._diagSides(b, dq) : this._sidesOf(b), cv = dg ? 0 : this._curveOf(b);
-      if (f !== (b.front || 0) || own !== b.ownFront || cn !== (b.corner || 0) || sd !== (b.sides || 0) || dg !== (b.diag || 0) || cv !== (b.curve || 0)) {
-        if (dg) b.diag = dg; else delete b.diag;
-        if (cv) b.curve = cv; else delete b.curve;
+      const f = this._frontOf(b), r = spareRect(b), own = r ? this._frontOf(b, r) : undefined;
+      const cn = this._cornerOf(b), sd = this._sidesOf(b);
+      if (f !== (b.front || 0) || own !== b.ownFront || cn !== (b.corner || 0) || sd !== (b.sides || 0)) {
         if (sd) b.sides = sd; else delete b.sides;
         b.front = f;
         if (own === undefined) delete b.ownFront; else b.ownFront = own;
@@ -552,76 +587,45 @@ export class World {
     for (const b of refit) this.emit('building:refit', b);
   }
 
-  // A one-tile building facing the outside of a bend in the street turns to
-  // sit square to its curve: towards the corner the bend turns round (b.curve,
-  // radians from facing straight out of its plot; 0 for none). See pose.js.
-  _curveOf(b) {
-    if (!b.access || !diagCapable(b) || b.spare) return 0;
-    const { x: ax, z: az } = b.access, [fx, fz] = DIRS[b.rot];
-    if (b.x + fx !== ax || b.z + fz !== az) return 0;
-    const s = roadTile(this, ax, az);
-    if (!s || s.bend < 0 || s.arms[sideTo(ax, az, b.x, b.z)]) return 0;
-    const K = cornerFrame(ax, az, s.bend);
-    let rel = Math.atan2(K.Kx - b.x - 0.5, K.Kz - b.z - 0.5) - (b.rot * Math.PI) / 2;
-    while (rel > Math.PI) rel -= 2 * Math.PI;
-    while (rel < -Math.PI) rel += 2 * Math.PI;
-    return Math.abs(rel) < 0.7 ? Math.round(rel * 1000) / 1000 : 0;
-  }
-
-  // Turn and nudge a building on its plot (pose: [turn, across, forward], see
-  // pose.js); null squares it to its street again.
-  setPose(id, pose) {
-    const b = this.buildings.get(id);
+  // Turn a building on its plot: its plot turns about its middle to face
+  // angle a (radians, as b.a). It must still fit and reach its street.
+  turnCheck(b, a) {
     if (!b) return { ok: false, reason: 'That building is gone' };
-    if (b.spare) return { ok: false, reason: 'Build it across its whole plot first' };
-    const p = pose == null ? null : cleanPose(pose);
-    if (JSON.stringify(p) === JSON.stringify(b.pose || null)) return { ok: true, building: b };
-    if (p) b.pose = p; else delete b.pose;
+    if (b.con) return { ok: false, reason: 'Construction under way' };
+    if (b.spare || (b.leases && b.leases.length)) return { ok: false, reason: 'Not while it has land taken but not built on, or garden bought or sold' };
+    const R = rect(b.x, b.z, a, b.w / 2, b.d / 2);
+    const why = this._plotBlock(R, { except: [b] });
+    if (why) return { ok: false, reason: why };
+    const g = groundUnder(this.terrain, R);
+    if (g.water) return { ok: false, reason: "Can't build on water" };
+    const access = this.accessFor(R);
+    if (!access && !BUILDINGS[b.type].park) return { ok: false, reason: 'It would no longer face a street' };
+    return { ok: true, rect: R, access, g };
+  }
+  turnBuilding(id, a) {
+    const b = this.buildings.get(id);
+    a = wrapAngle(Number(a));
+    if (!Number.isFinite(a)) return { ok: false, reason: 'No such turn' };
+    const chk = this.turnCheck(b, a);
+    if (!chk.ok) return chk;
+    b.a = Math.round(a * 1000) / 1000;
+    b.access = chk.access ? { e: chk.access.e, s: chk.access.s, x: chk.access.x, z: chk.access.z } : null;
+    b.connected = !!(chk.access && chk.access.conn);
+    if (BUILDINGS[b.type].needsRail) b.rail = this.findRail(chk.rect);
+    b.baseY = floorHeight(this.terrain, b.type, chk.rect, chk.g.minH, chk.g.maxH); b.minY = chk.g.minH;
+    this._file(b);
+    this._clearTreesIn(grow(chk.rect, 0.22));
+    this._updateFronts();
     this.emit('building:refit', b);
+    this.emit('trees');
     return { ok: true, building: b };
   }
 
-  // The corner a building faces a diagonal across (see above), or -1.
-  _diagOf(b) {
-    if (!this.diagN || !diagCapable(b)) return -1;
-    return facingCorner(spillsOf(this, b.x, b.z), b.rot);
-  }
-
-  // The two road tiles a diagonal past corner q of b's plot links.
-  _diagPair(b, q) {
-    const [ax, az] = SIDES[q], [bx, bz] = SIDES[(q + 1) & 3];
-    return [[b.x + ax, b.z + az], [b.x + bx, b.z + bz]];
-  }
-
-  // Point a building facing a diagonal at one of its two road tiles (one
-  // joined to the way out of town, if either is).
-  _diagAccess(b, q) {
-    const pair = this._diagPair(b, q).filter(([x, z]) => this.roadAt(x, z));
-    if (!pair.length) return;
-    const conn = ([x, z]) => !!this.connected[this.idx(x, z)];
-    const keep = pair.find(([x, z]) => b.access && b.access.x === x && b.access.z === z && (conn([x, z]) || !pair.some(conn)));
-    const [x, z] = keep || pair.find(conn) || pair[0];
-    b.access = { x, z };
-    b.connected = conn([x, z]);
-  }
-
-  // The other sides of a building facing a diagonal with a diagonal along
-  // them too (b.sides: 1 its left, 2 its right, 4 its back, as seen from the
-  // street): the ones passing the plot's other corners.
-  _diagSides(b, q) {
-    const sp = spillsOf(this, b.x, b.z);
-    return (sp & (1 << ((q + 1) & 3)) ? 1 : 0) | (sp & (1 << ((q + 3) & 3)) ? 2 : 0) | (sp & (1 << ((q + 2) & 3)) ? 4 : 0);
-  }
-
   _occupy(b) {
-    const plot = [];
-    for (let dz = 0; dz < b.d; dz++) for (let dx = 0; dx < b.w; dx++) plot.push([b.x + dx, b.z + dz]);
-    this._unfield(plot);
-    for (let dz = 0; dz < b.d; dz++) for (let dx = 0; dx < b.w; dx++) {
-      this.buildingAt[this.idx(b.x + dx, b.z + dz)] = b.id;
-      this._clearTrees(b.x + dx, b.z + dz);
-    }
-    this._clearTreesNear(b.x, b.z, b.w, b.d, 0.22);
+    const R = plotOf(b);
+    this._unfield(R);
+    this._file(b);
+    this._clearTreesIn(grow(R, 0.22));
   }
 
   // Take a building off the map without refunds or rehousing (its people
@@ -629,7 +633,7 @@ export class World {
   _detach(b) {
     this._dissolveLeases(b);
     this._dropFields(b);
-    for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) this.buildingAt[this.idx(b.x + dx, b.z + dz)] = -1;
+    this.plots.remove(b);
     this.buildings.delete(b.id);
     this.emit('building:remove', b);
     this._updateFronts();
@@ -695,7 +699,7 @@ export class World {
   // Built out across the whole plot: extended, or rebuilt as a building whose
   // own footprint is the plot (a Country Mansion on a double plot).
   _fill(b, extend) {
-    if (b.spare && (extend || baseArea(b) >= fw(b) * fd(b))) { delete b.spare; setFloor(this.terrain, b); this._updateFronts(b); }
+    if (b.spare && (extend || baseArea(b) >= b.w * b.d)) { delete b.spare; setFloor(this.terrain, b); this._updateFronts(b); }
   }
 
   // A home rebuilt to hold fewer people (a Grand Manor on a double plot
@@ -724,41 +728,70 @@ export class World {
     return out;
   }
 
+  // ------------------------------------------------- neighbours in a row
+  // The neighbour beside a building on one side of its own plot (side: 'x0'
+  // its left in its own frame... as b.ext: x0 -x, x1 +x, z0 behind, z1 in
+  // front), when the two stand in line: square to each other (facing the
+  // same way, or any quarter turn of it) and sharing that whole side, so
+  // land can pass from one to the other as it did between squares. { o,
+  // oside (o's side facing b) }, or null.
+  _besideOn(b, side) {
+    const R = ownPlot(b), ax = side[0] === 'x', sg = side[1] === '1' ? 1 : -1;
+    const [px, pz] = toWorld(R, ax ? sg * (R.hw + 0.25) : 0, ax ? 0 : sg * (R.hd + 0.25));
+    const o = this.buildingAt(px, pz);
+    if (!o || o === b) return null;
+    const turn = wrapAngle(o.a - b.a), q = Math.round(turn / (Math.PI / 2));
+    if (Math.abs(turn - q * (Math.PI / 2)) > 0.02) return null;
+    const O = ownPlot(o);
+    // the direction from b into o, in o's frame: which of o's sides faces b
+    const vx = ax ? sg * R.ex : sg * R.ux, vz = ax ? sg * R.ez : sg * R.uz;
+    const ox = -(vx * O.ex + vz * O.ez), oz = -(vx * O.ux + vz * O.uz);
+    const oside = Math.abs(ox) > 0.9 ? (ox > 0 ? 'x1' : 'x0') : oz > 0 ? 'z1' : 'z0';
+    // sharing the whole side: o's half-length along it the same, and its middle
+    // straight across from b's
+    const len = ax ? R.hd : R.hw, olen = oside[0] === 'x' ? O.hd : O.hw;
+    const [lx, lz] = toLocal(R, O.cx, O.cz), across = ax ? lz : lx, out = ax ? Math.abs(lx) - R.hw : Math.abs(lz) - R.hd;
+    const odep = oside[0] === 'x' ? O.hw : O.hd;
+    if (Math.abs(len - olen) > 0.02 || Math.abs(across) > 0.03 || Math.abs(out - odep) > 0.04) return null;
+    return { o, oside };
+  }
+
   // ---------------------------------------------------------- land deals
   // A big home (def.spacious) can buy a strip of garden from a cottage or
-  // family house next door. Its plot grows by LAND tiles on that side and the
+  // family house next door. Its plot grows by LAND on that side and the
   // seller's shrinks by the same amount, so the two never overlap. The buyer's
   // household pays the seller's household (not the town).
   tryEncroach(b) {
     const LAND = 0.25;
     if (!this.hasTech('surveying')) return [];
-    if (!b || !BUILDINGS[b.type].spacious || b.con || fw(b) !== 1 || fd(b) !== 1 || b.diag) return [];
+    if (!b || !BUILDINGS[b.type].spacious || b.con || b.w !== 1 || b.d !== 1) return [];
     b.leases ||= [];
     const ext = this._ext(b);
     const sold = [];
-    const sides = [['x1', 1, 0, 'x0'], ['x0', -1, 0, 'x1'], ['z1', 0, 1, 'z0'], ['z0', 0, -1, 'z1']];
-    for (const [side, dx, dz, opp] of sides) {
+    for (const side of ['x1', 'x0', 'z1', 'z0']) {
       if (b.leases.length >= 2) break;
-      if (ext[side]) continue;
+      if (ext[side] || side === 'z1') continue;
       // strips on two perpendicular sides would meet in a corner of a third plot
       const perp = side[0] === 'x' ? 'z' : 'x';
       if (ext[perp + '0'] > 0 || ext[perp + '1'] > 0) continue;
-      const o = this.buildingOn(b.x + dx, b.z + dz);
-      if (!o || o.type !== 'house' || o.con || fw(o) !== 1 || fd(o) !== 1 || o.diag) continue;
+      const nb = this._besideOn(b, side);
+      if (!nb) continue;
+      const { o, oside: opp } = nb;
+      if (o.type !== 'house' || o.con || o.w !== 1 || o.d !== 1) continue;
       const oe = this._ext(o);
       // a seller gives up one strip at most, and keeps its street side
-      if (oe.x0 < 0 || oe.x1 < 0 || oe.z0 < 0 || oe.z1 < 0) continue;
-      if (o.access && o.access.x === b.x && o.access.z === b.z) continue;
+      if (oe.x0 < 0 || oe.x1 < 0 || oe.z0 < 0 || oe.z1 < 0 || opp === 'z1') continue;
       const price = 60 + 40 * b.level + (b.type === 'villa' ? 30 : 0);
       ext[side] = LAND;
       oe[opp] = -LAND;
       b.leases.push({ with: o.id, side, amt: LAND, price, buyer: true });
       (o.leases ||= []).push({ with: b.id, side: opp, amt: LAND, price, buyer: false });
       sold.push(o);
+      this._file(o);
       this.emit('building:refit', o);
       this.emit('land:sold', { buyer: b, seller: o, price });
     }
-    if (sold.length) { this._updateFronts(b); this.emit('building:refit', b); }
+    if (sold.length) { this._file(b); this._updateFronts(b); this.emit('building:refit', b); }
     return sold;
   }
 
@@ -774,12 +807,14 @@ export class World {
       this._ext(b)[l.side] = 0;
       const o = this.buildings.get(l.with);
       if (!o || !o.leases) continue;
-      const opp = { x0: 'x1', x1: 'x0', z0: 'z1', z1: 'z0' }[l.side];
+      const mine = o.leases.find(x => x.with === b.id);
       o.leases = o.leases.filter(x => x.with !== b.id);
-      this._ext(o)[opp] = 0;
+      if (mine) this._ext(o)[mine.side] = 0;
+      if (this.plots.of.has(o)) this._file(o);
       if (o !== b) this.emit('building:refit', o);
     }
     b.leases = keep;
+    if (this.plots.of.has(b)) this._file(b);
   }
 
   // Each morning a few big homes look for garden land to buy.
@@ -790,119 +825,125 @@ export class World {
   }
 
   // ----------------------------------------------------------- expansion
+  // The land beside a building's plot, in its own frame: a rectangle from
+  // lx0 to lx1 across and lz0 to lz1 back to front (relative to the plot's
+  // middle, as toLocal).
+  _landRect(b, lx0, lx1, lz0, lz1) {
+    const [cx, cz] = toWorld(ownPlot(b), (lx0 + lx1) / 2, (lz0 + lz1) / 2);
+    return rect(cx, cz, b.a, (lx1 - lx0) / 2, (lz1 - lz0) / 2);
+  }
   // Grow a 1×1 building onto the plot beside or behind it. Empty land is
   // simply taken; a small neighbour is either squeezed (it sells a garden
-  // strip and keeps its house) or bought out and demolished.
+  // strip and keeps its house) or bought out and demolished. Every option
+  // grows the plot by whole plots in its own frame (dir: which way, as
+  // { gx0, gx1, gz0, gz1 }, the plot widths it grows by to its left, right,
+  // back and front).
   expandOptions(b) {
     const out = [];
     const def = BUILDINGS[b.type];
-    if (!b || !this.hasTech('surveying') || this._dryHome(b) || b.diag) return out;
+    if (!b || !this.hasTech('surveying') || this._dryHome(b)) return out;
+    const hw = b.w / 2, hd = b.d / 2;
     // a 2×2 park, or a 3×3 one, can grow onto the land round one of its
     // corners into grounds a size bigger (Public Parks); so can the seat of
     // government at its top level (Capital City)
-    const n = fw(b);
+    const n = b.w;
     const grows = def.park ? this.hasTech('publicparks') : def.seat && b.level === def.levels.length - 1 && this.hasTech('capital');
-    if (!b.con && !b.spare && grows && n >= 2 && fd(b) === n && n * n === baseArea(b) && growsInto(b.type, (n + 1) ** 2).length) {
-      const [fx, fz] = DIRS[b.rot];
+    if (!b.con && !b.spare && grows && n >= 2 && b.d === n && n * n === baseArea(b) && growsInto(b.type, (n + 1) ** 2).length) {
       for (const cz of [-1, 1]) for (const cx of [-1, 1]) {
-        const x0 = cx < 0 ? b.x - 1 : b.x, z0 = cz < 0 ? b.z - 1 : b.z, tiles = [];
-        for (let z = z0; z <= z0 + n; z++) for (let x = x0; x <= x0 + n; x++) if (x < b.x || x >= b.x + n || z < b.z || z >= b.z + n) tiles.push([x, z]);
-        const take = this._growLand(b, tiles, 1.4);
+        // the L of land round that corner: a strip along one side and one along the next
+        const strips = [this._landRect(b, cx < 0 ? -hw - 1 : hw, cx < 0 ? -hw : hw + 1, -hd + (cz < 0 ? -1 : 0), hd + (cz > 0 ? 1 : 0)), this._landRect(b, -hw, hw, cz < 0 ? -hd - 1 : hd, cz < 0 ? -hd : hd + 1)];
+        const take = this._growLand(b, strips, 1.4);
         if (!take) continue;
-        // which corner, as the park sees it from its street side
-        const ahead = cx * fx + cz * fz, right = -cx * fz + cz * fx;
-        const where = `${ahead > 0 ? 'in front of it' : 'behind it'} and to its ${right > 0 ? 'right' : 'left'}`;
-        out.push({ dir: 20 + (cx > 0 ? 1 : 0) + (cz > 0 ? 2 : 0), x: tiles[0][0], z: tiles[0][1], tiles, kind: 'grand', where, ...take, label: `Take the land ${where} for ${plotName((n + 1) ** 2)}` });
+        const where = `${cz > 0 ? 'in front of it' : 'behind it'} and to its ${cx > 0 ? 'right' : 'left'}`;
+        out.push({ dir: 20 + (cx > 0 ? 1 : 0) + (cz > 0 ? 2 : 0), grow: { gx0: cx < 0 ? 1 : 0, gx1: cx > 0 ? 1 : 0, gz0: cz < 0 ? 1 : 0, gz1: cz > 0 ? 1 : 0 }, kind: 'grand', where, ...take, label: `Take the land ${where} for ${plotName((n + 1) ** 2)}` });
       }
       return out;
     }
     // a double plot can grow into a 2×2 estate onto two plots beside it:
     // empty land or, for a park, the little parks there too
-    if (!b.con && fw(b) * fd(b) === 2 && this.hasTech('bigplots') && !def.stop && growsInto(b.type, 4).length) {
-      const along = fw(b) === 2;
+    if (!b.con && b.w * b.d === 2 && this.hasTech('bigplots') && !def.stop && growsInto(b.type, 4).length) {
+      const wide = b.w === 2;
       for (const s of [-1, 1]) {
-        const tiles = along ? [[b.x, s < 0 ? b.z - 1 : b.z + 1], [b.x + 1, s < 0 ? b.z - 1 : b.z + 1]] : [[s < 0 ? b.x - 1 : b.x + 1, b.z], [s < 0 ? b.x - 1 : b.x + 1, b.z + 1]];
-        const take = this._growLand(b, tiles, 1.2);
+        const R = wide ? this._landRect(b, -hw, hw, s < 0 ? -hd - 1 : hd, s < 0 ? -hd : hd + 1) : this._landRect(b, s < 0 ? -hw - 1 : hw, s < 0 ? -hw : hw + 1, -hd, hd);
+        const take = this._growLand(b, [R], 1.2);
         if (!take) continue;
-        const [fx, fz] = DIRS[b.rot], where = (along ? -fz === s && !fx : -fx === s && !fz) ? 'behind it' : 'beside it';
-        out.push({ dir: 10 + (s + 1), x: tiles[0][0], z: tiles[0][1], tiles, kind: 'estate', where, ...take, label: `Take the two plots ${where} for a 2×2 estate` });
+        const where = wide ? (s < 0 ? 'behind it' : 'in front of it') : 'beside it';
+        out.push({ dir: 10 + (s + 1), grow: wide ? { gx0: 0, gx1: 0, gz0: s < 0 ? 1 : 0, gz1: s > 0 ? 1 : 0 } : { gx0: s < 0 ? 1 : 0, gx1: s > 0 ? 1 : 0, gz0: 0, gz1: 0 }, kind: 'estate', where, ...take, label: `Take the two plots ${where} for a 2×2 estate` });
       }
       return out;
     }
+    const SIDES = [
+      { dir: 0, side: 'z1', where: 'in front', R: () => this._landRect(b, -hw, hw, hd, hd + 1), grow: { gx0: 0, gx1: 0, gz0: 0, gz1: 1 } },
+      { dir: 1, side: 'x0', where: 'beside', R: () => this._landRect(b, -hw - 1, -hw, -hd, hd), grow: { gx0: 1, gx1: 0, gz0: 0, gz1: 0 } },
+      { dir: 2, side: 'z0', where: 'behind', R: () => this._landRect(b, -hw, hw, -hd - 1, -hd), grow: { gx0: 0, gx1: 0, gz0: 1, gz1: 0 } },
+      { dir: 3, side: 'x1', where: 'beside', R: () => this._landRect(b, hw, hw + 1, -hd, hd), grow: { gx0: 0, gx1: 1, gz0: 0, gz1: 0 } },
+    ];
     // a one-plot park only takes an empty plot beside it (it joins with the
     // parks next door instead)
-    if (def.park && !b.con && fw(b) === 1 && fd(b) === 1 && def.size === 1 && growsInto(b.type, 2).length) {
-      const sideOf = (k) => (k === b.rot ? 'in front' : (k + 2) % 4 === b.rot ? 'behind' : 'beside');
-      DIRS.forEach(([dx, dz], k) => {
-        const take = this._growLand(b, [[b.x + dx, b.z + dz]], 1.1, false);
-        if (take) out.push({ dir: k, x: b.x + dx, z: b.z + dz, kind: 'land', where: sideOf(k), ...take, label: `Take the empty plot ${sideOf(k)}` });
-      });
+    if (def.park && !b.con && b.w === 1 && b.d === 1 && def.size === 1 && growsInto(b.type, 2).length) {
+      for (const S of SIDES) {
+        const take = this._growLand(b, [S.R()], 1.1, false);
+        if (take) out.push({ dir: S.dir, grow: S.grow, kind: 'land', where: S.where, ...take, label: `Take the empty plot ${S.where}` });
+      }
       return out;
     }
-    if (!b || b.con || def.merged || def.park || def.stop || fw(b) !== 1 || fd(b) !== 1 || def.size !== 1) return out;
+    if (!b || b.con || def.merged || def.park || def.stop || b.w !== 1 || b.d !== 1 || def.size !== 1) return out;
     // only where the double plot opens up something bigger to upgrade into
     if (!growsInto(b.type, 2).length) return out;
     const base = CONFIG.PLOT_PRICE;   // the land, whatever stands beside it
-    const front = DIRS[b.rot];
-    const sideOf = (k) => (k === b.rot ? 'in front' : (k + 2) % 4 === b.rot ? 'behind' : 'beside');
-    const names = { 0: 'z1', 1: 'x1', 2: 'z0', 3: 'x0' };
-    DIRS.forEach(([dx, dz], k) => {
-      const x = b.x + dx, z = b.z + dz;
-      if (!this.inBounds(x, z) || this.roadAt(x, z) || this.railAt(x, z) || this.terrain.isWater(x, z) || this.fields[this.idx(x, z)] >= 0) return;
-      // (a plot a diagonal street passes takes nothing bigger than one tile)
-      if (this.diagN && spillsOf(this, x, z)) return;
-      const lo = Math.min(this.terrain.tileMin(x, z), this.terrain.tileMin(b.x, b.z)), hi = Math.max(this.terrain.tileMax(x, z), this.terrain.tileMax(b.x, b.z));
-      if (hi - lo > 1.1) return;
-      const o = this.buildingOn(x, z);
-      const where = sideOf(k);
-      const trees = this.treeCount[this.idx(x, z)] * CLEAR_COST;
-      if (!o) { out.push({ dir: k, x, z, kind: 'land', where, cost: base + trees, label: `Take the empty plot ${where}` }); return; }
-      if (o.con || BUILDINGS[o.type].unique || fw(o) !== 1 || fd(o) !== 1) return;
+    for (const S of SIDES) {
+      const R = S.R();
+      const nb = this._besideOn(b, S.side), o = nb ? nb.o : null;
+      // empty land: in bounds and clear of everything, not too rough
+      const take = !o ? this._growLand(b, [R], 1.1, false) : null;
+      if (take) { out.push({ dir: S.dir, grow: S.grow, kind: 'land', where: S.where, cost: base + take.cost - CONFIG.PLOT_PRICE, label: `Take the empty plot ${S.where}` }); continue; }
+      if (!o || o.con || BUILDINGS[o.type].unique || o.w !== 1 || o.d !== 1) continue;
+      // (its own ground must be good enough to build across)
+      const lo = Math.min(o.minY, b.minY), hi = Math.max(groundUnder(this.terrain, R).maxH, groundUnder(this.terrain, ownPlot(b)).maxH);
+      if (hi - lo > 1.1) continue;
       const oname = BUILDINGS[o.type].levels[o.level].name;
       // squeeze: buy a strip of a cottage's garden (it keeps its house)
-      const side = names[k], opp = names[(k + 2) % 4];
+      const side = S.side, opp = nb.oside;
       const be = b.ext || {}, oe = o.ext || {};
       const perp = side[0] === 'x' ? 'z' : 'x';
-      if (o.type === 'house' && !be[side] && !(be[perp + '0'] > 0 || be[perp + '1'] > 0) && !(oe.x0 < 0 || oe.x1 < 0 || oe.z0 < 0 || oe.z1 < 0)) {
-        out.push({ dir: k, x, z, kind: 'strip', where, other: o, side, opp, cost: 60 + 40 * b.level, label: `Buy a strip of the ${oname}'s garden ${where}`, warn: `The ${oname} next door gets a smaller garden (its owners are paid)` });
+      if (o.type === 'house' && side !== 'z1' && opp !== 'z1' && !be[side] && !(be[perp + '0'] > 0 || be[perp + '1'] > 0) && !(oe.x0 < 0 || oe.x1 < 0 || oe.z0 < 0 || oe.z1 < 0)) {
+        out.push({ dir: S.dir, grow: S.grow, kind: 'strip', where: S.where, other: o, side, opp, cost: 60 + 40 * b.level, label: `Buy a strip of the ${oname}'s garden ${S.where}`, warn: `The ${oname} next door gets a smaller garden (its owners are paid)` });
       }
       const comp = this.buildValue(o);   // its owners are paid what their building is worth
-      out.push({ dir: k, x, z, kind: 'takeover', where, other: o, cost: base + comp, comp, label: `Take over the ${oname} ${where}`,
+      out.push({ dir: S.dir, grow: S.grow, kind: 'takeover', where: S.where, other: o, cost: base + comp, comp, label: `Take over the ${oname} ${S.where}`,
         warn: `The ${oname} will be demolished${o.residents.length ? ` and its ${o.residents.length} resident${o.residents.length > 1 ? 's' : ''} rehoused` : ''} ($${comp} to its owners included)` });
-    });
+    }
     return out;
   }
 
-  // Land a building can grow onto: every tile in bounds, clear of roads,
-  // track, water and fields and with no building on it (though a park, or
-  // the seat's grounds, may take in the little parks there), and the ground
-  // over the old plot and the new no rougher than `rough`. { cost, absorb,
-  // warn }, or null.
-  _growLand(b, tiles, rough, absorb = true) {
+  // Land a building can grow onto (rectangles beside its plot): in bounds,
+  // clear of roads, track, water and fields and with no building on it
+  // (though a park, or the seat's grounds, may take in the little parks
+  // there), and the ground over the old plot and the new no rougher than
+  // `rough`. { cost, absorb, warn }, or null.
+  _growLand(b, rects, rough, absorb = true) {
     const def = BUILDINGS[b.type], taken = [];
-    for (const [x, z] of tiles) {
-      if (!this.inBounds(x, z) || this.roadAt(x, z) || this.railAt(x, z) || this.terrain.isWater(x, z) || this.fields[this.idx(x, z)] >= 0) return null;
-      // (nor where a diagonal street passes the plot's corner: see diagonal.js)
-      if (this.diagN && spillsOf(this, x, z)) return null;
-      const o = this.buildingOn(x, z);
-      if (!o) continue;
-      if (!(absorb && (def.park || def.seat) && isSmallPark(o) && !(o.leases || []).length)) return null;
-      if (!taken.includes(o)) taken.push(o);
-    }
-    let lo = Infinity, hi = -Infinity;
-    for (const [x, z] of [...tiles, [b.x, b.z], [b.x + fw(b) - 1, b.z], [b.x, b.z + fd(b) - 1], [b.x + fw(b) - 1, b.z + fd(b) - 1]]) {
-      lo = Math.min(lo, this.terrain.tileMin(x, z)); hi = Math.max(hi, this.terrain.tileMax(x, z));
+    let lo = b.minY, hi = groundUnder(this.terrain, ownPlot(b)).maxH, trees = 0;
+    for (const R of rects) {
+      // (what stands there: a little park it may take in, or nothing)
+      const there = this.plots.query(aabbOf(R)).filter(o => o !== b && rectsOverlap(R, plotOf(o), 0.004));
+      for (const o of there) {
+        if (!(absorb && (def.park || def.seat) && isSmallPark(o) && !(o.leases || []).length)) return null;
+        if (!taken.includes(o)) taken.push(o);
+      }
+      if (this._plotBlock(R, { except: [b, ...taken] })) return null;
+      const g = groundUnder(this.terrain, R);
+      if (g.water) return null;
+      lo = Math.min(lo, g.minH); hi = Math.max(hi, g.maxH);
+      trees += this._treesIn(R).length;
     }
     if (hi - lo > rough) return null;
-    const empty = tiles.filter(([x, z]) => !this.buildingOn(x, z));
-    const trees = empty.reduce((s, [x, z]) => s + this.treeCount[this.idx(x, z)], 0) * CLEAR_COST;
+    const area = rects.reduce((s, R) => s + 4 * R.hw * R.hd, 0) - taken.reduce((s, o) => s + o.w * o.d, 0);
     const names = [...new Set(taken.map(o => BUILDINGS[o.type].levels[o.level].name.toLowerCase()))];
     const list = names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : names[0];
-    return { cost: empty.length * CONFIG.PLOT_PRICE + trees, absorb: taken, warn: taken.length ? `The ${list} there ${taken.length > 1 ? 'become' : 'becomes'} part of the ${def.park ? 'park' : 'grounds'}` : undefined };
+    return { cost: Math.round(Math.max(0, area)) * CONFIG.PLOT_PRICE + trees * CLEAR_COST, absorb: taken, warn: taken.length ? `The ${list} there ${taken.length > 1 ? 'become' : 'becomes'} part of the ${def.park ? 'park' : 'grounds'}` : undefined };
   }
 
-  // Homes need running water to grow (see Sim._working), unless the sandbox
-  // lets buildings upgrade without meeting their needs.
   _dryHome(b) {
     return !this.sandbox.freeUpgrades && !!BUILDINGS[b.type].levels[b.level].housing && (b.blockers || []).includes('water');
   }
@@ -920,6 +961,7 @@ export class World {
       this._ext(opt.other)[opt.opp] = -LAND;
       (b.leases ||= []).push({ with: opt.other.id, side: opt.side, amt: LAND, price: opt.cost, buyer: true });
       (opt.other.leases ||= []).push({ with: b.id, side: opt.opp, amt: LAND, price: opt.cost, buyer: false });
+      this._file(b); this._file(opt.other);
       this._updateFronts(b);
       this.emit('building:refit', opt.other);
       this.emit('building:refit', b);
@@ -931,27 +973,24 @@ export class World {
     for (const o of opt.absorb || []) this.removeBuilding(o.id, 0);
     this.money -= opt.cost;
     this._dissolveLeases(b);
-    const tiles = opt.tiles || [[opt.x, opt.z]];
     // what the building itself covers, and where (it stays where it stands)
-    const spare = b.spare || { w: fw(b), d: fd(b) };
-    const ox = b.x + fw(b) / 2, oz = b.z + fd(b) / 2;
-    this._unfield(tiles);
-    for (const [x, z] of tiles) { this._clearTrees(x, z); this.buildingAt[this.idx(x, z)] = b.id; }
-    const xs = [b.x, b.x + fw(b) - 1, ...tiles.map(t => t[0])], zs = [b.z, b.z + fd(b) - 1, ...tiles.map(t => t[1])];
-    const x0 = Math.min(...xs), z0 = Math.min(...zs);
-    b.w = Math.max(...xs) - x0 + 1; b.d = Math.max(...zs) - z0 + 1;
-    b.x = x0; b.z = z0; b.size = Math.max(b.w, b.d);
+    const spare = b.spare || { w: b.w, d: b.d };
+    const g = opt.grow, W = b.w + g.gx0 + g.gx1, D = b.d + g.gz0 + g.gz1;
+    const [cx, cz] = toWorld(ownPlot(b), (g.gx1 - g.gx0) / 2, (g.gz1 - g.gz0) / 2);
     if (spare.sx == null) {
       // which end of the new plot it stands at, in its own frame
-      const dx = ox - (b.x + b.w / 2), dz = oz - (b.z + b.d / 2), th = (b.rot * Math.PI) / 2, co = Math.cos(th), si = Math.sin(th);
-      const lx = dx * co - dz * si, lz = dx * si + dz * co, sign = (v) => (Math.abs(v) < 0.01 ? 0 : Math.sign(v));
-      spare.sx = sign(lx); spare.sz = sign(lz);
+      const sign = (v) => (Math.abs(v) < 0.01 ? 0 : Math.sign(v));
+      spare.sx = sign(g.gx0 - g.gx1); spare.sz = sign(g.gz0 - g.gz1);
     }
+    b.x = Math.round(cx * 1000) / 1000; b.z = Math.round(cz * 1000) / 1000;
+    b.w = W; b.d = D; b.size = Math.max(W, D);
     b.spare = spare;
-    delete b.pose;   // (a turn was for the plot it had: square on the bigger one)
+    const R = ownPlot(b);
+    this._unfield(R);
+    this._clearTreesIn(grow(R, 0.22));
+    this._file(b);
     setFloor(this.terrain, b);
     this._updateFronts(b);
-    this._clearTreesNear(b.x, b.z, b.w, b.d, 0.22);
     // the land is the building's now, as a garden; what to build across it
     // (the bigger buildings it opens up, or the same one extended) is the
     // next choice, under Upgrade
@@ -960,10 +999,6 @@ export class World {
     return { ok: true, building: b, kind: opt.kind };
   }
 
-  // ---------------------------------------------------------- demolition
-  // A demolition crew (builders, or hired hands) pulls the building down
-  // over time. People move out at once; plots that are still only pegged
-  // out, and anything in instant-build sandbox, are cleared straight away.
   demolishBuilding(id) {
     const b = this.buildings.get(id);
     if (!b) return { ok: false };
@@ -982,10 +1017,10 @@ export class World {
   // ------------------------------------------------------------- moving
   moveCost(b) { return Math.round(40 + this.buildValue(b) * 0.3); }
 
-  moveCheck(b, x, z) {
-    if (b.con) return { ok: false, reason: 'Construction under way', access: [], cost: 0 };
-    if (!this.hasTech('relocation')) return { ok: false, reason: 'Research House Moving first', access: [], cost: 0 };
-    return this.checkBuild(b.type, x, z, { w: fw(b), d: fd(b), ignoreUnlock: true, ignoreUnique: true, baseCost: this.moveCost(b) });
+  moveCheck(b, x, z, a = null) {
+    if (b.con) return { ok: false, reason: 'Construction under way', access: null, cost: 0 };
+    if (!this.hasTech('relocation')) return { ok: false, reason: 'Research House Moving first', access: null, cost: 0 };
+    return this.checkBuild(b.type, x, z, { w: b.w, d: b.d, a: a ?? undefined, ignoreUnlock: true, ignoreUnique: true, baseCost: this.moveCost(b), except: [b] });
   }
 
   // Moving = builders take the building down, a cart hauls the materials
@@ -994,13 +1029,13 @@ export class World {
   moveBuilding(id, x, z, opts = {}) {
     const b = this.buildings.get(id);
     if (!b) return { ok: false, reason: 'That building is gone' };
-    const chk = this.moveCheck(b, x, z);
+    const chk = this.moveCheck(b, x, z, opts.a);
     if (!chk.ok) return { ok: false, reason: chk.reason };
     const nb = this._record(b.type, x, z, chk, {
-      w: fw(b), d: fd(b), level: b.level, variant: b.variant, flavor: b.flavor, look: b.look, accessIndex: opts.accessIndex,
-      happiness: b.happiness, factors: b.factors, pose: b.pose,
+      level: b.level, variant: b.variant, flavor: b.flavor, look: b.look,
+      happiness: b.happiness, factors: b.factors,
     });
-    if (b.spare) nb.spare = { ...b.spare };
+    if (b.spare) { nb.spare = { ...b.spare }; setFloor(this.terrain, nb); }
     this._occupy(nb);
     this.money -= chk.cost;
     this._retarget(b.id, nb.id);
@@ -1022,18 +1057,25 @@ export class World {
   }
 
   // ------------------------------------------------------------ merging
+  // Two one-plot buildings in a row (side by side, or one behind the other,
+  // square to each other) join into one on the double plot they make,
+  // facing the way the first one faces (the one in front, of one behind the
+  // other).
   mergeOptions(b) {
     const out = this._farmJoins(b);
     if (!this.hasTech('joining')) return out;
-    if (!b || b.con || fw(b) !== 1 || fd(b) !== 1 || b.diag) return out;
-    for (const [dx, dz] of DIRS) {
-      const o = this.buildingOn(b.x + dx, b.z + dz);
-      if (!o || o.con || fw(o) !== 1 || fd(o) !== 1 || o.diag) continue;
+    if (!b || b.con || b.w !== 1 || b.d !== 1) return out;
+    for (const side of ['x0', 'x1', 'z0', 'z1']) {
+      const nb = this._besideOn(b, side), o = nb && nb.o;
+      if (!o || o.con || o.w !== 1 || o.d !== 1) continue;
+      // (one behind the other: the one in front faces the street, and the
+      // one behind must face the same way)
+      if (side[0] === 'z' && Math.abs(wrapAngle(o.a - b.a)) > 0.02) continue;
       const m = mergeResult(b, o, (type, level) => this.hasTech(techForLevel(type, level)) && this.unlockPop >= unlockOf(type, level));
       if (!m || !this.hasTech(BUILDINGS[m.type].tech)) continue;
       // people who won't fit in what the two become
       const people = b.residents.length + o.residents.length, room = capOf({ type: m.type, level: m.level, w: 2, d: 1, size: 2 }, 'housing');
-      out.push({ other: o, ...m, moveOut: Math.max(0, people - room), ok: this.money >= m.cost });
+      out.push({ other: o, side, ...m, moveOut: Math.max(0, people - room), ok: this.money >= m.cost });
     }
     return out;
   }
@@ -1044,18 +1086,19 @@ export class World {
     if (!opt) return { ok: false, reason: "These two can't be joined" };
     if (this.money < opt.cost) return { ok: false, reason: 'Not enough money' };
     if (opt.farmJoin) return this._joinFarm(opt);
-    const x = Math.min(a.x, o.x), z = Math.min(a.z, o.z), w = a.x !== o.x ? 2 : 1, d = a.z !== o.z ? 2 : 1;
-    let minH = Infinity, maxH = -Infinity;
-    for (let dz = 0; dz < d; dz++) for (let dx = 0; dx < w; dx++) {
-      minH = Math.min(minH, this.terrain.tileMin(x + dx, z + dz));
-      maxH = Math.max(maxH, this.terrain.tileMax(x + dx, z + dz));
-    }
-    if (maxH - minH > 1.1) return { ok: false, reason: 'The ground is too uneven to join them' };
-    const access = this.findAccess(x, z, w, d);
-    if (!access.length) return { ok: false, reason: 'Needs a road alongside' };
+    // the double plot: side by side, facing the way a faces; one behind the
+    // other, facing the way the one in front faces
+    const side = opt.side, front = side === 'z1' ? o : a;
+    const cx = (a.x + o.x) / 2, cz = (a.z + o.z) / 2, along = side[0] === 'x';
+    const R = rect(cx, cz, front.a, along ? 1 : 0.5, along ? 0.5 : 1);
+    const g = groundUnder(this.terrain, R);
+    if (g.maxH - g.minH > 1.1) return { ok: false, reason: 'The ground is too uneven to join them' };
+    const access = this.accessFor(R);
+    if (!access) return { ok: false, reason: 'Needs a road alongside' };
     const homes = capOf(a, 'housing') + capOf(o, 'housing');
-    const nb = this._record(opt.type, x, z, { access, rail: null, minH, maxH }, {
-      w, d, level: opt.level, variant: opt.base.variant, flavor: opt.flavor, look: opt.base.look, happiness: opt.base.happiness, factors: opt.base.factors,
+    // (a double plot one behind the other is 1 wide and 2 deep)
+    const nb = this._record(opt.type, cx, cz, { access, rail: null, minH: g.minH, maxH: g.maxH, rect: R, a: front.a, w: along ? 2 : 1, d: along ? 1 : 2 }, {
+      level: opt.level, variant: opt.base.variant, flavor: opt.flavor, look: opt.base.look, happiness: opt.base.happiness, factors: opt.base.factors,
     });
     this.money -= opt.cost;
     this._retarget(a.id, nb.id);
@@ -1074,21 +1117,20 @@ export class World {
   // A farm and a house beside it (FARM_JOIN), from either side: the farm
   // becomes a homestead at its level, with its fields and produce, and the
   // house's family moves into the farmhouse (the house's plot is freed).
-  // Needs no research: any farm can have its farmhouse.
+  // Needs no research: any farm can have its farmhouse. Beside: the two
+  // plots touch along a side (not just at a corner).
   _farmJoins(b) {
     const out = [];
     if (!b || b.con) return out;
-    const J = FARM_JOIN, farmSide = J.from.includes(b.type), houseSide = J.with.includes(b.type) && fw(b) === 1 && fd(b) === 1;
+    const J = FARM_JOIN, farmSide = J.from.includes(b.type), houseSide = J.with.includes(b.type) && b.w === 1 && b.d === 1;
     if (!farmSide && !houseSide) return out;
-    const seen = new Set();
-    for (let dz = -1; dz <= fd(b); dz++) for (let dx = -1; dx <= fw(b); dx++) {
-      const inX = dx >= 0 && dx < fw(b), inZ = dz >= 0 && dz < fd(b);
-      if (inX === inZ) continue;   // the plot itself, and its corners
-      const o = this.buildingOn(b.x + dx, b.z + dz);
-      if (!o || o === b || o.con || seen.has(o.id) || o.diag || b.diag) continue;
+    const R = plotOf(b), seen = new Set();
+    for (const o of this.plots.query(aabbOf(grow(R, 0.1)))) {
+      if (o === b || o.con || seen.has(o.id)) continue;
+      if (!rectsOverlap(grow(R, 0.06), plotOf(o), 0.004) || !this._sideBy(R, plotOf(o))) continue;
       seen.add(o.id);
       const farm = farmSide ? b : o, house = farmSide ? o : b;
-      if (!J.from.includes(farm.type) || !J.with.includes(house.type) || fw(house) !== 1 || fd(house) !== 1) continue;
+      if (!J.from.includes(farm.type) || !J.with.includes(house.type) || house.w !== 1 || house.d !== 1) continue;
       const to = BUILDINGS[J.to], level = Math.min(farm.level, to.levels.length - 1);
       let value = 0;
       for (let l = 0; l <= level; l++) value += to.levels[l].cost;
@@ -1096,6 +1138,13 @@ export class World {
       out.push({ other: o, type: J.to, farmJoin: true, farm, house, base: farm, flavor: farm.flavor || null, level, cost, name: to.levels[level].name, ok: this.money >= cost });
     }
     return out;
+  }
+  // Whether two plots touch along a side (some of a side of one runs along
+  // a side of the other, not only a corner against a corner).
+  _sideBy(A, B) {
+    let n = 0;
+    for (const [x, z] of rectSamples(grow(A, 0.04), 0.1)) if (!inRect(A, x, z, 0.02) && inRect(B, x, z, 0.03)) n++;
+    return n >= 3;
   }
 
   _joinFarm(opt) {
@@ -1116,29 +1165,24 @@ export class World {
   restoreBuilding(rec) {
     const def = BUILDINGS[rec.type];
     if (!def) return;
-    const w = rec.w || def.size, d = rec.d || def.size;
-    let minH = Infinity, maxH = -Infinity;
-    for (let dz = 0; dz < d; dz++) for (let dx = 0; dx < w; dx++) {
-      minH = Math.min(minH, this.terrain.tileMin(rec.x + dx, rec.z + dz));
-      maxH = Math.max(maxH, this.terrain.tileMax(rec.x + dx, rec.z + dz));
-    }
+    const [w0, d0] = sizeOf(rec.type);
+    const w = rec.w || w0, d = rec.d || d0;
     const b = {
-      id: rec.id, type: rec.type, level: Math.min(rec.level, def.levels.length - 1), x: rec.x, z: rec.z, size: Math.max(w, d), w, d,
+      id: rec.id, type: rec.type, level: Math.min(rec.level, def.levels.length - 1), x: rec.x, z: rec.z, a: wrapAngle(rec.a || 0), size: Math.max(w, d), w, d,
       flavor: rec.flavor || null, look: rec.look || null, con: rec.con && typeof rec.con === 'object' ? { ...rec.con } : null,
-      rot: rec.rot, variant: rec.variant, access: null, rail: null, baseY: floorHeight(this.terrain, rec.type, rec.x, rec.z, w, d, rec.rot, minH, maxH), minY: minH, built: rec.built || 1,
+      variant: rec.variant, access: null, rail: null, baseY: 0, minY: 0, built: rec.built || 1,
       residents: [], workers: [], connected: false, happiness: 60, factors: null,
     };
     const spare = spareOf(rec.spare, w, d);
-    if (spare) { b.spare = spare; setFloor(this.terrain, b); }
-    const pose = spare ? null : cleanPose(rec.pose);
-    if (pose) b.pose = pose;
-    for (let dz = 0; dz < d; dz++) for (let dx = 0; dx < w; dx++) this.buildingAt[this.idx(rec.x + dx, rec.z + dz)] = b.id;
+    if (spare) b.spare = spare;
+    setFloor(this.terrain, b);
     if (Array.isArray(rec.leases) && rec.leases.length) {
       b.leases = rec.leases.map(l => ({ ...l }));
       const e = this._ext(b);
       for (const l of b.leases) e[l.side] = l.buyer ? l.amt : -l.amt;
     }
     this.buildings.set(b.id, b);
+    this._file(b);
   }
 
   // What a building can become next: its next level, or at the top level
@@ -1161,14 +1205,14 @@ export class World {
     }
     // ...and a double-plot building grown into a 2×2 estate can be rebuilt as
     // its estate counterpart, at the level it has reached
-    if (fw(b) * fd(b) >= 4 && ESTATE[b.type]) {
+    if (b.w * b.d >= 4 && ESTATE[b.type]) {
       for (const type of ESTATE[b.type]) out.push({ type, level: Math.min(b.level, BUILDINGS[type].levels.length - 1), estate: true });
     }
     // ...and a 2×2 park grown into 3×3 grounds (or a 3×3 one into 4×4) laid
     // out afresh across them, round what it was; the seat rebuilt across
     // them as the first level of the grander seat
-    if (b.spare && fw(b) * fd(b) >= 9 && GRAND[b.type]) {
-      for (const type of GRAND[b.type]) if (baseAreaOf(type) === fw(b) * fd(b)) out.push({ type, level: def.seat ? 0 : Math.min(b.level, BUILDINGS[type].levels.length - 1), grand: true });
+    if (b.spare && b.w * b.d >= 9 && GRAND[b.type]) {
+      for (const type of GRAND[b.type]) if (baseAreaOf(type) === b.w * b.d) out.push({ type, level: def.seat ? 0 : Math.min(b.level, BUILDINGS[type].levels.length - 1), grand: true });
     }
     // ...or the building as it is can be built out across the land it took
     // (not a park: a bigger lawn holds no more scenery; nor the seat, which
@@ -1186,8 +1230,8 @@ export class World {
     // a building on a grown plot is that much bigger, and so is its upgrade;
     // one not yet built out across it stays its own size unless the new
     // building fills the plot
-    const fills = !!target.extend || baseAreaOf(target.type) >= fw(b) * fd(b);
-    const k = b.spare && !fills ? sizeKFor(target.type, b.spare.w, b.spare.d) : sizeKFor(target.type, fw(b), fd(b));
+    const fills = !!target.extend || baseAreaOf(target.type) >= b.w * b.d;
+    const k = b.spare && !fills ? sizeKFor(target.type, b.spare.w, b.spare.d) : sizeKFor(target.type, b.w, b.d);
     const next = scaledLevel(BUILDINGS[target.type].levels[target.level], k);
     // extending costs what the building is worth, times how much bigger it gets
     let price = next.cost;
@@ -1215,7 +1259,7 @@ export class World {
     if (tech) reqs.unshift({ label: `Research: ${this.techName(tech)}`, met: this.hasTech(tech), tech });
     // the bigger stages need a double plot: expand onto the plot next door
     // first; estates need a 2×2 plot, grown from a double plot
-    if (fw(b) * fd(b) < baseAreaOf(target.type)) {
+    if (b.w * b.d < baseAreaOf(target.type)) {
       const grounds = plotName(baseAreaOf(target.type));
       reqs.unshift(BUILDINGS[target.type].grand
         ? { label: `${grounds[0].toUpperCase()}${grounds.slice(1)} — grow the ${BUILDINGS[target.type].seat ? 'seat' : 'park'} onto the land round it first`, met: false, space: true }
@@ -1333,6 +1377,7 @@ export class World {
     return undefined;
   }
 
+
   removeBuilding(id, refund = 0.25) {
     const b = this.buildings.get(id);
     if (!b) return;
@@ -1344,7 +1389,7 @@ export class World {
     }
     this._dissolveLeases(b);
     this._dropFields(b);
-    for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) this.buildingAt[this.idx(b.x + dx, b.z + dz)] = -1;
+    this.plots.remove(b);
     this.buildings.delete(id);
     const def = BUILDINGS[b.type];
     let value = 0;
@@ -1363,265 +1408,251 @@ export class World {
     }
   }
 
-  // ---------------------------------------------------------------- rails
-  checkRail(x, z) {
-    if (!this.inBounds(x, z)) return { ok: false, reason: 'Out of bounds' };
-    const i = this.idx(x, z);
-    const t = this.terrain;
-    if (this.buildingAt[i] >= 0) return { ok: false, reason: 'A building is in the way' };
-    if (this.fields[i] >= 0) return { ok: false, reason: 'Farm fields are in the way: take them out of the farm first' };
-    if (this.rails[i]) return { ok: true, cost: 0, noop: true };
-    const water = t.isWater(x, z);
-    if (!water && t.slope(x, z) > 0.6) return { ok: false, reason: 'Too steep for track' };
-    if (water && t.tileAvg(x, z) < -0.9) return { ok: false, reason: 'Water too deep' };
-    if (this.unlockPop < 25) return { ok: false, reason: 'Railways unlock at 25 villagers' };
-    if (!this.hasTech('railways')) return { ok: false, reason: 'Research Railways first' };
-    let cost = RAIL_COST * (water ? BRIDGE_MULT : 1) + this.treeCount[i] * CLEAR_COST;
-    return { ok: true, cost, water };
+  // ------------------------------------------------------- laying curves
+  // The curve a stroke the player drew lays: the points (ctrl) fitted with a
+  // smooth curve (or straight, two of them).
+  static curveOf(ctrl) {
+    const P = (Array.isArray(ctrl) ? ctrl : []).filter(p => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1])).map(p => [p[0], p[1]]);
+    if (P.length < 3) return P;
+    return spline(P, 0.1, 0.002);
   }
 
-  placeRails(tiles) {
-    let placed = 0, spent = 0, failed = null;
-    for (const [x, z] of tiles) {
-      const c = this.checkRail(x, z);
-      if (!c.ok) { failed ||= c.reason; continue; }
-      if (c.noop) continue;
-      if (this.money < c.cost) { failed = 'Not enough money'; break; }
-      this.money -= c.cost; spent += c.cost; placed++;
-      this.rails[this.idx(x, z)] = 1;
-      this._clearTrees(x, z);
-      this._clearTreesNear(x, z, 1, 1, 0.2);
+  // What laying a curve of road (level) or track (rail) through ctrl would
+  // do: the network's plan (net.js) and the town's rules on top of it.
+  // { ok, reason, cost, plan, pts, len, water (how much is bridge) }.
+  _checkCurve(net, ctrl, level, rail) {
+    const out = { ok: false, reason: null, cost: 0, plan: null, pts: null, len: 0, water: 0 };
+    const pts = World.curveOf(ctrl);
+    out.pts = pts;
+    if (pts.length < 2) { out.reason = 'Too short'; return out; }
+    const N = this.N, hw = rail ? RAIL_HALF : HALF[level];
+    if (!rail && !(ROAD_LEVELS[level])) { out.reason = 'No such road'; return out; }
+    if (!rail && this.unlockPop < ROAD_LEVELS[level].unlock) { out.reason = `Unlocks at ${ROAD_LEVELS[level].unlock} villagers`; return out; }
+    if (rail && this.unlockPop < 25) { out.reason = 'Railways unlock at 25 villagers'; return out; }
+    if (rail && !this.hasTech('railways')) { out.reason = 'Research Railways first'; return out; }
+    if (pts.some(([x, z]) => x < 0.05 || z < 0.05 || x > N - 0.05 || z > N - 0.05)) { out.reason = 'Out of bounds'; return out; }
+    if (tightest(pts, 0.2) < (rail ? 0.9 : 0.32)) { out.reason = rail ? 'Track can\'t bend that tightly' : 'Too tight a bend'; return out; }
+    const plan = net.plan(pts);
+    out.plan = plan;
+    if (plan.reason) { out.reason = plan.reason; return out; }
+    // every point along it, a little apart, and where it meets the roads (or
+    // track) already there
+    const all = resample(plan.pieces.flatMap((p, i) => (i ? p.pts.slice(1) : p.pts)), 0.1);
+    const joins = [plan.j0, plan.j1, ...plan.cross].filter(Boolean).map(j => [j.x, j.z]);
+    const nearJoin = (x, z, r) => joins.some(([jx, jz]) => Math.hypot(jx - x, jz - z) < r);
+    // over buildings, fields and the other network
+    for (let i = 0; i + 1 < all.length; i++) {
+      const [ax, az] = all[i], [bx, bz] = all[i + 1];
+      const box = [Math.min(ax, bx) - 0.6, Math.min(az, bz) - 0.6, Math.max(ax, bx) + 0.6, Math.max(az, bz) + 0.6];
+      for (const o of this.plots.query(box)) {
+        if (segRectDist(plotOf(o), ax, az, bx, bz) < hw + VERGE - 0.02) { out.reason = `The ${BUILDINGS[o.type].levels[o.level].name.toLowerCase()} is in the way`; return out; }
+      }
+      for (const f of this.fieldIx.query(box)) if (segRectDist(f.rect, ax, az, bx, bz) < hw) { out.reason = 'Farm fields are in the way: take them out of the farm first'; return out; }
     }
-    if (placed) { this._boulevards(true); this.updateRailLinks(); this.emit('trees'); }
-    return { placed, spent, failed };
+    // the other network: crossed at a good angle, never run along
+    const other = rail ? this.roads : this.rails;
+    const crossAt = [];
+    for (let i = 0; i + 1 < all.length; i++) {
+      const [ax, az] = all[i], [bx, bz] = all[i + 1];
+      for (const sg of other.segsIn([Math.min(ax, bx), Math.min(az, bz), Math.max(ax, bx), Math.max(az, bz)])) {
+        const p = sg.e.pts[sg.i], q = sg.e.pts[sg.i + 1];
+        if (!segCross(ax, az, bx, bz, p[0], p[1], q[0], q[1])) continue;
+        const L1 = Math.hypot(bx - ax, bz - az), L2 = Math.hypot(q[0] - p[0], q[1] - p[1]);
+        const c = Math.abs(((bx - ax) * (q[0] - p[0]) + (bz - az) * (q[1] - p[1])) / (L1 * L2 || 1));
+        if (c > Math.cos((40 * Math.PI) / 180)) { out.reason = rail ? 'Track must cross a road nearer square' : 'A road must cross the track nearer square'; return out; }
+        crossAt.push([(ax + bx) / 2, (az + bz) / 2]);
+      }
+    }
+    const oh = rail ? HALF[3] : RAIL_HALF;
+    for (const [x, z] of all) {
+      if (crossAt.some(([cx, cz]) => Math.hypot(cx - x, cz - z) < hw + oh + 0.35)) continue;
+      const h = other.nearest(x, z, hw + oh + 0.1);
+      if (h) { out.reason = rail ? 'A road is in the way' : 'Railway track is in the way'; return out; }
+    }
+    // alongside roads (or track) of its own kind, too near to be apart
+    for (const [x, z] of all) {
+      if (nearJoin(x, z, hw + HALF[3] + 0.3)) continue;
+      for (const { e, d } of net.within(x, z, hw + HALF[3] + 0.12)) {
+        if (d < hw + (rail ? RAIL_HALF : HALF[e.level]) + 0.1) { out.reason = rail ? 'Too close alongside other track' : 'Too close alongside another road'; return out; }
+      }
+    }
+    // the ground: steep, deep water, junctions on water
+    let wet = 0;
+    for (let i = 0; i < all.length; i++) {
+      const [x, z] = all[i];
+      if (this.waterAt(x, z)) {
+        wet++;
+        if (this.terrain.heightAt(x, z) < -0.9 && !(rail && false)) { out.reason = 'Water too deep'; return out; }
+      }
+      if (i >= 5) {
+        const [px, pz] = all[i - 5];
+        const dh = Math.abs(Math.max(this.terrain.heightAt(x, z), 0) - Math.max(this.terrain.heightAt(px, pz), 0));
+        if (!this.waterAt(x, z) && !this.waterAt(px, pz) && dh > (rail ? 0.3 : 0.45)) { out.reason = rail ? 'Too steep for track' : 'Too steep for a road'; return out; }
+      }
+    }
+    for (const [x, z] of joins) if (this.waterAt(x, z)) { out.reason = 'Junctions can\'t stand on water'; return out; }
+    for (const pc of plan.pieces) for (const p of [pc.pts[0], pc.pts[pc.pts.length - 1]]) if (this.waterAt(p[0], p[1])) { out.reason = 'A road can\'t end on water'; return out; }
+    const len = polyLength(all), step = len / Math.max(1, all.length - 1);
+    out.len = len;
+    out.water = wet * step;
+    const per = rail ? RAIL_COST : ROAD_LEVELS[level].cost;
+    const trees = this._treesAlong(all, hw + 0.1).length;
+    out.cost = Math.round((len - out.water) * per + out.water * per * BRIDGE_MULT + trees * CLEAR_COST);
+    out.trees = trees;
+    out.all = all;
+    if (!this.sandbox.infiniteMoney && this.money < out.cost) { out.reason = 'Not enough money'; out.ok = false; return out; }
+    out.ok = true;
+    return out;
   }
 
-  removeRail(x, z) {
-    if (!this.railAt(x, z)) return false;
-    this.rails[this.idx(x, z)] = 0;
-    this._boulevards(true);
+  // ---------------------------------------------------------------- rails
+  checkRail(ctrl) { return this._checkCurve(this.rails, ctrl, 1, true); }
+  placeRail(ctrl) {
+    const c = this.checkRail(ctrl);
+    if (!c.ok) return { placed: 0, spent: 0, failed: c.reason };
+    this.rails.lay(c.plan, { level: 1 });
+    this.money -= c.cost;
+    this._clearTreesAlong(c.all, RAIL_HALF + 0.2);
+    this.updateRailLinks();
+    this.emit('trees');
+    return { placed: 1, spent: c.cost, failed: null };
+  }
+  removeRailEdge(id) {
+    const e = this.rails.edges.get(id);
+    if (!e) return false;
+    this.rails.removeEdge(id);
+    this.rails.tidy([e.a, e.b]);
     this.updateRailLinks();
     return true;
   }
 
   updateRailLinks() {
-    this._boulevards();   // a level crossing breaks a boulevard's median
     for (const b of this.buildings.values()) {
       if (!BUILDINGS[b.type].needsRail) continue;
-      const r = this.findRail(b.x, b.z, fw(b), fd(b));
-      const changed = !!r !== !!b.rail || (r && b.rail && (r.x !== b.rail.x || r.z !== b.rail.z));
-      b.rail = r ? { x: r.x, z: r.z, dir: r.dir } : null;
+      const r = this.findRail(ownPlot(b));
+      const changed = !!r !== !!b.rail || (r && b.rail && (r.e !== b.rail.e || Math.abs(r.s - b.rail.s) > 1e-6));
+      b.rail = r;
       if (changed) this.emit('building:change', b);
     }
     this.emit('rails');
   }
 
   // ---------------------------------------------------------------- roads
-  checkRoad(x, z, level, opts = {}) {
-    if (!this.inBounds(x, z)) return { ok: false, reason: 'Out of bounds' };
-    const i = this.idx(x, z);
-    const t = this.terrain;
-    if (this.buildingAt[i] >= 0) return { ok: false, reason: 'A building is in the way' };
-    if (this.fields[i] >= 0) return { ok: false, reason: 'Farm fields are in the way: take them out of the farm first' };
-    const water = t.isWater(x, z);
-    if (!water && t.slope(x, z) > 0.85) return { ok: false, reason: 'Too steep for a road' };
-    if (water && t.tileAvg(x, z) < -0.9) return { ok: false, reason: 'Water too deep' };
-    if (!opts.ignoreUnlock && this.unlockPop < ROAD_LEVELS[level].unlock) return { ok: false, reason: `Unlocks at ${ROAD_LEVELS[level].unlock} villagers` };
-    const cur = this.roads[i];
-    if (cur >= level) return { ok: true, cost: 0, noop: true };
-    let cost = ROAD_LEVELS[level].cost - (cur ? ROAD_LEVELS[cur].cost : 0);
-    if (water) cost *= BRIDGE_MULT;
-    if (!cur) cost += this.treeCount[i] * CLEAR_COST;
-    return { ok: true, cost, water };
+  checkRoad(ctrl, level) { return this._checkCurve(this.roads, ctrl, level, false); }
+
+  // Lay a curve of road at this level through the points the player drew.
+  placeRoad(ctrl, level) {
+    const c = this.checkRoad(ctrl, level);
+    if (!c.ok) return { placed: 0, spent: 0, failed: c.reason };
+    const { made } = this.roads.lay(c.plan, { level });
+    this.money -= c.cost;
+    this._clearTreesAlong(c.all, HALF[level] + 0.12);
+    this.updateRoadNetwork();
+    this.emit('trees');
+    return { placed: made.length, spent: c.cost, failed: null, edges: made.map(e => e.id) };
   }
 
-  // What laying a drag of road would do, tile by tile (as checkRoad). A step
-  // across a corner is a diagonal (see diagonal.js), whose band passes over
-  // the corners of the two tiles beside it, so only a building that can turn
-  // to face it may stand there. A tile whose step in is refused isn't laid
-  // (or, already road, isn't linked): { ok, reason, cost, noop, step }.
-  checkStroke(tiles, level) {
-    const out = tiles.map(([x, z]) => ({ ...this.checkRoad(x, z, level), step: true }));
-    for (let n = 1; n < tiles.length; n++) {
-      const [ax, az] = tiles[n - 1], [bx, bz] = tiles[n];
-      if (cornerTo(ax, az, bx, bz) < 0) continue;
-      const why = this._diagBlock(ax, az, bx, bz);
-      if (!why) continue;
-      out[n].step = false;
-      if (out[n].ok && !out[n].noop) Object.assign(out[n], { ok: false, reason: why });
+  // What upgrading (or downgrading) these road edges to `level` costs:
+  // the difference in price over their length (a bridge three times over),
+  // a quarter back going down. { ok, reason, cost, edges }.
+  levelCheck(ids, level) {
+    if (!ROAD_LEVELS[level]) return { ok: false, reason: 'No such road', cost: 0, edges: [] };
+    if (this.unlockPop < ROAD_LEVELS[level].unlock) return { ok: false, reason: `Unlocks at ${ROAD_LEVELS[level].unlock} villagers`, cost: 0, edges: [] };
+    let cost = 0;
+    const edges = [];
+    for (const id of ids) {
+      const e = this.roads.edges.get(id);
+      if (!e || e.level === level) continue;
+      const hy = this._heights(e), wet = hy.wet.reduce((s, v) => s + v, 0) * hy.step;
+      const k = (e.len - wet) + wet * BRIDGE_MULT, d = (ROAD_LEVELS[level].cost - ROAD_LEVELS[e.level].cost) * k;
+      cost += d > 0 ? d : d * ROAD_SALVAGE;
+      edges.push(e);
     }
-    return out;
+    cost = Math.round(cost);
+    if (!edges.length) return { ok: false, reason: 'Already that road', cost: 0, edges };
+    if (cost > 0 && this.money < cost) return { ok: false, reason: 'Not enough money', cost, edges };
+    return { ok: true, cost, edges };
   }
-
-  // Why a diagonal can't run from tile a to tile b (across their shared
-  // corner), or null.
-  _diagBlock(ax, az, bx, bz) {
-    const t = this.terrain;
-    if (!this.inBounds(ax, az) || !this.inBounds(bx, bz)) return 'Out of bounds';
-    if (t.isWater(ax, az) || t.isWater(bx, bz)) return 'Bridges run along the grid, not diagonally';
-    for (const [x, z] of [[bx, az], [ax, bz]]) {
-      const o = this.buildingOn(x, z);
-      if (o && !diagCapable(o)) return `The ${BUILDINGS[o.type].levels[o.level].name.toLowerCase()} on the corner is in the way`;
-      if (this.fields[this.idx(x, z)] >= 0) return 'Farm fields are in the way: take them out of the farm first';
-    }
-    return null;
-  }
-
-  // Lay road on these tiles at this level (a lesser road is upgraded). With
-  // opts.stroke the tiles are a drag, in order, and are linked as it runs:
-  // diagonally where it steps across a corner (see diagonal.js).
-  placeRoads(tiles, level, opts = {}) {
-    const stroke = !!opts.stroke && isStroke(tiles);
-    const plan = stroke ? this.checkStroke(tiles, level) : null;
-    let placed = 0, spent = 0, failed = null;
-    const fresh = new Set();
-    for (let n = 0; n < tiles.length; n++) {
-      const [x, z] = tiles[n];
-      const c = plan ? plan[n] : this.checkRoad(x, z, level);
-      if (!c.ok) { failed ||= c.reason; continue; }
-      if (c.noop) continue;
-      if (this.money < c.cost) { failed = 'Not enough money'; break; }
-      this.money -= c.cost; spent += c.cost; placed++;
-      if (!this.roads[this.idx(x, z)]) fresh.add(this.idx(x, z));
-      this.roads[this.idx(x, z)] = level;
-      this._clearTrees(x, z);
-    }
-    let linked = 0;
-    if (stroke) {
-      const before = this.diag.slice();
-      // link each run of steps that weren't refused
-      let from = 0;
-      for (let n = 1; n <= tiles.length; n++) {
-        if (n < tiles.length && plan[n].step) continue;
-        if (n - from > 1) linkStroke(this, tiles.slice(from, n), fresh);
-        from = n;
-      }
-      tidyDiag(this);
-      for (let i = 0; i < before.length; i++) if (before[i] !== this.diag[i]) linked++;
-      // trees in the way where a diagonal passes the corners beside it
-      for (let n = 1; n < tiles.length; n++) {
-        const [ax, az] = tiles[n - 1], [bx, bz] = tiles[n], k = cornerTo(ax, az, bx, bz);
-        if (k < 0 || !diagLinked(this, ax, az, k)) continue;
-        this._clearTreesNear(Math.max(ax, bx) - 0.4, Math.max(az, bz) - 0.4, 0.8, 0.8, 0);
+  setLevel(ids, level) {
+    const c = this.levelCheck(ids, level);
+    if (!c.ok) return c;
+    this.money -= c.cost;
+    for (const e of c.edges) {
+      e.level = level;
+      // (a dressing the new road can't have goes, a quarter back)
+      for (const part of [streetPart(e.dress), lookPart(e.dress)]) {
+        const D = DRESSINGS[part];
+        if (D && D.minLevel && level < D.minLevel) { this.money += dressRefund(part); e.dress = part === streetPart(e.dress) ? e.dress & ~15 : e.dress & 15; }
       }
     }
-    if (placed || linked) { this._boulevards(true); this.updateRoadNetwork(); this.emit('trees'); }
-    return { placed, spent, failed, linked };
+    this.roads.version++;
+    this.updateRoadNetwork();
+    return { ok: true, cost: c.cost, n: c.edges.length };
   }
 
-  removeRoad(x, z) {
-    const L = this.roadAt(x, z);
-    if (!L) return false;
-    if (x === this.entry.x && z === this.entry.z) return 'The road to the outside world must stay';
-    this.roads[this.idx(x, z)] = 0;
-    this.diag[this.idx(x, z)] = 0;
-    this.money += roadRefund(L, 0, this.terrain.isWater(x, z)) + dressRefundAll(this.dress[this.idx(x, z)]);
-    this.buried[this.idx(x, z)] = 0;
-    this.dress[this.idx(x, z)] = 0;
-    this._boulevards(true);
+  // What taking up this road edge pays back: a quarter of what it cost, and
+  // of its dressings. The road out of the valley stays.
+  removeCheck(id) {
+    const e = this.roads.edges.get(id);
+    if (!e) return { ok: false, reason: 'That road is gone' };
+    if (e.a === this.entry.node || e.b === this.entry.node) return { ok: false, reason: 'The road to the outside world must stay' };
+    const hy = this._heights(e), wet = hy.wet.reduce((s, v) => s + v, 0) * hy.step;
+    const refund = Math.round(ROAD_LEVELS[e.level].cost * ((e.len - wet) + wet * BRIDGE_MULT) * ROAD_SALVAGE + (dressRefund(streetPart(e.dress)) + dressRefund(lookPart(e.dress))) * Math.max(1, Math.round(e.len)));
+    return { ok: true, refund, e };
+  }
+  removeRoadEdge(id) {
+    const c = this.removeCheck(id);
+    if (!c.ok) return c.reason;
+    this.roads.removeEdge(id);
+    this.roads.tidy([c.e.a, c.e.b], new Set([this.entry.node]));
+    this.money += c.refund;
     this.updateRoadNetwork();
     return true;
   }
 
-  // Boulevards come from the road layout (see boulevard.js): worked out
-  // again whenever the roads or the track change, and never saved or sent.
-  // A look that no longer suits its tile goes: a boulevard's where its
-  // second road was taken up or a street now crosses, a planted median
-  // where a second road was laid alongside. pay: a quarter of its price
-  // back (when the player changed the roads; loads and guests just tidy up).
-  _boulevards(pay = false) {
-    tidyDiag(this);   // (the roads have changed: the diagonals first)
-    this.blvd = findBoulevards(this, this.roads, this.blvd);
-    let back = 0, gone = false;
-    for (let i = 0; i < this.dress.length; i++) {
-      const v = this.dress[i];
-      if (!v) continue;
-      let s = streetPart(v), l = lookPart(v);
-      if (s && !dressFits(this, i, s)) { back += dressRefund(s); s = 0; }
-      if (l && !dressFits(this, i, l)) { back += dressRefund(l); l = 0; }
-      if (packDress(s, l) === v) continue;
-      this.dress[i] = packDress(s, l);
-      gone = true;
-    }
-    if (pay) this.money += back;
-    if (gone) this.emit('dress');
-    return back;
-  }
-
   // ---------------------------------------------------- buried power lines
-  // The street through (x, z): the straight runs of road along it, both
-  // ways at a crossing.
-  streetTiles(x, z) {
-    if (!this.roadAt(x, z)) return [];
-    const out = [[x, z]];
-    for (const [dx, dz] of DIRS) for (let k = 1; this.roadAt(x + dx * k, z + dz * k); k++) out.push([x + dx * k, z + dz * k]);
-    return out;
-  }
-
-  // Lay the power lines under the given road tiles (Underground Cables):
+  // Lay the power lines under the given road edges (Underground Cables):
   // their poles and wires come down, and the street looks the better for it.
-  buryCost(tiles) {
-    return tiles.filter(([x, z]) => this.roadAt(x, z) && !this.buried[this.idx(x, z)]).length * BURY_COST;
+  buryCost(ids) {
+    let n = 0;
+    for (const id of ids) { const e = this.roads.edges.get(id); if (e && !e.buried) n += Math.max(1, Math.round(e.len)); }
+    return n * BURY_COST;
   }
-
-  buryLines(tiles) {
+  buryLines(ids) {
     if (!this.hasTech('cables')) return { ok: false, reason: `Research ${this.techName('cables')} first` };
-    const todo = tiles.filter(([x, z]) => this.roadAt(x, z) && !this.buried[this.idx(x, z)]);
+    const todo = ids.map(id => this.roads.edges.get(id)).filter(e => e && !e.buried);
     if (!todo.length) return { ok: false, reason: 'Those lines are already underground' };
-    const cost = todo.length * BURY_COST;
+    const cost = this.buryCost(todo.map(e => e.id));
     if (this.money < cost) return { ok: false, reason: 'Not enough money' };
     this.money -= cost;
-    for (const [x, z] of todo) this.buried[this.idx(x, z)] = 1;
+    for (const e of todo) e.buried = 1;
+    this.roads.version++;
     this.emit('lines');
     return { ok: true, n: todo.length, cost };
   }
 
+  // Which roads reach the way out of the valley, and every building's way
+  // to the street (a building keeps the road it had, if it still reaches it).
   updateRoadNetwork() {
-    const N = this.N;
-    this._boulevards();
-    this.connected.fill(0);
-    const q = [];
-    const e = this.idx(this.entry.x, this.entry.z);
-    if (this.roads[e]) { this.connected[e] = 1; q.push(e); }
-    const D = this.diag;
-    while (q.length) {
-      const i = q.pop();
-      const x = i % N, z = (i / N) | 0;
-      for (let k = 0; k < 4; k++) {
-        const nx = x + SIDES[k][0], nz = z + SIDES[k][1];
-        if (!this.inBounds(nx, nz)) continue;
-        const ni = nz * N + nx;
-        // (not where a diagonal passes by, cut off from it)
-        if (this.roads[ni] && !this.connected[ni] && !(D[i] & (CUT << k)) && !(D[ni] & (CUT << ((k + 2) & 3)))) { this.connected[ni] = 1; q.push(ni); }
-      }
-      if (D[i] & 15) for (let k = 0; k < 4; k++) {
-        if (!(D[i] & (1 << k))) continue;
-        const nx = x + CORNERS[k][0], nz = z + CORNERS[k][1];
-        if (!this.inBounds(nx, nz)) continue;
-        const ni = nz * N + nx;
-        if (this.roads[ni] && !this.connected[ni] && (D[ni] & (1 << ((k + 2) & 3)))) { this.connected[ni] = 1; q.push(ni); }
-      }
-    }
+    this.connected = this.roads.reach(this.entry.node);
     for (const b of this.buildings.values()) {
-      let acc = this.findAccess(b.x, b.z, fw(b), fd(b));
-      // facing a diagonal: one of the two road tiles it links
-      const dq = this._diagOf(b);
-      if (dq >= 0) { const pair = this._diagPair(b, dq); acc = acc.filter(a => pair.some(([x, z]) => x === a.x && z === a.z)); }
-      const keep = b.access && acc.find(a => a.x === b.access.x && a.z === b.access.z && (a.conn || !acc[0].conn));
-      const pick = keep || acc[0] || null;
-      b.access = pick ? { x: pick.x, z: pick.z } : null;
-      b.connected = !!(pick && pick.conn);
+      const acc = this.accessFor(ownPlot(b)) || (b.ext ? this.accessFor(plotOf(b)) : null);
+      b.access = acc ? { e: acc.e, s: acc.s, x: acc.x, z: acc.z } : null;
+      b.connected = !!(acc && acc.conn);
     }
+    for (const e of this.roads.edges.values()) e.hy = null;
     this.emit('roads');
     this._updateFronts();
   }
+  // Whether a road edge reaches the way out of the valley.
+  edgeConnected(id) { const e = this.roads.edges.get(id); return !!e && this.connected.has(e.a); }
 
   // -------------------------------------------------------------- terrain
+  // Raising, lowering or flattening the ground: the four points of the
+  // terrain's mesh round (x, z). Not right by a building.
   checkTerraform(x, z) {
     if (!this.inBounds(x, z)) return { ok: false, reason: 'Out of bounds' };
-    for (let tz = z - 1; tz <= z + 1; tz++) for (let tx = x - 1; tx <= x + 1; tx++) {
-      if (this.inBounds(tx, tz) && this.buildingAt[this.idx(tx, tz)] >= 0) return { ok: false, reason: 'Too close to a building' };
-    }
+    for (const b of this.plots.near(x, z, 1.6)) if (segRectDist(plotOf(b), x, z, x, z) < 1.1) return { ok: false, reason: 'Too close to a building' };
     if (this.money < TERRAFORM_COST) return { ok: false, reason: 'Not enough money' };
     return { ok: true, cost: TERRAFORM_COST };
   }
@@ -1629,8 +1660,8 @@ export class World {
   terraform(x, z, mode) {
     const c = this.checkTerraform(x, z);
     if (!c.ok) return c;
-    const t = this.terrain;
-    const corners = [[x, z], [x + 1, z], [x, z + 1], [x + 1, z + 1]];
+    const t = this.terrain, tx = Math.min(this.N - 1, Math.max(0, Math.floor(x))), tz = Math.min(this.N - 1, Math.max(0, Math.floor(z)));
+    const corners = [[tx, tz], [tx + 1, tz], [tx, tz + 1], [tx + 1, tz + 1]];
     if (mode === 'flatten') {
       const avg = corners.reduce((s, [cx, cz]) => s + t.ch(cx, cz), 0) / 4;
       for (const [cx, cz] of corners) t.setCh(cx, cz, avg);
@@ -1640,47 +1671,49 @@ export class World {
     }
     this.money -= c.cost;
     this.updateRoadNetwork();
-    this.emit('terrain', { x0: x - 1, z0: z - 1, x1: x + 1, z1: z + 1 });
+    this.emit('terrain', { x0: tx - 1, z0: tz - 1, x1: tx + 1, z1: tz + 1 });
     return { ok: true, cost: c.cost };
   }
 
   // ---------------------------------------------------------------- trees
-  _clearTrees(x, z) {
-    const i = this.idx(x, z);
-    if (!this.treeCount[i]) return 0;
-    const n = this.treeCount[i];
-    this.trees = this.trees.filter(tr => tr.t !== i);
-    this.treeCount[i] = 0;
-    return n;
+  _treesIn(R) { return this.treeIx.query(aabbOf(R)).filter(tr => inRect(R, tr.x, tr.z)); }
+  _treesAlong(pts, r) {
+    const out = new Set();
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const [ax, az] = pts[i], [bx, bz] = pts[i + 1];
+      for (const tr of this.treeIx.query([Math.min(ax, bx) - r, Math.min(az, bz) - r, Math.max(ax, bx) + r, Math.max(az, bz) + r])) {
+        if (segDist(tr.x, tr.z, ax, az, bx, bz) < r) out.add(tr);
+      }
+    }
+    return [...out];
   }
-
-  // Trees growing right up against a new wall or track would poke through it.
-  _clearTreesNear(x, z, w, d, margin) {
-    const x0 = x - margin, x1 = x + w + margin, z0 = z - margin, z1 = z + d + margin;
-    const before = this.trees.length;
-    this.trees = this.trees.filter((tr) => {
-      if (tr.x < x0 || tr.x > x1 || tr.z < z0 || tr.z > z1) return true;
-      this.treeCount[tr.t] = Math.max(0, this.treeCount[tr.t] - 1);
-      return false;
-    });
-    return before - this.trees.length;
+  _dropTrees(list) {
+    if (!list.length) return 0;
+    const gone = new Set(list);
+    for (const tr of list) this.treeIx.remove(tr);
+    this.trees = this.trees.filter(tr => !gone.has(tr));
+    return list.length;
   }
+  // Trees growing right up against a new wall, road or track would poke through it.
+  _clearTreesIn(R) { return this._dropTrees(this._treesIn(R)); }
+  _clearTreesAlong(pts, r) { return this._dropTrees(this._treesAlong(pts, r)); }
+  _clearTreesNear(x, z, r) { return this._dropTrees(this.treeIx.near(x, z, r).filter(tr => Math.hypot(tr.x - x, tr.z - z) < r)); }
+  treesNear(x, z, r) { return this.treeIx.near(x, z, r).filter(tr => Math.hypot(tr.x - x, tr.z - z) < r); }
 
   addTree(x, z, k, s, r) {
-    const tx = Math.floor(x), tz = Math.floor(z);
-    if (!this.inBounds(tx, tz)) return;
-    const i = this.idx(tx, tz);
-    if (this.treeCount[i] >= 250) return;
-    this.trees.push({ x, z, k, s, r, t: i });
-    this.treeCount[i]++;
+    if (!this.inBounds(x, z)) return;
+    const tr = { x, z, k, s, r };
+    this.trees.push(tr);
+    this.treeIx.add(tr, [x, z, x, z]);
   }
 
+  // A tree right where the player points: on open ground (not water, a
+  // plot, a road, track or a field), and not in the middle of a thicket.
   checkPlant(x, z) {
     if (!this.inBounds(x, z)) return { ok: false, reason: 'Out of bounds' };
-    const i = this.idx(x, z);
-    if (this.terrain.isWater(x, z)) return { ok: false, reason: "Trees don't grow in water" };
-    if (this.roads[i] || this.buildingAt[i] >= 0) return { ok: false, reason: 'Occupied' };
-    if (this.treeCount[i] >= 4) return { ok: false, reason: 'No room for more trees' };
+    if (this.waterAt(x, z)) return { ok: false, reason: "Trees don't grow in water" };
+    if (this.buildingAt(x, z) || this.roadAt(x, z, 0.08) || this.railAt(x, z, 0.08) || this.fieldAt(x, z)) return { ok: false, reason: 'Occupied' };
+    if (this.treesNear(x, z, 0.5).length >= 4) return { ok: false, reason: 'No room for more trees' };
     if (this.money < TREE_COST) return { ok: false, reason: 'Not enough money' };
     return { ok: true, cost: TREE_COST };
   }
@@ -1689,32 +1722,37 @@ export class World {
     const c = this.checkPlant(x, z);
     if (!c.ok) return c;
     const r = Math.random;
-    const h = this.terrain.tileAvg(x, z);
+    const h = this.terrain.heightAt(x, z);
     const k = h > 1.6 ? (r() < 0.7 ? TREE.PINE : TREE.ROUND) : [TREE.ROUND, TREE.ROUND, TREE.BIRCH, TREE.PINE][(r() * 4) | 0];
-    this.addTree(x + 0.2 + r() * 0.6, z + 0.2 + r() * 0.6, k, 0.75 + r() * 0.5, r() * Math.PI * 2);
+    this.addTree(x, z, k, 0.75 + r() * 0.5, r() * Math.PI * 2);
     this.money -= c.cost;
     this.emit('trees');
     return { ok: true, cost: c.cost };
   }
 
   // ---------------------------------------------------------- bulldozing
+  // Whatever is at (x, z): a building (a crew pulls it down), road or track
+  // (that stretch, junction to junction, is taken up), a field, or trees.
   bulldoze(x, z) {
     if (!this.inBounds(x, z)) return { ok: false };
-    const b = this.buildingOn(x, z);
+    const b = this.buildingAt(x, z);
     if (b) { const r = this.demolishBuilding(b.id); return { ok: r.ok, what: 'building', building: b, reason: r.reason }; }
-    if (this.railAt(x, z)) { this.removeRail(x, z); return { ok: true, what: 'rail' }; }
-    if (this.roadAt(x, z)) {
-      const r = this.removeRoad(x, z);
+    const rl = this.railAt(x, z, 0.06);
+    const rd = this.roadAt(x, z, 0.06);
+    if (rl && (!rd || rl.d < rd.d)) { this.removeRailEdge(rl.e.id); return { ok: true, what: 'rail' }; }
+    if (rd) {
+      const r = this.removeRoadEdge(rd.e.id);
       if (r !== true) return { ok: false, reason: r };
       return { ok: true, what: 'road' };
     }
-    const i = this.idx(x, z);
-    if (this.fields[i] >= 0) { const r = this.setFields(this.fields[i], [[x, z]], false); return { ok: r.ok, what: 'fields', reason: r.reason }; }
-    if (this.treeCount[i]) {
-      const cost = this.treeCount[i] * CLEAR_COST;
+    const f = this.fieldAt(x, z);
+    if (f) { const r = this.setFields(f.farm, [[f.x, f.z, f.a]], false); return { ok: r.ok, what: 'fields', reason: r.reason }; }
+    const trees = this.treesNear(x, z, 0.4);
+    if (trees.length) {
+      const cost = trees.length * CLEAR_COST;
       if (this.money < cost) return { ok: false, reason: 'Not enough money' };
       this.money -= cost;
-      this._clearTrees(x, z);
+      this._dropTrees(trees);
       this.emit('trees');
       return { ok: true, what: 'trees', cost };
     }
@@ -1722,72 +1760,73 @@ export class World {
   }
 
   // ------------------------------------------------------------ farmland
-  // A farm works fields beyond its own plot: tiles of farmland touching the
-  // plot or its other fields, as many as its level allows (FIELD_MAX). Each
-  // is ploughed and fenced for FIELD_COST (and any trees cleared), adds
-  // FIELD_JOBS jobs (capOf), and gives a quarter back when taken out.
+  // A farm works fields beyond its own plot: plots of farmland (a unit
+  // square each, at any angle) touching the plot or its other fields, as
+  // many as its level allows (FIELD_MAX). Each is ploughed and fenced for
+  // FIELD_COST (and any trees cleared), adds FIELD_JOBS jobs (capOf), and
+  // gives a quarter back when taken out.
   fieldMax(b) { return b && hasFields(b.type) ? CONFIG.FIELD_MAX[Math.min(b.level + (BUILDINGS[b.type].fieldsFrom || 0), CONFIG.FIELD_MAX.length - 1)] : 0; }
+  fieldsOf(id) { return [...this.parcels.values()].filter(f => f.farm === id); }
+  fieldAt(x, z) { for (const f of this.fieldIx.near(x, z, 0)) if (inRect(f.rect, x, z)) return f; return null; }
 
-  // Why tile (x, z) can't become a field of farm b, or null.
-  _fieldBlock(b, x, z) {
-    if (!this.inBounds(x, z)) return 'Out of bounds';
-    const i = this.idx(x, z), f = this.fields[i];
-    if (f === b.id) return 'Already one of its fields';
-    if (f >= 0) return "Another farm's field";
-    if (this.terrain.isWater(x, z)) return 'Water';
-    if (this.roads[i]) return 'A road';
-    if (this.rails[i]) return 'Railway track';
-    if (this.buildingAt[i] >= 0) return 'A building';
-    if (this.terrain.slope(x, z) > 0.6) return 'Too steep to plough';
-    if (aheadOf(b, x, z) > 0) return 'Fields go behind and beside it, not between it and the road';
+  // Why a field at (x, z) facing a can't be one of farm b's, or null.
+  _fieldBlock(b, R) {
+    for (const [x, z] of R.pts) if (!this.inBounds(x, z)) return 'Out of bounds';
+    for (const f of this.fieldIx.query(aabbOf(R))) if (rectsOverlap(R, f.rect, 0.01)) return f.farm === b.id ? 'Already one of its fields' : "Another farm's field";
+    const why = this._plotBlock(R, { fields: true });
+    if (why) return /road/i.test(why) ? 'A road' : /track/i.test(why) ? 'Railway track' : /bounds/i.test(why) ? 'Out of bounds' : 'A building';
+    const g = groundUnder(this.terrain, R);
+    if (g.water) return 'Water';
+    if (g.maxH - g.minH > 0.6) return 'Too steep to plough';
+    if (aheadOf(b, R.cx, R.cz) > 0) return 'Fields go behind and beside it, not between it and the road';
     return null;
   }
 
-  // What adding (add) or taking out these tiles would do for farm id:
-  // { tiles: [{ x, z, i, reason }], n (tiles that change), cost, refund,
-  // max, have, short }. New fields must touch the farm or its fields, or
-  // other new fields that do, nearest first, up to its limit.
+  // What adding (add) or taking out these fields would do for farm id
+  // (list: [x, z, a] for each, its middle and the way it lies): { tiles:
+  // [{ x, z, a, rect, reason }], n (fields that change), cost, refund, max,
+  // have, short }. New fields must touch the farm or its fields, or other
+  // new fields that do, nearest first, up to its limit.
   planFields(id, list, add = true) {
     const b = this.buildings.get(id);
     const plan = { tiles: [], n: 0, cost: 0, refund: 0, max: this.fieldMax(b), have: b ? b.fields || 0 : 0, short: null };
     if (!b || !hasFields(b.type)) { plan.short = 'Only a farm has fields'; return plan; }
     if (b.con && b.con.kind !== 'upgrade') { plan.short = 'Not until the farm is built'; return plan; }
-    const seen = new Set();
-    for (const [x, z] of list) {
-      if (!this.inBounds(x, z)) continue;
-      const i = this.idx(x, z);
-      if (seen.has(i)) continue;
-      seen.add(i);
-      plan.tiles.push({ x, z, i, reason: null });
+    for (const p of list) {
+      if (!Array.isArray(p) || ![p[0], p[1]].every(Number.isFinite)) continue;
+      const [x, z] = p, a = Number.isFinite(p[2]) ? p[2] : b.a;
+      plan.tiles.push({ x, z, a, rect: rect(x, z, a, 0.5, 0.5), reason: null, i: plan.tiles.length });
     }
     if (!add) {
       for (const t of plan.tiles) {
-        if (this.fields[t.i] !== id) { t.reason = 'Not one of its fields'; continue; }
+        const f = this.fieldAt(t.x, t.z);
+        if (!f || f.farm !== id) { t.reason = 'Not one of its fields'; continue; }
+        t.field = f;
         plan.n++; plan.refund += Math.round(CONFIG.FIELD_COST * 0.25);
       }
       return plan;
     }
-    for (const t of plan.tiles) t.reason = this._fieldBlock(b, t.x, t.z);
-    const open = new Map(plan.tiles.filter(t => !t.reason).map(t => [t.i, t]));
-    const near = (x, z, test) => [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dz]) => this.inBounds(x + dx, z + dz) && test(this.idx(x + dx, z + dz)));
-    const queue = [...open.values()].filter(t => near(t.x, t.z, j => this.buildingAt[j] === id || this.fields[j] === id)).sort((p, q) => aheadOf(b, p.x, p.z) - aheadOf(b, q.x, q.z));
-    const reached = new Set(queue.map(t => t.i)), take = [];
+    for (const t of plan.tiles) t.reason = this._fieldBlock(b, t.rect);
+    // (new fields mustn't overlap each other either)
+    const open = plan.tiles.filter(t => !t.reason);
+    for (let i = 0; i < open.length; i++) for (let j = 0; j < i; j++) if (!open[j].reason && rectsOverlap(open[i].rect, open[j].rect, 0.01)) { open[i].reason = 'Overlaps another new field'; break; }
+    const free = open.filter(t => !t.reason);
+    const own = [plotOf(b), ...this.fieldsOf(id).map(f => f.rect)];
+    const touches = (R, list) => list.some(Q => rectsOverlap(grow(R, 0.05), Q, 0.004));
+    const queue = free.filter(t => touches(t.rect, own)).sort((p, q) => aheadOf(b, p.x, p.z) - aheadOf(b, q.x, q.z));
+    const reached = new Set(queue), take = [];
     const room = Math.max(0, plan.max - plan.have);
     while (queue.length && take.length < room) {
       const t = queue.shift();
       take.push(t);
-      for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-        if (!this.inBounds(t.x + dx, t.z + dz)) continue;
-        const j = this.idx(t.x + dx, t.z + dz);
-        if (open.has(j) && !reached.has(j)) { reached.add(j); queue.push(open.get(j)); }
-      }
+      for (const u of free) if (!reached.has(u) && touches(u.rect, [t.rect])) { reached.add(u); queue.push(u); }
     }
-    const taken = new Set(take.map(t => t.i));
+    const taken = new Set(take);
     for (const t of plan.tiles) {
-      if (t.reason || taken.has(t.i)) continue;
-      t.reason = reached.has(t.i) || room === 0 ? `It can work ${plan.max} fields at most` : 'Must touch the farm or its fields';
+      if (t.reason || taken.has(t)) continue;
+      t.reason = reached.has(t) || room === 0 ? `It can work ${plan.max} fields at most` : 'Must touch the farm or its fields';
     }
-    for (const t of take) { plan.n++; plan.cost += CONFIG.FIELD_COST + this.treeCount[t.i] * CLEAR_COST; }
+    for (const t of take) { plan.n++; plan.cost += CONFIG.FIELD_COST + this._treesIn(t.rect).length * CLEAR_COST; }
     if (plan.n && plan.cost > this.money) plan.short = 'Not enough money';
     return plan;
   }
@@ -1798,17 +1837,26 @@ export class World {
     if (!plan.n) return { ok: false, reason: (plan.tiles.find(t => t.reason) || {}).reason || 'No fields there' };
     for (const t of plan.tiles) {
       if (t.reason) continue;
-      if (add) { this.fields[t.i] = id; this._clearTrees(t.x, t.z); } else this.fields[t.i] = -1;
+      if (add) this._addField(id, t.x, t.z, t.a);
+      else if (t.field) this._removeField(t.field);
     }
+    if (add) for (const t of plan.tiles) if (!t.reason) this._clearTreesIn(t.rect);
     this.money += plan.refund - plan.cost;
     this._countFields();
     if (add) this.emit('trees');
     this.emit('fields');
     return { ok: true, n: plan.n, cost: plan.cost, refund: plan.refund, skipped: plan.tiles.length - plan.n };
   }
+  _addField(farm, x, z, a, id = null) {
+    const r = (v) => Math.round(v * 1000) / 1000;
+    const f = { id: id ?? this.newId(), farm, x: r(x), z: r(z), a: r(wrapAngle(a)) };
+    f.rect = rect(f.x, f.z, f.a, 0.5, 0.5);
+    this.parcels.set(f.id, f);
+    this.fieldIx.add(f, aabbOf(f.rect));
+    return f;
+  }
+  _removeField(f) { this.parcels.delete(f.id); this.fieldIx.remove(f); }
 
-  // What a farm grows or raises (PRODUCE; kept in b.flavor). It changes the
-  // look of its plot and fields, the hands it takes and what each earns.
   setProduce(id, key) {
     const b = this.buildings.get(id);
     if (!b || !hasFields(b.type)) return { ok: false, reason: 'Only a farm grows crops or keeps livestock' };
@@ -1822,62 +1870,51 @@ export class World {
     return { ok: true, produce: key };
   }
 
-  // Each farm's fields (b.fields, fieldTiles) from the grid; fields of a
-  // building that is no farm are dropped.
+  // Each farm's count of fields (b.fields); fields of a building that is no
+  // farm are dropped.
   _countFields() {
-    this.fieldTiles = new Map();
     for (const b of this.buildings.values()) if (hasFields(b.type)) b.fields = 0;
-    for (let i = 0; i < this.fields.length; i++) {
-      const f = this.fields[i];
-      if (f < 0) continue;
-      const b = this.buildings.get(f);
-      if (!b || !hasFields(b.type)) { this.fields[i] = -1; continue; }
+    for (const f of [...this.parcels.values()]) {
+      const b = this.buildings.get(f.farm);
+      if (!b || !hasFields(b.type)) { this._removeField(f); continue; }
       b.fields++;
-      if (!this.fieldTiles.has(f)) this.fieldTiles.set(f, []);
-      this.fieldTiles.get(f).push(i);
     }
   }
 
   // A farm's fields must reach its plot (through its other fields), up to
   // its limit, nearest first; any others go (after a town merge, say).
   _pruneFields() {
-    const keep = new Uint8Array(this.fields.length);
+    const keep = new Set();
     for (const b of this.buildings.values()) {
       if (!hasFields(b.type)) continue;
-      const max = this.fieldMax(b), q = [];
-      for (let dz = 0; dz < fd(b); dz++) for (let dx = 0; dx < fw(b); dx++) q.push([b.x + dx, b.z + dz]);
-      let n = 0;
-      for (let k = 0; k < q.length && n < max; k++) {
-        const [x, z] = q[k];
-        for (const [ox, oz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-          const nx = x + ox, nz = z + oz;
-          if (!this.inBounds(nx, nz)) continue;
-          const j = this.idx(nx, nz);
-          if (this.fields[j] !== b.id || keep[j] || n >= max) continue;
-          keep[j] = 1; n++; q.push([nx, nz]);
+      const max = this.fieldMax(b), mine = this.fieldsOf(b.id);
+      const reached = [plotOf(b)];
+      let grew = true;
+      while (grew && keep.size < Infinity) {
+        grew = false;
+        for (const f of mine) {
+          if (keep.has(f) || mine.filter(x => keep.has(x)).length >= max) continue;
+          if (reached.some(Q => rectsOverlap(grow(f.rect, 0.05), Q, 0.004))) { keep.add(f); reached.push(f.rect); grew = true; }
         }
       }
     }
-    for (let i = 0; i < this.fields.length; i++) if (this.fields[i] >= 0 && !keep[i]) this.fields[i] = -1;
+    for (const f of [...this.parcels.values()]) if (!keep.has(f)) this._removeField(f);
     this._countFields();
   }
 
   // A plot laid over farm fields takes them out of their farms.
-  _unfield(tiles) {
-    let any = false;
-    for (const [x, z] of tiles) {
-      const i = this.idx(x, z);
-      if (this.fields[i] >= 0) { this.fields[i] = -1; any = true; }
-    }
-    if (!any) return;
+  _unfield(R) {
+    const gone = this.fieldIx.query(aabbOf(R)).filter(f => rectsOverlap(R, f.rect, 0.004));
+    if (!gone.length) return;
+    for (const f of gone) this._removeField(f);
     this._countFields();
     this.emit('fields');
   }
 
   _dropFields(b) {
-    let any = false;
-    for (let i = 0; i < this.fields.length; i++) if (this.fields[i] === b.id) { this.fields[i] = -1; any = true; }
-    if (!any) return;
+    const mine = this.fieldsOf(b.id);
+    if (!mine.length) return;
+    for (const f of mine) this._removeField(f);
     this._countFields();
     b.fields = 0;
     this.emit('fields');
@@ -1890,54 +1927,61 @@ export class World {
     w.townName = name || 'Kinstead';
     w.townId = newTownId();
     if (sandbox) w.setSandbox(sandbox);
-    for (const [x, z] of entryPath) w.roads[w.idx(x, z)] = 1;
-    const last = entryPath[entryPath.length - 1];
-    w.entry = { x: last[0], z: last[1] };
-    w._layFoundingStreets(start, entryPath);
+    w._layEntry(entryPath);
+    w._layFoundingStreets(start);
     w.updateRoadNetwork();
     w.generateNature(start);
-    w._placeFoundingBuildings(start, entryPath);
+    w._placeFoundingBuildings(start);
     w.updateRoadNetwork();
     return w;
   }
 
-  _layFoundingStreets(start, path) {
-    const t = this.terrain;
-    const first = path[1] || [start.x + 1, start.z];
-    const dir = [Math.sign(first[0] - start.x), Math.sign(first[1] - start.z)];
-    const perp = [dir[1], dir[0]];
-    const extend = (d, len) => {
-      for (let k = 1; k <= len; k++) {
-        const x = start.x + d[0] * k, z = start.z + d[1] * k;
-        if (!this.inBounds(x, z) || t.isWater(x, z) || t.slope(x, z) > 0.6) break;
-        this.roads[this.idx(x, z)] = 1;
+  // The road out of the valley: from the edge of the map to where the town
+  // begins, along the way the land allows (the terrain's path, smoothed
+  // into a winding lane). Its end at the map's edge is the way out.
+  _layEntry(path) {
+    const N = this.N, P = path.map(([x, z]) => [x + 0.5, z + 0.5]).reverse();
+    // (out to the very edge of the map)
+    const [ex, ez] = P[0], d = [ex - 0.5 < 1 ? -1 : ex > N - 1.5 ? 1 : 0, ez - 0.5 < 1 ? -1 : ez > N - 1.5 ? 1 : 0];
+    P.unshift([d[0] < 0 ? 0 : d[0] > 0 ? N : ex, d[1] < 0 ? 0 : d[1] > 0 ? N : ez]);
+    let pts = simplify(P, 0.6);
+    pts = pts.length > 2 ? spline(pts, 0.1, 0.002) : pts;
+    const a = this.roads.addNode(pts[0][0], pts[0][1]), b = this.roads.addNode(pts[pts.length - 1][0], pts[pts.length - 1][1]);
+    this.roads.addEdge(a.id, b.id, pts, { level: 1 });
+    this.entry = { node: a.id, x: a.x, z: a.z };
+    this._founding = { at: b, path: pts };
+  }
+
+  // The first streets: across the road in at the town's start, and on from it.
+  _layFoundingStreets(start) {
+    const f = this._founding, n = f.at, P = f.path;
+    const [px, pz] = P[Math.max(0, P.length - 6)], dl = Math.hypot(n.x - px, n.z - pz) || 1;
+    const dir = [(n.x - px) / dl, (n.z - pz) / dl], perp = [-dir[1], dir[0]];
+    const lay = (d, len) => {
+      // as far as the ground allows, a unit at a time
+      let k = len;
+      while (k >= 1) {
+        const c = this.roads.plan([[n.x, n.z], [n.x + d[0] * k, n.z + d[1] * k]]);
+        const end = [n.x + d[0] * k, n.z + d[1] * k];
+        const steep = resample([[n.x, n.z], end], 0.5).some(([x, z], i, a) => i && (this.waterAt(x, z) || Math.abs(this.terrain.heightAt(x, z) - this.terrain.heightAt(a[i - 1][0], a[i - 1][1])) > 0.3));
+        if (!c.reason && !steep && end[0] > 0.5 && end[1] > 0.5 && end[0] < this.N - 0.5 && end[1] < this.N - 0.5) { this.roads.lay(c, { level: 1 }); return; }
+        k--;
       }
     };
-    extend(perp, 4);
-    extend([-perp[0], -perp[1]], 4);
-    extend([-dir[0], -dir[1]], 3);
+    lay(perp, 4.5);
+    lay([-perp[0], -perp[1]], 4.5);
+    lay(dir, 3.5);
+    void start;
   }
 
   _placeFoundingBuildings(start) {
-    const spots = [];
-    for (let z = start.z - 7; z <= start.z + 7; z++) for (let x = start.x - 7; x <= start.x + 7; x++) {
-      if (this.inBounds(x, z)) spots.push([x, z, Math.hypot(x - start.x, z - start.z)]);
-    }
-    spots.sort((a, b) => a[2] - b[2]);
     const opts = { free: true, ignoreMoney: true, ignoreUnlock: true, instant: true };
-    const place = (type, extra = {}) => {
-      for (const [x, z] of spots) {
-        const r = this.placeBuilding(type, x, z, { ...opts, ...extra });
-        if (r.ok) return r.building;
-      }
-      return null;
-    };
-    place('townhall');
-    place('well');
-    place('builder');
-    place('house');
-    place('house');
-    place('market');
+    const near = { x: this._founding.at.x, z: this._founding.at.z };
+    for (const type of ['townhall', 'well', 'builder', 'house', 'house', 'market']) {
+      const spot = findPlot(this, type, near, { opts });
+      if (spot) this.placeBuilding(type, spot.x, spot.z, { ...opts, a: spot.a });
+    }
+    void start;
   }
 
   generateNature(start) {
@@ -1945,10 +1989,11 @@ export class World {
     const rng = new RNG(this.seed + 404);
     const nF = makeNoise2D(this.seed + 303);
     const nK = makeNoise2D(this.seed + 505);
+    const open = (x, z) => !this.roadAt(x, z, 0.15) && !this.buildingAt(x, z) && !this.waterAt(x, z);
+    const put = (x, z, k, s, r) => { if (open(x, z)) this.addTree(x, z, k, s, r); };
     for (let z = 0; z < N; z++) {
       for (let x = 0; x < N; x++) {
-        const i = this.idx(x, z);
-        if (this.roads[i] || this.buildingAt[i] >= 0 || t.isWater(x, z)) continue;
+        if (t.isWater(x, z)) continue;
         const h = t.tileAvg(x, z), slope = t.slope(x, z);
         const forest = fbm(nF, x * 0.085, z * 0.085, 3);
         const dStart = start ? Math.hypot(x - start.x, z - start.z) : 99;
@@ -1960,18 +2005,18 @@ export class World {
           for (let k = 0; k < count; k++) {
             const pinePref = h > 1.6 ? 0.8 : (nK(x * 0.1, z * 0.1) > 0.2 ? 0.6 : 0.15);
             const kind = rng.chance(pinePref) ? TREE.PINE : (rng.chance(0.2) ? TREE.BIRCH : TREE.ROUND);
-            this.addTree(x + rng.float(0.15, 0.85), z + rng.float(0.15, 0.85), kind, rng.float(0.7, 1.25), rng.float(0, 6.28));
+            put(x + rng.float(0.15, 0.85), z + rng.float(0.15, 0.85), kind, rng.float(0.7, 1.25), rng.float(0, 6.28));
           }
         } else if (!nearStart && h < 0.35 && rng.chance(0.18)) {
-          this.addTree(x + rng.float(0.2, 0.8), z + rng.float(0.2, 0.8), TREE.BUSH, rng.float(0.7, 1.2), rng.float(0, 6.28));
+          put(x + rng.float(0.2, 0.8), z + rng.float(0.2, 0.8), TREE.BUSH, rng.float(0.7, 1.2), rng.float(0, 6.28));
         }
         if ((slope > 0.45 || h > 2.2) && rng.chance(0.3)) {
-          this.addTree(x + rng.float(0.2, 0.8), z + rng.float(0.2, 0.8), TREE.ROCK, rng.float(0.6, 1.4), rng.float(0, 6.28));
+          put(x + rng.float(0.2, 0.8), z + rng.float(0.2, 0.8), TREE.ROCK, rng.float(0.6, 1.4), rng.float(0, 6.28));
         } else if (!nearStart && rng.chance(0.02)) {
-          this.addTree(x + rng.float(0.2, 0.8), z + rng.float(0.2, 0.8), rng.chance(0.5) ? TREE.ROCK : TREE.PEBBLE, rng.float(0.5, 1), rng.float(0, 6.28));
+          put(x + rng.float(0.2, 0.8), z + rng.float(0.2, 0.8), rng.chance(0.5) ? TREE.ROCK : TREE.PEBBLE, rng.float(0.5, 1), rng.float(0, 6.28));
         }
         if (!nearStart && rng.chance(0.05)) {
-          this.addTree(x + rng.float(0.2, 0.8), z + rng.float(0.2, 0.8), TREE.BUSH, rng.float(0.6, 1), rng.float(0, 6.28));
+          put(x + rng.float(0.2, 0.8), z + rng.float(0.2, 0.8), TREE.BUSH, rng.float(0.6, 1), rng.float(0, 6.28));
         }
       }
     }
@@ -1979,22 +2024,18 @@ export class World {
 }
 
 export function bridgeDeckY() { return CONFIG.WATER_LEVEL + 0.2; }
-// length of the approach ramp onto a bridge, in tiles
+// length of the approach ramp onto a bridge
 export const RAMP = 0.5;
 
-// Point on the shared edge between a building's footprint and its access road.
+// Point on the middle of a building's front, where it meets the verge.
 export function doorPoint(b) {
-  if (!b.access) return { x: b.x + fw(b) / 2, z: b.z + fd(b) / 2 };
-  // facing a diagonal: just short of the street, towards the corner it passes
-  if (b.diag) { const [cx, cz] = CORNERS[b.diag - 1]; return { x: b.x + 0.5 + cx * 0.26, z: b.z + 0.5 + cz * 0.26 }; }
-  const ax = b.access.x, az = b.access.z;
-  const cx = Math.min(Math.max(ax, b.x), b.x + fw(b) - 1);
-  const cz = Math.min(Math.max(az, b.z), b.z + fd(b) - 1);
-  return { x: (ax + cx) / 2 + 0.5, z: (az + cz) / 2 + 0.5 };
+  const R = plotOf(b);
+  const [x, z] = toWorld(R, 0, R.hd);
+  return { x, z };
 }
 
 export function buildingCenter(b) {
-  return { x: b.x + fw(b) / 2, z: b.z + fd(b) / 2 };
+  return { x: b.x, z: b.z };
 }
 
 // The seat of government (the town hall, or the Capitol or Parliament it
@@ -2020,4 +2061,41 @@ export function civicQuarter(w, seat = seatOf(w)) {
   out.kinds = [...new Set(out.members.map(m => m.b.type))];
   out.tax = out.kinds.length * CIVIC_QUARTER.tax;
   return out;
+}
+
+// ------------------------------------------------------------ finding plots
+// Somewhere for a building of this type near a point, its front SETBACK
+// from the middle of a street and facing it (as the town's own builders lay
+// out a street): the free spot nearest `near` along the roads within
+// opts.r of it, { x, z, a }, or null. opts.opts: what checkBuild is told
+// (free, ignoreMoney...); opts.w, opts.d: the plot's size; opts.step: how
+// finely the roads are searched along; opts.test(x, z, a): a further say.
+export function findPlot(w, type, near, opts = {}) {
+  const [w0, d0] = sizeOf(type);
+  const W = opts.w ?? w0, D = opts.d ?? d0, r = opts.r ?? 9, step = opts.step ?? 0.125;
+  const cands = [];
+  for (const e of w.roads.edges.values()) {
+    // (only edges coming within r)
+    let close = false;
+    for (const p of e.pts) if (Math.hypot(p[0] - near.x, p[1] - near.z) < r + 1) { close = true; break; }
+    if (!close && !(e.pts.length === 2 && segDist(near.x, near.z, e.pts[0][0], e.pts[0][1], e.pts[1][0], e.pts[1][1]) < r)) continue;
+    const off = SETBACK + D / 2;
+    for (let s = Math.min(W / 2 + 0.3, e.len / 2); s <= e.len - Math.min(W / 2 + 0.3, e.len / 2) + 1e-9; s += step) {
+      const p = pointAt(e.pts, e.cum, s), nx = -p[4], nz = p[3];
+      for (const sd of [1, -1]) {
+        const x = p[0] + nx * sd * off, z = p[1] + nz * sd * off;
+        const dd = Math.hypot(x - near.x, z - near.z);
+        if (dd > r) continue;
+        cands.push({ x, z, a: angleOf(-nx * sd, -nz * sd), d: dd });
+      }
+    }
+  }
+  cands.sort((p, q) => p.d - q.d);
+  const o = { ...(opts.opts || {}), w: W, d: D };
+  for (const c of cands) {
+    if (opts.test && !opts.test(c.x, c.z, c.a)) continue;
+    const chk = w.checkBuild(type, c.x, c.z, { ...o, a: c.a });
+    if (chk.ok) return { x: Math.round(c.x * 1000) / 1000, z: Math.round(c.z * 1000) / 1000, a: Math.round(c.a * 1000) / 1000, chk };
+  }
+  return null;
 }

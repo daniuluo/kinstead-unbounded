@@ -4,9 +4,9 @@
 import * as THREE from 'three';
 import { CONFIG } from '../config.js';
 import { BUILDINGS, TRADES, servicesOf, tradesOf, visitOf } from '../defs.js';
-import { doorPoint, fw, fd, isOpen, DIRS } from '../world/world.js';
-import { tilePolyline } from './path.js';
-import { curvesAt } from '../world/roadShape.js';
+import { doorPoint, plotOf, ownPlot, isOpen } from '../world/world.js';
+import { routeLine, routeSamples } from './path.js';
+import { toLocal, toWorld } from '../world/geom.js';
 import { workArea, LIFT } from '../render/buildings.js';
 import { VillagerView, lookOf, dressOf, carryFrom, strideLen } from '../render/villagers.js';
 import { traitsOf } from './people.js';
@@ -36,7 +36,7 @@ export function visitorCap(b) {
   const def = BUILDINGS[b.type], kind = visitKind(def);
   if (!kind) return Infinity;
   const base = def.visitors || { park: 3, shop: 4, tavern: 6, chapel: 8, clinic: 3 }[kind];
-  return Math.max(2, Math.round(base * fw(b) * fd(b) * (1 + (kind === 'park' ? 0.3 : 0.5) * b.level)));
+  return Math.max(2, Math.round(base * b.w * b.d * (1 + (kind === 'park' ? 0.3 : 0.5) * b.level)));
 }
 
 const _fr = new THREE.Frustum(), _pm = new THREE.Matrix4(), _sp = new THREE.Sphere(), _v = new THREE.Vector3();
@@ -86,21 +86,25 @@ export function walkY(w, wk) {
 // Where a door's path meets the edge of its plot, straight out from the door
 // (a little past it, on the pavement); null when the door is at the front.
 function gateOf(B, d) {
-  const x0 = B.x, z0 = B.z, x1 = B.x + fw(B), z1 = B.z + fd(B);
+  const R = plotOf(B), [lx, lz] = toLocal(R, d.x, d.z);
+  const ux = d.dx * R.ex + d.dz * R.ez, uz = d.dx * R.ux + d.dz * R.uz;
   let t = Infinity;
-  if (d.dx > 1e-3) t = Math.min(t, (x1 - d.x) / d.dx); else if (d.dx < -1e-3) t = Math.min(t, (x0 - d.x) / d.dx);
-  if (d.dz > 1e-3) t = Math.min(t, (z1 - d.z) / d.dz); else if (d.dz < -1e-3) t = Math.min(t, (z0 - d.z) / d.dz);
+  if (ux > 1e-3) t = Math.min(t, (R.hw - lx) / ux); else if (ux < -1e-3) t = Math.min(t, (-R.hw - lx) / ux);
+  if (uz > 1e-3) t = Math.min(t, (R.hd - lz) / uz); else if (uz < -1e-3) t = Math.min(t, (-R.hd - lz) / uz);
   if (!Number.isFinite(t) || t < 0.2) return null;
   t += 0.05;
   return [d.x + d.dx * t, d.z + d.dz * t];
 }
 
+// A wander area: [x0, z0, x1, z1] in world space, or across and along the
+// frame of the rectangle area[4] (its own x and z) when there is one. The
+// world point at (lx, lz) in it.
+export function inArea(A, lx, lz) { return A[4] ? toWorld(A[4], lx, lz) : [lx, lz]; }
+
 export class Agents {
   constructor(game) {
     this.game = game;
     this.world = game.world;
-    // villagers cut a corner along the road's curve (not on a bridge ramp)
-    this._curve = (x, z, outside) => curvesAt(this.world, x, z, outside);
     this.walkers = new Set();
     this.plannedDay = -1;
     const scene = game.renderer.scene;
@@ -301,24 +305,23 @@ export class Agents {
     if (!A) { r.at = r.home; A = w.buildings.get(r.home); if (r.walk) this._drop(r.walk); r.loc = 'in'; }
     if (!A || !B || A === B) return;
     if (!A.access || !B.access) return;
-    const tiles = this.game.paths.road(A.access.x, A.access.z, B.access.x, B.access.z);
-    if (!tiles) return;
+    const route = this.game.paths.road(A.access, B.access);
+    if (!route) return;
     const startPos = r.loc === 'out' && r.walk ? { x: r.walk.x, z: r.walk.z } : null;
     if (r.walk) this._drop(r.walk);
     // (how long the walk takes, climbing counted: see climbCost)
-    let walk = 0;
-    for (let i = 1; i < tiles.length; i++) walk += climbCost(w.walkHeight(tiles[i][0] + 0.5, tiles[i][1] + 0.5) - w.walkHeight(tiles[i - 1][0] + 0.5, tiles[i - 1][1] + 0.5));
+    const walk = walkCost(w, route);
     const plan = r.skipTransit ? null : this.game.transit.plan(A, B, walk);
     if (plan) this.game.transit.tally(plan, walk);
     r.skipTransit = false;
     if (plan) {
-      const t1 = this.game.paths.road(A.access.x, A.access.z, plan.board.access.x, plan.board.access.z);
+      const t1 = this.game.paths.road(A.access, plan.board.access);
       if (t1) {
         this._walk(r, A, plan.board, t1, startPos, () => this.game.transit.wait(r, plan, B.id));
         return;
       }
     }
-    this._walk(r, A, B, tiles, startPos, () => this._arrive(r, B.id));
+    this._walk(r, A, B, route, startPos, () => this._arrive(r, B.id));
   }
 
   // Front door of a building as a short path: a step inside (hidden by the
@@ -337,14 +340,18 @@ export class Agents {
     const inside = [d.x - d.dx * 0.09, d.z - d.dz * 0.09], door = [d.x, d.z], step = [d.x + d.dx * 0.08, d.z + d.dz * 0.08];
     const way = [step, door, inside];
     const gate = gateOf(B, d);
-    const a = B.access, side = (x, z) => (x < B.x ? 'w' : x > B.x + fw(B) ? 'e' : z < B.z ? 'n' : z > B.z + fd(B) ? 's' : '');
-    const as = a && side(a.x + 0.5, a.z + 0.5), g = gate && as && side(gate[0], gate[1]) !== as ? this._gridOf(B) : null;
+    // (which side of the plot a point lies beyond, in its own frame: its
+    // front 's' (+z), back 'n', +x 'e', -x 'w')
+    const R = plotOf(B), a = B.access;
+    const side = (x, z) => { const [lx, lz] = toLocal(R, x, z); return lx < -R.hw ? 'w' : lx > R.hw ? 'e' : lz < -R.hd ? 'n' : lz > R.hd ? 's' : ''; };
+    const as = a && side(a.x, a.z), g = gate && as && side(gate[0], gate[1]) !== as ? this._gridOf(B) : null;
     let round = null, from = null;
     if (g) {
       // in from the street's edge of the plot (and the verge it may come
       // forward into), in line with the door's step
-      const [X0, Z0, X1, Z1] = plotRect(B), cl = (v, lo, hi) => Math.min(hi - 0.06, Math.max(lo + 0.06, v));
-      from = as === 'n' ? [cl(step[0], X0, X1), Z0 - 0.03] : as === 's' ? [cl(step[0], X0, X1), Z1 + 0.03] : as === 'w' ? [X0 - 0.03, cl(step[1], Z0, Z1)] : [X1 + 0.03, cl(step[1], Z0, Z1)];
+      const f = B.front || 0, X0 = -R.hw, X1 = R.hw, Z0 = -R.hd, Z1 = R.hd + f, cl = (v, lo, hi) => Math.min(hi - 0.06, Math.max(lo + 0.06, v));
+      const [sx, sz] = toLocal(R, step[0], step[1]);
+      from = toWorld(R, ...(as === 'n' ? [cl(sx, X0, X1), Z0 - 0.03] : as === 's' ? [cl(sx, X0, X1), Z1 + 0.03] : as === 'w' ? [X0 - 0.03, cl(sz, Z0, Z1)] : [X1 + 0.03, cl(sz, Z0, Z1)]));
       // to the open ground straight out from the door (beyond a porch or a
       // portico, whose columns leave no room on the grid), then straight in
       // (or, where even that is shut in, on the grid as drawn, without the room
@@ -361,9 +368,9 @@ export class Agents {
     return arriving ? way : way.reverse();
   }
 
-  _walk(r, A, B, tiles, startPos, onArrive) {
+  _walk(r, A, B, route, startPos, onArrive) {
     const start = doorPoint(A), end = doorPoint(B);
-    const pts = tilePolyline(tiles, r.lk.lane, start, end, this._curve);
+    const pts = routeLine(this.world.roads, route, r.lk.lane, start, end);
     const out = startPos ? null : this._doorway(A, r, false), into = this._doorway(B, r, true);
     // with a real door the plot-edge point is skipped (the front may stand
     // further forward than the plot edge)
@@ -564,7 +571,7 @@ export class Agents {
     if (!t) return;
     const still = (wk) => wk.sit || (wk.mode === 'path' && wk.narrow);
     const hidden = (wk) => inside(wk);
-    const W = this.world, road = (x, z) => { const tx = Math.floor(x), tz = Math.floor(z); return W.inBounds(tx, tz) && !!W.roadAt(tx, tz); };
+    const W = this.world, road = (x, z) => !!W.roadAt(x, z, 0.02);
     const shove = (wk, px, pz) => {
       if (still(wk)) return;
       if (wk.mode === 'path') {
@@ -716,7 +723,7 @@ export class Agents {
     const mesh = it && it.mesh;
     if (!mesh || !mesh.geometry) return null;
     let g = this._grids.get(mesh);
-    if (g === undefined) { g = plotGrid(B, mesh, ...plotRect(B)); this._grids.set(mesh, g); }
+    if (g === undefined) { g = plotGrid(B, mesh, plotRect(B)); this._grids.set(mesh, g); }
     return g;
   }
 
@@ -731,7 +738,7 @@ export class Agents {
       // only the strip from the door out to the street, and nothing more
       // than a step or two above the threshold (a portico's steps, not the
       // head of the door or a porch's roof)
-      const d = B.door, L = Math.max(fw(B), fd(B)) + 0.2, ex = d.x + d.dx * L, ez = d.z + d.dz * L;
+      const d = B.door, L = Math.max(B.w, B.d) + 0.2, ex = d.x + d.dx * L, ez = d.z + d.dz * L;
       s = stepsGrid(B, mesh, Math.min(d.x, ex) - 0.3, Math.min(d.z, ez) - 0.3, Math.max(d.x, ex) + 0.3, Math.max(d.z, ez) + 0.3, Math.max(d.y, B.baseY) + 0.1);
       this._stairs.set(mesh, s);
     }
@@ -765,7 +772,7 @@ export class Agents {
     if (outdoor && r.walk) {
       const wk = r.walk;
       wk.mode = 'wander';
-      wk.area = site ? siteArea(B) : B.work || workArea(B) || [B.x + 0.15, B.z + 0.15, B.x + fw(B) - 0.15, B.z + fd(B) - 0.15];
+      wk.area = site ? siteArea(B) : B.work || workArea(B) || [-B.w / 2 + 0.15, -B.d / 2 + 0.15, B.w / 2 - 0.15, B.d / 2 - 0.15, ownPlot(B)];
       // a park's visitors stroll between its walks and seats (B.spots, from
       // the model) rather than anywhere on the plot (so not into the pond)
       wk.ring = site;
@@ -844,9 +851,9 @@ export class Agents {
     r.at = stop.id;
     r.loc = 'in';
     if (!B || !stop.access || !B.access) { r.at = r.home; return 0; }
-    const tiles = this.game.paths.road(stop.access.x, stop.access.z, B.access.x, B.access.z);
-    if (!tiles) { r.at = r.home; return 0; }
-    const wk = this._walk(r, stop, B, tiles, null, () => this._arrive(r, B.id));
+    const route = this.game.paths.road(stop.access, B.access);
+    if (!route) { r.at = r.home; return 0; }
+    const wk = this._walk(r, stop, B, route, null, () => this._arrive(r, B.id));
     // (from their seat in the cabin; or, not quite in it yet when it set
     // off, from the cabin where it stands now)
     const from = rode && rode.mode === 'ride' ? [rode.x, rode.z] : at ? seatAt(at, 0) : null;
@@ -894,7 +901,7 @@ export class Agents {
       return;
     }
     const p = doorPoint(stop);
-    const cx = stop.x + fw(stop) / 2, cz = stop.z + fd(stop) / 2;
+    const cx = stop.x, cz = stop.z;
     const wk = r.walk || this._makeWalker(r.lk, [[p.x, p.z]], null);
     wk.r = r;
     r.walk = wk;
@@ -961,10 +968,10 @@ export class Agents {
     const e = w.entry;
     for (const r of family) {
       this._initResident(r);
-      const tiles = home.access ? this.game.paths.road(e.x, e.z, home.access.x, home.access.z) : null;
-      if (!tiles) continue;
-      const startEdge = { x: e.x + 0.5 + (e.x === 0 ? -0.5 : e.x === w.N - 1 ? 0.5 : 0), z: e.z + 0.5 + (e.z === 0 ? -0.5 : e.z === w.N - 1 ? 0.5 : 0) };
-      const pts = tilePolyline(tiles, r.lk.lane, startEdge, doorPoint(home), this._curve);
+      const route = home.access ? this.game.paths.road({ node: e.node }, home.access) : null;
+      if (!route) continue;
+      const startEdge = { x: e.x, z: e.z };
+      const pts = routeLine(w.roads, route, r.lk.lane, null, doorPoint(home));
       const into = this._doorway(home, r, true);
       if (into) { pts.pop(); pts.push(...into); }
       const delay = Math.random() * 1.5;
@@ -992,9 +999,9 @@ export class Agents {
       this.game.transit.forget(r);
       const from = fromBuilding || w.buildings.get(r.home);
       if (!from || !from.access) continue;
-      const tiles = this.game.paths.road(from.access.x, from.access.z, e.x, e.z);
-      if (!tiles) continue;
-      const pts = tilePolyline(tiles, r.lk.lane, doorPoint(from), null, this._curve);
+      const route = this.game.paths.road(from.access, { node: e.node });
+      if (!route) continue;
+      const pts = routeLine(w.roads, route, r.lk.lane, doorPoint(from), null);
       const out = this._doorway(from, r, false);
       if (out) { pts.shift(); pts.unshift(...out); }
       const wk = this._makeWalker(r.lk, pts, () => this._drop(wk));
@@ -1128,18 +1135,18 @@ export class Agents {
         if (wk.idle > 0) { wk.idle -= dt * speed; wk.moving = false; if (wk.working && speed) wk.phase += dt * speed * 4; continue; }
         if (!wk.target && wk.route && wk.route.length) wk.target = wk.route.shift();
         if (!wk.target) {
-          const [x0, z0, x1, z1] = wk.area;
+          const A = wk.area, [x0, z0, x1, z1] = A;
           const somewhere = () => {
             if (wk.ring) {
               // builders work their way round the scaffolding
               const wx = x1 - x0, wz = z1 - z0, t = Math.random() * 2 * (wx + wz);
-              return t < wx ? [x0 + t, z0] : t < wx + wz ? [x1, z0 + t - wx] : t < 2 * wx + wz ? [x1 - (t - wx - wz), z1] : [x0, z1 - (t - 2 * wx - wz)];
+              return inArea(A, ...(t < wx ? [x0 + t, z0] : t < wx + wz ? [x1, z0 + t - wx] : t < 2 * wx + wz ? [x1 - (t - wx - wz), z1] : [x0, z1 - (t - 2 * wx - wz)]));
             }
             if (wk.spots) {
               const p = wk.spots[(Math.random() * wk.spots.length) | 0];
               return [p[0] + (Math.random() - 0.5) * 0.08, p[1] + (Math.random() - 0.5) * 0.08];
             }
-            return [x0 + Math.random() * (x1 - x0), z0 + Math.random() * (z1 - z0)];
+            return inArea(A, x0 + Math.random() * (x1 - x0), z0 + Math.random() * (z1 - z0));
           };
           // (not where someone stands already, if there's anywhere else)
           const taken = (p) => this.near(p[0], p[1], BODY_D).some(o => o !== wk && Math.hypot(o.x - p[0], o.z - p[1]) < BODY_D);
@@ -1277,7 +1284,7 @@ export class Agents {
     if (r.walk && this.walkers.has(r.walk)) return { x: r.walk.x, y: r.walk.y, z: r.walk.z };
     if (r.loc === 'ride') { const v = this.game.transit.vehicleOf(r); if (v) return v; }
     const b = this.world.buildings.get(r.at ?? r.home);
-    if (b) return { x: b.x + fw(b) / 2, y: b.baseY, z: b.z + fd(b) / 2 };
+    if (b) return { x: b.x, y: b.baseY, z: b.z };
     return null;
   }
 
@@ -1314,13 +1321,29 @@ export class Agents {
 // A building's plot, with the verge of the street in front that it may
 // come forward into (b.front), as [x0, z0, x1, z1].
 function plotRect(B) {
-  const [dx, dz] = DIRS[B.rot] || [0, 1], f = B.front || 0;
-  return [B.x - (dx < 0 ? f : 0), B.z - (dz < 0 ? f : 0), B.x + fw(B) + (dx > 0 ? f : 0), B.z + fd(B) + (dz > 0 ? f : 0)];
+  const R = plotOf(B), f = B.front || 0;
+  if (!f) return R;
+  const [cx, cz] = toWorld(R, 0, f / 2);
+  return { ...R, cx, cz, hd: R.hd + f / 2 };
 }
 
-// Where builders walk on a building site: a ring just inside the plot edge.
+// Where builders walk on a building site: a ring just inside the plot edge
+// (in the plot's own frame: see inArea).
 export function siteArea(B) {
-  return [B.x + 0.1, B.z + 0.1, B.x + fw(B) - 0.1, B.z + fd(B) - 0.1];
+  const R = ownPlot(B);
+  return [-R.hw + 0.1, -R.hd + 0.1, R.hw - 0.1, R.hd - 0.1, R];
+}
+
+// How long a walk along a route takes, its climbs counted (see climbCost),
+// in units of an easy walk the length of a cottage's plot.
+export function walkCost(w, route) {
+  const S = routeSamples(w.roads, route, 1);
+  let c = 0;
+  for (let i = 1; i < S.length; i++) {
+    const L = Math.hypot(S[i][0] - S[i - 1][0], S[i][1] - S[i - 1][1]);
+    c += L * climbCost((w.walkHeight(S[i][0], S[i][1]) - w.walkHeight(S[i - 1][0], S[i - 1][1])) / (L || 1));
+  }
+  return c;
 }
 
 // The crowd (see Agents._spread): a villager is about BODY_D across; they're

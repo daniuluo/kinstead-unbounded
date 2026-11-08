@@ -6,8 +6,8 @@
 // off the road (gardens, flower beds) are planted by volunteers.
 
 import { BUILDINGS } from '../defs.js';
-import { fw, fd, isOpen } from '../world/world.js';
-import { lookOf, siteArea } from './agents.js';
+import { isOpen } from '../world/world.js';
+import { lookOf, siteArea, inArea } from './agents.js';
 import { doorPoint } from '../world/world.js';
 
 const DAY_START = 6.5, DAY_END = 18;
@@ -18,7 +18,7 @@ const HIRED_RATE = 0.55;   // each hired hand, against 1–1.5 for a town builde
 const firstUp = (a, b) => (b.con.priority ? 1 : 0) - (a.con.priority ? 1 : 0) || (a._queued ?? Infinity) - (b._queued ?? Infinity);
 
 // How many builders fit on a site at once.
-export function crewCap(b) { return Math.min(8, 2 + 2 * fw(b) * fd(b)); }
+export function crewCap(b) { return Math.min(8, 2 + 2 * b.w * b.d); }
 
 export class Construction {
   constructor(game) {
@@ -164,7 +164,7 @@ export class Construction {
     while (list.length < n) {
       const lk = lookOf({ look: (Math.random() * 1e9) | 0, age: 'adult' }, { kind: 'builder' });
       const area = siteArea(s);
-      const wk = ag._makeWalker(lk, [[area[0] + Math.random() * (area[2] - area[0]), area[3]]], null);
+      const wk = ag._makeWalker(lk, [inArea(area, area[0] + Math.random() * (area[2] - area[0]), area[3])], null);
       Object.assign(wk, { mode: 'wander', area, ring: true, baseY: s.baseY + 0.012, working: true, idle: Math.random() * 2, target: null, hand: true });
       list.push(wk);
     }

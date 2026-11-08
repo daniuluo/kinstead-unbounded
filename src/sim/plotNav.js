@@ -1,9 +1,13 @@
 // Ways about an open plot (a farmyard, a park, a market square, a yard):
-// a fine grid over the plot, blocked wherever the building's model stands at
+// a fine grid over the plot (in the plot's own frame, turned with it: the
+// cells are only a way to find a path round things, nothing stands on
+// them), blocked wherever the building's model stands at
 // a villager's height (walls, sheds, stalls, statues, trunks, tall hedges),
 // and the shortest way between two points on it that keeps to the open
 // cells. Built from the model as drawn, so only where it is drawn: in the
 // headless tests villagers walk straight, as they always did.
+
+import { toLocal, toWorld } from '../world/geom.js';
 
 const CELL = 0.05;
 // a triangle blocks the way if any of it is between these heights above
@@ -11,13 +15,14 @@ const CELL = 0.05;
 const LO = 0.09, HI = 0.13;
 
 // The grid for building b drawn as mesh (its geometry in the mesh's frame,
-// turned by mesh.rotation.y and placed at mesh.position), over its plot
-// (x0, z0)–(x1, z1) and a cell or two round it; the cells beyond the plot
-// are blocked, as a neighbour's building may stand right up to its edge.
-// Null without a model.
-export function plotGrid(b, mesh, x0, z0, x1, z1) {
+// turned by mesh.rotation.y and placed at mesh.position), over its plot (R,
+// a rectangle: geom.js) and a cell or two round it; the cells beyond the
+// plot are blocked, as a neighbour's building may stand right up to its
+// edge. Null without a model.
+export function plotGrid(b, mesh, R) {
   const geo = mesh && mesh.geometry, pos = geo && geo.attributes && geo.attributes.position;
   if (!pos) return null;
+  let x0 = -R.hw, z0 = -R.hd, x1 = R.hw, z1 = R.hd;
   const px0 = x0, pz0 = z0, px1 = x1, pz1 = z1;
   x0 -= CELL * 2; z0 -= CELL * 2; x1 += CELL * 2; z1 += CELL * 2;
   const nx = Math.ceil((x1 - x0) / CELL), nz = Math.ceil((z1 - z0) / CELL);
@@ -29,10 +34,12 @@ export function plotGrid(b, mesh, x0, z0, x1, z1) {
   const th = mesh.rotation.y, co = Math.cos(th), si = Math.sin(th), px = mesh.position.x, pz = mesh.position.z;
   const floor = b.baseY - mesh.position.y;
   const P = pos.array, I = geo.index ? geo.index.array : null, n = I ? I.length : pos.count;
+  // (the model's points in the plot's own frame)
   const mark = (x, z) => {
     const i = Math.floor((x - x0) / CELL), k = Math.floor((z - z0) / CELL);
     if (i >= 0 && k >= 0 && i < nx && k < nz) blocked[k * nx + i] = 1;
   };
+  const local = (wx, wz) => toLocal(R, wx, wz);
   const W = [0, 0, 0, 0, 0, 0];
   for (let t = 0; t + 2 < n; t += 3) {
     let ya = Infinity, yb = -Infinity;
@@ -40,7 +47,8 @@ export function plotGrid(b, mesh, x0, z0, x1, z1) {
       const j = I ? I[t + v] : t + v, y = P[j * 3 + 1] - floor;
       ya = Math.min(ya, y); yb = Math.max(yb, y);
       const lx = P[j * 3], lz = P[j * 3 + 2];
-      W[v * 2] = px + lx * co + lz * si; W[v * 2 + 1] = pz - lx * si + lz * co;
+      const [qx, qz] = local(px + lx * co + lz * si, pz - lx * si + lz * co);
+      W[v * 2] = qx; W[v * 2 + 1] = qz;
     }
     if (yb < LO || ya > HI) continue;
     // the triangle as seen from above: its edges, and whatever it covers
@@ -72,8 +80,8 @@ export function plotGrid(b, mesh, x0, z0, x1, z1) {
       if (a >= 0 && c >= 0 && a < nx && c < nz) wide[c * nx + a] = 1;
     }
   }
-  const g = { x0, z0, nx, nz, blocked: wide };
-  g.tight = { x0, z0, nx, nz, blocked };
+  const g = { x0, z0, nx, nz, blocked: wide, R };
+  g.tight = { x0, z0, nx, nz, blocked, R };
   return g;
 }
 
@@ -121,7 +129,11 @@ export function stepAt(s, x, z) {
   return i >= 0 && k >= 0 && i < s.nx && k < s.nz ? s.h[k * s.nx + i] : -Infinity;
 }
 
-const cellOf = (g, x, z) => [Math.min(g.nx - 1, Math.max(0, Math.floor((x - g.x0) / CELL))), Math.min(g.nz - 1, Math.max(0, Math.floor((z - g.z0) / CELL)))];
+// (world points in the plot's own frame, and back)
+const lc = (g, x, z) => (g.R ? toLocal(g.R, x, z) : [x, z]);
+const wc = (g, x, z) => (g.R ? toWorld(g.R, x, z) : [x, z]);
+const cellOf = (g, x, z) => { [x, z] = lc(g, x, z); return [Math.min(g.nx - 1, Math.max(0, Math.floor((x - g.x0) / CELL))), Math.min(g.nz - 1, Math.max(0, Math.floor((z - g.z0) / CELL)))]; };
+const cellXZ = (g, i, k) => wc(g, g.x0 + (i + 0.5) * CELL, g.z0 + (k + 0.5) * CELL);
 const free = (g, i, k) => i >= 0 && k >= 0 && i < g.nx && k < g.nz && !g.blocked[k * g.nx + i];
 
 // The open cell nearest (x, z) (itself if open), or null.
@@ -159,7 +171,7 @@ export function clearLine(g, ax, az, bx, bz) {
 export function plotPath(g, ax, az, bx, bz) {
   const s = nearestFree(g, ax, az), e = nearestFree(g, bx, bz);
   if (!s || !e) return null;
-  const end = free(g, ...cellOf(g, bx, bz)) ? [bx, bz] : [g.x0 + (e[0] + 0.5) * CELL, g.z0 + (e[1] + 0.5) * CELL];
+  const end = free(g, ...cellOf(g, bx, bz)) ? [bx, bz] : cellXZ(g, e[0], e[1]);
   const start = [ax, az];
   if (free(g, ...cellOf(g, ax, az)) && clearLine(g, ax, az, end[0], end[1])) return [end];
   // breadth-first over the cells (eight ways, no squeezing past a corner)
@@ -179,14 +191,14 @@ export function plotPath(g, ax, az, bx, bz) {
   }
   if (prev[ei] < 0) return null;
   const cells = [];
-  for (let c = ei; c !== si; c = prev[c]) cells.push([g.x0 + ((c % g.nx) + 0.5) * CELL, g.z0 + (((c / g.nx) | 0) + 0.5) * CELL]);
+  for (let c = ei; c !== si; c = prev[c]) cells.push(cellXZ(g, c % g.nx, (c / g.nx) | 0));
   cells.reverse();
   cells[cells.length - 1] = end;
   // pull the string tight: keep only the corners it has to go round (first
   // stepping out into the open, if starting up against something)
   const out = [];
   let from = start;
-  if (!free(g, ...cellOf(g, ax, az))) { from = [g.x0 + (s[0] + 0.5) * CELL, g.z0 + (s[1] + 0.5) * CELL]; out.push(from); }
+  if (!free(g, ...cellOf(g, ax, az))) { from = cellXZ(g, s[0], s[1]); out.push(from); }
   for (let i = 0; i < cells.length; i++) {
     const next = cells[i + 1];
     if (next && clearLine(g, from[0], from[1], next[0], next[1])) continue;

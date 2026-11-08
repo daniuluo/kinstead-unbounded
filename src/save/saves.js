@@ -1,16 +1,20 @@
 // Save format + local (browser) save slots + file export/import.
 
-import { World } from '../world/world.js';
+import { World, ownPlot } from '../world/world.js';
 import { Terrain } from '../world/terrain.js';
+import { Net } from '../world/net.js';
 import { BUILDINGS, TECHS } from '../defs.js';
 import { titleFor, dressValid } from '../config.js';
-import { tidyDiag } from '../world/diagonal.js';
-import { poseRec } from '../world/pose.js';
+import { rect } from '../world/geom.js';
+import { fromGrid } from './fromGrid.js';
 import { cleanText, cleanColor, hasKey, newTownId, isTownId } from '../util/text.js';
 import { pack, unpack } from './pack.js';
 
 export const SAVE_FORMAT = 'hearthvale-save';   // the game's old name, kept so every save still loads
-export const SAVE_VERSION = 1;
+// 2: the town without a grid (roads and track as networks of curves,
+// plots anywhere at any angle). Version 1 saves (on squares) are made over
+// as they load (fromGrid.js).
+export const SAVE_VERSION = 2;
 
 function toB64(u8) {
   let s = '';
@@ -39,14 +43,13 @@ export function serialize(world) {
     seed: world.seed,
     N: world.N,
     heights: toB64(new Uint8Array(q.buffer)),
-    roads: toB64(world.roads),
-    rails: toB64(world.rails),
-    ...(world.buried && world.buried.some((v, i) => v && world.roads[i]) ? { buried: toB64(world.buried.map((v, i) => (v && world.roads[i] ? 1 : 0))) } : {}),
-    ...(world.dress && world.dress.some((v, i) => v && world.roads[i]) ? { dress: toB64(world.dress.map((v, i) => (world.roads[i] ? v : 0))) } : {}),
-    // diagonal streets (older saves have none)
-    ...(world.diagN ? { diag: toB64(world.diag.map((v, i) => (world.roads[i] ? v : 0))) } : {}),
-    ...(world.fieldTiles && world.fieldTiles.size ? { fields: [...world.fieldTiles].map(([id, tiles]) => [id, ...tiles]) } : {}),
-    buildings: [...world.buildings.values()].map(b => [b.id, b.type, b.level, b.x, b.z, b.variant, b.rot, b.built, b.w ?? b.size, b.d ?? b.size, b.flavor || null, b.con || null, b.leases && b.leases.length ? b.leases : null, b.look || null, b.spare ? [b.spare.w, b.spare.d, ...(b.spare.sx != null ? [b.spare.sx, b.spare.sz] : [])] : null, ...(b.pose ? [poseRec(b)] : [])]),
+    // the networks of roads and track: { n: nodes, e: edges } (net.js toRec)
+    roads: world.roads.toRec(),
+    rails: world.rails.toRec(),
+    // farm fields: [id, farm, x, z, a]
+    ...(world.parcels.size ? { fields: [...world.parcels.values()].map(f => [f.id, f.farm, f.x, f.z, f.a]) } : {}),
+    // [id, type, level, x, z (its middle), variant, a (the way it faces), built, w, d (along the street and deep), flavor, con, leases, look, spare]
+    buildings: [...world.buildings.values()].map(b => [b.id, b.type, b.level, b.x, b.z, b.variant, b.a, b.built, b.w, b.d, b.flavor || null, b.con || null, b.leases && b.leases.length ? b.leases : null, b.look || null, b.spare ? [b.spare.w, b.spare.d, ...(b.spare.sx != null ? [b.spare.sx, b.spare.sz] : [])] : null]),
     trees,
     residents: [...world.residents.values()].map(r => [r.id, r.first, r.last, r.age, r.home ?? -1, r.job ?? -1, r.look, r.wealth ?? null, r.fam ?? null, r.years != null ? Math.round(r.years * 100) / 100 : null, r.edu ?? null, r.edYrs ?? null]),
     lines: world.lines.map(l => ({ id: l.id, mode: l.mode, name: l.name, color: l.color, stops: l.stops.slice(), vehicles: l.vehicles })),
@@ -61,6 +64,8 @@ export function serialize(world) {
 export function deserialize(data) {
   if (!data || data.format !== SAVE_FORMAT) throw new Error('This file is not a Kinstead save.');
   if (data.version > SAVE_VERSION) throw new Error('This save was made by a newer version of Kinstead.');
+  // a town laid out on squares: made over as a gridless one first
+  if (!(data.version >= 2)) data = fromGrid(data);
   const N = data.N;
   const raw = fromB64(data.heights);
   const q = new Int16Array(raw.buffer, raw.byteOffset, raw.byteLength / 2);
@@ -69,17 +74,15 @@ export function deserialize(data) {
   const w = new World(N, data.seed, new Terrain(N, H));
   w.townName = cleanText(data.name, 40) || 'Kinstead';
   w.townId = isTownId(data.townId) ? data.townId : newTownId();
-  w.roads.set(fromB64(data.roads).subarray(0, N * N));
-  if (data.rails) w.rails.set(fromB64(data.rails).subarray(0, N * N));
-  if (typeof data.buried === 'string') w.buried.set(fromB64(data.buried).subarray(0, N * N).map(v => (v ? 1 : 0)));
-  if (typeof data.dress === 'string') w.dress.set(fromB64(data.dress).subarray(0, N * N).map((v, i) => (dressValid(v) && w.roads[i] ? v : 0)));
-  if (typeof data.diag === 'string') { w.diag.set(fromB64(data.diag).subarray(0, N * N)); tidyDiag(w); }
+  w.roads = Net.fromRec(data.roads, 'road');
+  w.rails = Net.fromRec(data.rails, 'rail');
+  for (const e of w.roads.edges.values()) if (!dressValid(e.dress)) e.dress = 0;
   const tr = data.trees || [];
   for (let i = 0; i + 4 < tr.length; i += 5) w.addTree(tr[i] / 100, tr[i + 1] / 100, tr[i + 2], tr[i + 3] / 100, tr[i + 4] / 100);
-  for (let [id, type, level, x, z, variant, rot, built, bw, bd, flavor, con, leases, look, spare, pose] of data.buildings) {
+  for (let [id, type, level, x, z, variant, a, built, bw, bd, flavor, con, leases, look, spare] of data.buildings) {
     if (type === 'house' && level >= 2) [type, level] = level === 2 ? ['flats', 0] : ['villa', level - 2];
-    if (!hasKey(BUILDINGS, type)) continue;
-    w.restoreBuilding({ id, type, level, x, z, variant, rot, built, w: bw, d: bd, flavor, con, leases, look, spare, pose });
+    if (!hasKey(BUILDINGS, type) || ![x, z].every(Number.isFinite)) continue;
+    w.restoreBuilding({ id, type, level, x, z, variant, a: Number.isFinite(a) ? a : 0, built, w: bw, d: bd, flavor, con, leases, look, spare });
   }
   const oldEdu = (data.state && data.state.eduScale) !== 5;
   for (const [id, first, last, age, home, job, look, wealth, fam, years, edu, edYrs] of data.residents) {
@@ -95,7 +98,8 @@ export function deserialize(data) {
   w.lines = (Array.isArray(data.lines) ? data.lines : []).map(l => ({ ...l, name: cleanText(l.name, 40), color: cleanColor(l.color), stops: (Array.isArray(l.stops) ? l.stops : []).filter(s => w.buildings.has(s)) }));
   const s = data.state;
   Object.assign(w, {
-    money: s.money, taxRate: s.taxRate, day: s.day, hours: s.hours, nextId: s.nextId, entry: s.entry,
+    money: s.money, taxRate: s.taxRate, day: s.day, hours: s.hours, nextId: s.nextId,
+    entry: s.entry && w.roads.nodes.has(s.entry.node) ? { node: s.entry.node, x: w.roads.nodes.get(s.entry.node).x, z: w.roads.nodes.get(s.entry.node).z } : { node: -1, x: 0, z: 0 },
     history: s.history || [], titleIdx: s.titleIdx || 0,
   });
   Object.assign(w.stats, s.stats || {});
@@ -105,14 +109,26 @@ export function deserialize(data) {
   else w.research.done = Object.keys(TECHS);
   // farmland, for the farms that are there, on ground nothing else stands on
   if (Array.isArray(data.fields)) {
-    for (const [id, ...tiles] of data.fields) {
-      const b = w.buildings.get(id);
-      if (!b || !BUILDINGS[b.type].fields) continue;
-      for (const i of tiles) if (Number.isInteger(i) && i >= 0 && i < N * N && w.buildingAt[i] < 0 && !w.roads[i] && !w.rails[i]) w.fields[i] = id;
+    for (const [id, farm, x, z, a] of data.fields) {
+      const b = w.buildings.get(farm);
+      if (!b || !BUILDINGS[b.type].fields || ![id, x, z].every(Number.isFinite)) continue;
+      if (w._plotBlock(rect(x, z, a || 0, 0.5, 0.5), { fields: true })) continue;
+      w._addField(farm, x, z, a || 0, id);
     }
   }
   w._countFields();
   w.updateRoadNetwork();
+  // (a town made over from squares: a building that no longer reaches its
+  // street turns to face the nearest, where it can)
+  if (data.refaced) {
+    for (const b of w.buildings.values()) {
+      if (b.access || BUILDINGS[b.type].park) continue;
+      const a = w.faceRoad(b.x, b.z, 1.6);
+      if (a == null) continue;
+      if (w.accessFor(ownPlot({ ...b, a }))) { b.a = a; w._file(b); }
+    }
+    w.updateRoadNetwork();
+  }
   w.updateRailLinks();
   return w;
 }
