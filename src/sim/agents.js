@@ -105,6 +105,8 @@ export class Agents {
   constructor(game) {
     this.game = game;
     this.world = game.world;
+    // (a point beside a road over water, off the road and any bridge: see routeLine)
+    this._wet = (x, z) => this.world.waterAt(x, z) && !this.world.roadAt(x, z, 0.04);
     this.walkers = new Set();
     this.plannedDay = -1;
     const scene = game.renderer.scene;
@@ -370,7 +372,7 @@ export class Agents {
 
   _walk(r, A, B, route, startPos, onArrive) {
     const start = doorPoint(A), end = doorPoint(B);
-    const pts = routeLine(this.world.roads, route, r.lk.lane, start, end);
+    const pts = routeLine(this.world.roads, route, r.lk.lane, start, end, this._wet);
     const out = startPos ? null : this._doorway(A, r, false), into = this._doorway(B, r, true);
     // with a real door the plot-edge point is skipped (the front may stand
     // further forward than the plot edge)
@@ -579,8 +581,10 @@ export class Agents {
         const a = wk.pts[wk.seg], b = wk.pts[wk.seg + 1] || a, L = Math.hypot(b[0] - a[0], b[1] - a[1]);
         if (L < 1e-6) return;
         const nx = -(b[1] - a[1]) / L, nz = (b[0] - a[0]) / L, d = px * nx + pz * nz;
-        const was = wk.side;
-        wk.side = Math.max(-SIDE_IN, Math.min(SIDE_OUT, wk.side + d));
+        const was = wk.side, to = Math.max(-SIDE_IN, Math.min(SIDE_OUT, wk.side + d));
+        // (never shoved off a road along the shore into the water)
+        if (this._wet(wk.x + nx * (to - was), wk.z + nz * (to - was)) && !this._wet(wk.x, wk.z)) return;
+        wk.side = to;
         wk.x += nx * (wk.side - was); wk.z += nz * (wk.side - was);
       } else if (road(wk.x, wk.z) && road(wk.x + px, wk.z + pz)) { wk.x += px; wk.z += pz; }   // (on the street, never into a wall)
     };
@@ -978,7 +982,7 @@ export class Agents {
       const route = home.access ? this.game.paths.road({ node: e.node }, home.access) : null;
       if (!route) continue;
       const startEdge = { x: e.x, z: e.z };
-      const pts = routeLine(w.roads, route, r.lk.lane, null, doorPoint(home));
+      const pts = routeLine(w.roads, route, r.lk.lane, null, doorPoint(home), this._wet);
       const into = this._doorway(home, r, true);
       if (into) { pts.pop(); pts.push(...into); }
       const delay = Math.random() * 1.5;
@@ -1008,7 +1012,7 @@ export class Agents {
       if (!from || !from.access) continue;
       const route = this.game.paths.road(from.access, { node: e.node });
       if (!route) continue;
-      const pts = routeLine(w.roads, route, r.lk.lane, doorPoint(from), null);
+      const pts = routeLine(w.roads, route, r.lk.lane, doorPoint(from), null, this._wet);
       const out = this._doorway(from, r, false);
       if (out) { pts.shift(); pts.unshift(...out); }
       const wk = this._makeWalker(r.lk, pts, () => this._drop(wk));
@@ -1129,9 +1133,10 @@ export class Agents {
         // their right), eased back to their lane; none where it's narrow
         wk.side *= Math.max(0, 1 - dt * speed * (wk.narrow ? 6 : 0.25));
         if (wk.side) {
-          const L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
-          wk.x += (-(b[1] - a[1]) / L) * wk.side;
-          wk.z += ((b[0] - a[0]) / L) * wk.side;
+          const L = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1, sx = (-(b[1] - a[1]) / L) * wk.side, sz = ((b[0] - a[0]) / L) * wk.side;
+          // (never a step aside off a road along the shore, into the water)
+          if (this._wet(wk.x + sx, wk.z + sz) && !this._wet(wk.x, wk.z)) wk.side = 0;
+          else { wk.x += sx; wk.z += sz; }
         }
         if (Math.abs(b[0] - a[0]) + Math.abs(b[1] - a[1]) > 1e-4) wk.heading += angDiff(Math.atan2(b[0] - a[0], b[1] - a[1]), wk.heading) * Math.min(1, dt * 12);
         wk.y = walkY(w, wk);

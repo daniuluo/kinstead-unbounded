@@ -111,9 +111,31 @@ export function routeCentre(net, route) {
 
 // The way someone goes along a route, `offset` to the right of the road's
 // middle (negative: the left), from start and to end ({ x, z }) if given.
-export function routeLine(net, route, offset = 0, start = null, end = null) {
-  const C = route ? routeCentre(net, route) : [];
-  const pts = offsetPath(C, offset);
+// wet(x, z): whether a point off the road is over water; where a walker's
+// way along the verge would be (a road along the shore), they keep to the
+// road's edge instead.
+export function routeLine(net, route, offset = 0, start = null, end = null, wet = null) {
+  let C = route ? routeCentre(net, route) : [];
+  let pts = offsetPath(C, offset);
+  if (wet && offset && pts.some(([x, z]) => wet(x, z))) {
+    // (a point at least every tenth of a unit, so no step skips over the water)
+    const D = [];
+    C.forEach((p, i) => {
+      if (i) { const q = C[i - 1], n = Math.ceil(Math.hypot(p[0] - q[0], p[1] - q[1]) / 0.1); for (let k = 1; k < n; k++) D.push([q[0] + ((p[0] - q[0]) * k) / n, q[1] + ((p[1] - q[1]) * k) / n]); }
+      D.push(p);
+    });
+    C = D;
+    pts = offsetPath(C, offset);
+    const inner = offsetPath(C, Math.sign(offset) * Math.min(Math.abs(offset), 0.19));
+    if (inner.length === pts.length) {
+      // (a point over the water, or either end of a step whose middle is)
+      const off = pts.map(([x, z]) => wet(x, z));
+      for (let i = 0; i + 1 < pts.length; i++) if (wet((pts[i][0] + pts[i + 1][0]) / 2, (pts[i][1] + pts[i + 1][1]) / 2)) off[i] = off[i + 1] = true;
+      // (and where even that is, round a sharp corner on the shore, the middle of the road)
+      const mid = offsetPath(C, Math.sign(offset) * 0.02);
+      for (let i = 0; i < pts.length; i++) if (off[i]) pts[i] = wet(inner[i][0], inner[i][1]) && mid.length === pts.length ? mid[i] : inner[i];
+    }
+  }
   if (start) pts.unshift([start.x, start.z]);
   if (end) pts.push([end.x, end.z]);
   return pts;
