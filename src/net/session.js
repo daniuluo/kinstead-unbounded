@@ -248,7 +248,7 @@ export class HostSession extends Peerish {
     if (this.guests.has(link) || this.waiting.has(link)) return;
     // (the main game's protocol numbers are small: a player of the main game
     // trying a code for a town of this copy, which has no grid)
-    if (m.proto !== PROTOCOL) { this._refuse(link, typeof m.proto === 'number' && m.proto < 100 ? `This town is on Kinstead without the grid, a separate copy of the game. Join it from there: ${THIS_SITE}play/` : 'This town is running a different version of Kinstead. Reload both pages and try again.'); return; }
+    if (m.proto !== PROTOCOL) { this._refuse(link, typeof m.proto === 'number' && m.proto < 100 ? `This town is on Kinstead Unbounded, the copy of the game without the grid. Join it from there: ${THIS_SITE}play/` : 'This town is running a different version of Kinstead. Reload both pages and try again.'); return; }
     const name = cleanName(m.name), key = nameKey(name);
     if (this.locked) { this._refuse(link, LOCKED); return; }
     if (this.players.length >= MAX_PLAYERS) { this._refuse(link, FULL); return; }

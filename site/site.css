@@ -45,6 +45,7 @@ body.site img { max-width: 100%; }
 .site-nav a.play:active { box-shadow: 0 0 0 1px #000, var(--sunken); }
 .site-nav a:focus-visible, .btn:focus-visible { outline: 1px dotted #000; outline-offset: -5px; }
 @media (max-width: 620px) {
+  .site-logo .logo-sub { display: none; }
   .site-head .wrap { gap: 6px; padding-left: 10px; padding-right: 10px; }
   .site-logo { font-size: 20px; gap: 5px; }
   .site-logo svg { width: 22px; height: 22px; }

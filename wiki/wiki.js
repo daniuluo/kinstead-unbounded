@@ -151,8 +151,8 @@ function watchPictures(root) {
 function homeHTML() {
   const types = Object.keys(BUILDINGS), levels = types.reduce((n, t) => n + BUILDINGS[t].levels.length, 0);
   const statBox = (n, label) => `<div><b>${n}</b>${esc(label)}</div>`;
-  let h = `<div class="crumbs">Kinstead wiki</div><h1>The Kinstead wiki</h1>
-    <p class="summary">How everything in <a href="../">Kinstead</a> works, from the first cottage to the Civic Palace. The building pages, the research tree and many of the figures are read straight from the game's own code, so they always match the game you play.</p>
+  let h = `<div class="crumbs">Kinstead Unbounded wiki</div><h1>The Kinstead Unbounded wiki</h1>
+    <p class="summary">How everything in <a href="../">Kinstead Unbounded</a> works, from the first cottage to the Civic Palace. The building pages, the research tree and many of the figures are read straight from the game's own code, so they always match the game you play.</p>
     <div class="stats-row">${statBox(types.length, 'kinds of building')}${statBox(levels, 'building levels')}${statBox(Object.keys(TECHS).length, 'research projects')}${statBox(MERGES.length, 'ways to join')}${statBox(ESTATE_TYPES.length, '2×2 estates')}${statBox(Object.keys(TRADES).length, 'trades')}</div>
     <p><a class="btn primary" href="../play/">${ms('play_arrow')}Play Kinstead</a> <span class="muted" style="margin-left:8px">Press <span class="kbd">/</span> to search.</span></p>
     <div class="wiki-home-grid">`;
@@ -183,7 +183,7 @@ async function renderPage(pid) {
   const my = ++renderId;
   if (pid === 'home') {
     main.innerHTML = homeHTML();
-    document.title = 'Kinstead wiki';
+    document.title = 'Kinstead Unbounded wiki';
     return true;
   }
   const p = pageById(pid);
@@ -206,7 +206,7 @@ async function renderPage(pid) {
     ? `<nav class="toc" aria-label="On this page"><b>On this page</b><ol>${tocList.map(s => `<li><a href="#${p.id}/${s.id}">${esc(s.title)}</a></li>`).join('')}</ol></nav>` : '';
   main.innerHTML = `<div class="crumbs"><a href="#">Wiki</a> › ${esc(groupName(p.group))}</div><h1>${esc(p.title)}</h1><p class="summary">${esc(p.summary || '')}</p>${toc}`
     + sections.map(s => sectionHTML(p, s)).join('') + seeHTML(p.see);
-  document.title = `${p.title} — Kinstead wiki`;
+  document.title = `${p.title} — Kinstead Unbounded wiki`;
   for (const el of main.querySelectorAll('[data-gen]')) GEN[el.dataset.gen]?.(el).catch(e => console.warn(e));
   if (p.generated === 'starters') loadCatalog().then(c => c.growStarters(main)).catch(e => console.warn(e));
   watchPictures(main);
@@ -215,7 +215,7 @@ async function renderPage(pid) {
 
 function notFound(raw) {
   main.innerHTML = `<h1>Not here</h1><p class="summary">There is no wiki page called <b>${esc(raw)}</b>. Try the search, or start from the <a href="#">wiki home</a>.</p>`;
-  document.title = 'Not found — Kinstead wiki';
+  document.title = 'Not found — Kinstead Unbounded wiki';
   current = null;
 }
 

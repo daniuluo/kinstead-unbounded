@@ -9,11 +9,11 @@
     // query and hash; everyone else gets the landing page.
     if (/[?&](join|continue)(=|&|$)/.test(location.search)) location.replace('play/' + location.search + location.hash);
   </script>
-  <title>Kinstead — a cozy isometric town builder</title>
-  <meta name="description" content="Kinstead is a cozy isometric village builder that runs in your browser: pixel-art 3D, a living town of villagers, farms and high streets, research, seasons, and live multiplayer. Free, no download.">
-  <meta property="og:title" content="Kinstead — a cozy isometric town builder">
+  <title>Kinstead Unbounded — a cozy isometric town builder</title>
+  <meta name="description" content="Kinstead Unbounded is a cozy isometric village builder, with no grid, that runs in your browser: pixel-art 3D, a living town of villagers, farms and high streets, research, seasons, and live multiplayer. Free, no download.">
+  <meta property="og:title" content="Kinstead Unbounded — a cozy isometric town builder">
   <meta property="og:description" content="Build a little village in your browser: pixel-art 3D, villagers with lives of their own, farms, high streets, research, seasons and live multiplayer.">
-  <meta property="og:image" content="https://daniuluo.github.io/kinstead-gridless/img/og.jpg">
+  <meta property="og:image" content="https://daniuluo.github.io/kinstead-unbounded/img/og.jpg">
   <meta property="og:type" content="website">
   <meta name="theme-color" content="#000080">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22><path d=%22M8 30 32 10l24 20v26H8z%22 fill=%22%23d8c29a%22/><path d=%22M4 32 32 8l28 24-4 4L32 15 8 36z%22 fill=%22%239c4a32%22/><rect x=%2227%22 y=%2240%22 width=%2210%22 height=%2216%22 fill=%22%235c3d26%22/></svg>">
@@ -28,7 +28,7 @@
 <body class="site landing">
   <a class="skip" href="#features">Skip to the features</a>
   <header class="site-head"><div class="wrap">
-    <a class="site-logo" href="./" aria-label="Kinstead home"><svg viewBox="0 0 64 64" aria-hidden="true"><path d="M8 30 32 10l24 20v26H8z" fill="#d8c29a"/><path d="M4 32 32 8l28 24-4 4L32 15 8 36z" fill="#9c4a32"/><rect x="27" y="40" width="10" height="16" fill="#5c3d26"/></svg>Kinstead</a>
+    <a class="site-logo" href="./" aria-label="Kinstead Unbounded home"><svg viewBox="0 0 64 64" aria-hidden="true"><path d="M8 30 32 10l24 20v26H8z" fill="#d8c29a"/><path d="M4 32 32 8l28 24-4 4L32 15 8 36z" fill="#9c4a32"/><rect x="27" y="40" width="10" height="16" fill="#5c3d26"/></svg>Kinstead<span class="logo-sub"> Unbounded</span></a>
     <nav class="site-nav" aria-label="Site">
       <a class="play" href="play/"><span class="ms" aria-hidden="true">play_arrow</span>Play</a>
       <a href="wiki/"><span class="ms" aria-hidden="true">menu_book</span>Wiki</a>
@@ -41,11 +41,11 @@
       <img class="hero-town" src="img/hero.webp" width="960" height="480" fetchpriority="high" alt="A pixel-art city: streets of brick and stone houses, shops and offices around a domed civic palace, with a lake, works and a wind farm beyond.">
       <div class="wrap">
         <div class="hero-card win">
-          <div class="tb">Kinstead<span class="tb-btns" aria-hidden="true"><i></i><i></i></span></div>
+          <div class="tb">Kinstead Unbounded<span class="tb-btns" aria-hidden="true"><i></i><i></i></span></div>
           <div class="body">
-            <h1 class="logo">Kinstead</h1>
+            <h1 class="logo">Kinstead <small>Unbounded</small></h1>
             <p class="tagline">A cozy isometric town builder that runs in your browser. Lay the streets, raise the houses and watch your villagers go about their day.</p>
-            <p class="tagline"><b>This copy has no grid:</b> build anywhere, at any angle, along roads you draw as curves. The main game, on squares, is at <a href="https://daniuluo.github.io/kinstead/">daniuluo.github.io/kinstead</a>.</p>
+            <p class="tagline"><b>Kinstead Unbounded has no grid:</b> build anywhere, at any angle, along roads you draw as curves. The main game, on squares, is at <a href="https://daniuluo.github.io/kinstead/">daniuluo.github.io/kinstead</a>.</p>
             <a class="btn primary big" href="play/"><span class="ms" aria-hidden="true">play_arrow</span>Play now</a>
             <a class="btn cont hidden" id="cont" href="play/?continue"></a>
             <a class="btn" href="wiki/"><span class="ms" aria-hidden="true">menu_book</span>Read the wiki</a>
@@ -225,7 +225,7 @@
   </main>
 
   <footer class="site-foot"><div class="wrap">
-    <nav aria-label="Footer"><a href="play/">Play</a><a href="wiki/">Wiki</a><a href="https://github.com/daniuluo/kinstead-gridless">Source on GitHub</a><a href="https://daniuluo.github.io/kinstead/">The main game</a></nav>
+    <nav aria-label="Footer"><a href="play/">Play</a><a href="wiki/">Wiki</a><a href="https://github.com/daniuluo/kinstead-unbounded">Source on GitHub</a><a href="https://daniuluo.github.io/kinstead/">The main game</a></nav>
     <span class="grow"></span>
     <span>Made with three.js · fonts Pixelify Sans, icons Material Symbols · MIT licence</span>
   </div></footer>

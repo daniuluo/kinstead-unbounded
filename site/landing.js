@@ -52,7 +52,7 @@ async function fromDefs() {
 }
 
 // this copy's own repository (the main game's is daniuluo/kinstead)
-const REPO = 'daniuluo/kinstead-gridless', BRANCH = 'gridless';
+const REPO = 'daniuluo/kinstead-unbounded', BRANCH = 'gridless';
 
 // The latest commits to the game, from GitHub (kept for an hour, so a
 // visitor doesn't use up GitHub's allowance for unsigned requests).
