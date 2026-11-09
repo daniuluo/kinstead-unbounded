@@ -378,6 +378,9 @@ export class Agents {
     // further forward than the plot edge)
     if (out) { pts.shift(); pts.unshift(...out); }
     if (into) { pts.pop(); pts.push(...into); }
+    // (to and from a gondola station with a way up: out on the verge)
+    if (B.stair && !into) pts[pts.length - 1] = this._kerb(B, pts[pts.length - 1]);
+    if (A.stair && !out && !startPos) pts[0] = this._kerb(A, pts[0]);
     let plotOut = 0;
     if (startPos) {
       // out of an open plot, round whatever stands in the way
@@ -881,12 +884,22 @@ export class Agents {
   // The way between a point by a gondola station and the foot of its stairs
   // (a, b: [x, z]): out to the verge in front of its plot, along it, and in
   // again, rather than along the very edge of the plot, where its piers and
-  // posts stand (no points needed for a step straight out).
+  // posts stand (no points needed for a step straight out, nor for an end
+  // already out on the verge).
   _verge(stop, a, b) {
     const R = plotOf(stop), [ax, az] = toLocal(R, a[0], a[1]), [bx, bz] = toLocal(R, b[0], b[1]);
     if (Math.abs(ax - bx) < 0.08) return [];
     const out = R.hd + (stop.front || 0) + 0.1;
-    return [toWorld(R, ax, Math.max(az, out)), toWorld(R, bx, Math.max(bz, out))];
+    return [...(az < out - 1e-6 ? [toWorld(R, ax, out)] : []), ...(bz < out - 1e-6 ? [toWorld(R, bx, out)] : [])];
+  }
+
+  // The point on the verge in front of p (on the edge of a gondola station's
+  // plot): where the walks to and from the station end and begin, rather than
+  // the step on the plot's edge, which stone stairs going up along the front
+  // may stand over (they come down to it from a corner).
+  _kerb(stop, p) {
+    const R = plotOf(stop), [x, z] = toLocal(R, p[0], p[1]);
+    return toWorld(R, x, Math.max(z, R.hd + (stop.front || 0) + 0.1));
   }
 
   // Passenger waiting at a stop for line (visible, standing around). At a

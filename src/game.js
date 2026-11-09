@@ -28,8 +28,9 @@ import { runCommand } from './commands.js';
 import { ReplicaSim, ReplicaConstruction } from './net/replica.js';
 import { worldFromSnapshot } from './net/sync.js';
 import { RemoteCursors } from './net/cursors.js';
+import { STORE } from './store.js';
 
-const SETTINGS_KEY = 'hearthvale.settings';   // storage keys keep the game's old name so saves and settings carry over
+const SETTINGS_KEY = `${STORE}settings`;   // under this copy's own name (src/store.js)
 
 export class Game {
   constructor() {

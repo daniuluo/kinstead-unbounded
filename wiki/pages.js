@@ -145,7 +145,7 @@ export const PAGES = [
         ${list([
           '<b>Continue</b> loads the town you saved last (it only shows when there is one).',
           '<b>New village</b> starts a town: pick a name, a seed, a valley size and how high the land round it stands, or a ready-made ' + pl('starters', 'starter town') + '.',
-          '<b>Load a save…</b> lists the towns saved in this browser, and loads a <code>.json</code> save file.',
+          '<b>Load a save…</b> lists the towns saved in this browser, and loads a <code>.json</code> save file. Towns the main game saved in this browser are listed too, under <b>From the main game</b>: one opens here without the grid, and its save in the main game stays as it was.',
           '<b>Multiplayer…</b> hosts a town for friends or joins theirs with an invite code (' + pl('multiplayer', 'Multiplayer') + ').',
           '<b>Merge villages…</b> joins two saved towns into one valley (' + pl('merging', 'Merging villages') + ').',
         ])}

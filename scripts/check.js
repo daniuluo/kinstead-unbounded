@@ -1022,14 +1022,19 @@ await block('3d0c shopping', async () => {
   }
   const shops = [mk, ...nearby, far].filter(Boolean);
   const A = { world: tw, _nearest: Agents.prototype._nearest };
-  const n = 6000, got = new Map();
-  for (let i = 0; i < n; i++) { const id = Agents.prototype._shopFor.call(A, { home: home.id }, shops); got.set(id, (got.get(id) || 0) + 1); }
+  const n = 6000;
+  const draws = (list) => { const got = new Map(); for (let i = 0; i < n; i++) { const id = Agents.prototype._shopFor.call(A, { home: home.id }, list); got.set(id, (got.get(id) || 0) + 1); } return got; };
+  const got = draws(shops);
   const share = (b) => (got.get(b.id) || 0) / n;
   const [bak, but, dra] = nearby;
   const pct = (b) => `${Math.round(share(b) * 100)}%`;
   ok(shops.every(b => share(b) > 0), `every trade gets shoppers (market ${pct(mk)}, bakery ${pct(bak)}, butcher ${pct(but)}, draper ${pct(dra)}${far ? `, a bank ${Math.hypot(far.x - home.x, far.z - home.z).toFixed(0)} units off ${pct(far)}` : ''})`);
   ok(share(mk) > share(bak) && share(bak) > share(but) && share(but) > share(dra) && share(dra) > 0.05, 'everyday trades are shopped for most, clothes less, but the lone draper still gets its share');
-  ok(!far || share(far) < 0.5 * TRADES.banking.often / TRADES.clothes.often * share(dra), 'a trade only sold far from home is shopped for less');
+  // (the same bank as if it stood by the house: measured against the draper
+  // instead, the far bank's share sat within a percent of the bar wherever
+  // the draper's plot fell a few units further off, and 1 run in 5 failed)
+  const beside = far && (draws(shops.map(b => (b === far ? { ...b, x: home.x + 1.5, z: home.z } : b))).get(far.id) || 0) / n;
+  ok(!far || share(far) < 0.5 * beside, `a trade only sold far from home is shopped for less${far ? ` (the bank ${(share(far) * 100).toFixed(1)}%, ${(beside * 100).toFixed(1)}% were it beside the house)` : ''}`);
   ok(visitKind(BUILDINGS.offices) === null && !tradesOf({ type: 'offices' }).length, 'offices take no shoppers');
   ok(tradesOf({ type: 'shophouse', flavor: 'butcher' }).join() === 'meat' && tradesOf({ type: 'deptstore' }).includes('clothes') && !tradesOf({ type: 'deptstore' }).includes('banking'), 'a shophouse sells its own trade, a department store every trade but banking');
 });

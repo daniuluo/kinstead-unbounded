@@ -171,7 +171,7 @@ export const STARTERS = [
     // spring of the eleventh year · laid out whole by src/world/city.js, not
     // grown from a script: radius is how far out the streets go
     id: 'city', name: 'Cathedral city', town: 'Kingsbridge', N: 80, seed: 315838, radius: 24, city: true, day: 241, settle: 4, money: 60000, seat: 'capitol',
-    desc: 'A whole city decades along: a domed Capitol with law courts, a museum and an opera house round it, a cathedral, high streets of every trade, works and a wind farm, and some 3,000 people at work.',
+    desc: 'A whole city decades along: a domed Capitol with law courts, a museum and an opera house round it, a cathedral, high streets of every trade, works and a wind farm, and some 2,400 villagers.',
   },
   {
     // the most people a valley can hold: every plot of the largest valley built

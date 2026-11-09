@@ -8,8 +8,9 @@
 import { listen, connect, cleanCode, formatCode } from '../net/peer.js';
 import { HostSession, GuestSession, makeLink, MAX_PLAYERS } from '../net/session.js';
 import { serialize, downloadJSON, saveFileName, LocalSaves } from '../save/saves.js';
+import { STORE } from '../store.js';
 
-const NAME_KEY = 'hearthvale.mp.name';
+const NAME_KEY = `${STORE}mp.name`;
 const TITLE = 'Multiplayer';
 const esc = (s) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 

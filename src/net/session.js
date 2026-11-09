@@ -16,6 +16,7 @@ import { BUILDINGS } from '../defs.js';
 import { ROAD_LEVELS } from '../config.js';
 import { runCommand, packResult, unpackResult, describeCommand, VISITOR_REASON } from '../commands.js';
 import { PROTOCOL, Tracker, makeSnapshot, applyDelta } from './sync.js';
+import { THIS_SITE } from '../store.js';
 import { cleanColor } from '../util/text.js';
 
 export const COLORS = ['#e8b830', '#3d8fe0', '#e0503f', '#4fb84a', '#a86ae0', '#f0862f', '#2fb8a8', '#e060a8'];
@@ -245,7 +246,9 @@ export class HostSession extends Peerish {
   // answer, or are turned away.
   _hello(link, m) {
     if (this.guests.has(link) || this.waiting.has(link)) return;
-    if (m.proto !== PROTOCOL) { this._refuse(link, 'This town is running a different version of Kinstead. Reload both pages and try again.'); return; }
+    // (the main game's protocol numbers are small: a player of the main game
+    // trying a code for a town of this copy, which has no grid)
+    if (m.proto !== PROTOCOL) { this._refuse(link, typeof m.proto === 'number' && m.proto < 100 ? `This town is on Kinstead without the grid, a separate copy of the game. Join it from there: ${THIS_SITE}play/` : 'This town is running a different version of Kinstead. Reload both pages and try again.'); return; }
     const name = cleanName(m.name), key = nameKey(name);
     if (this.locked) { this._refuse(link, LOCKED); return; }
     if (this.players.length >= MAX_PLAYERS) { this._refuse(link, FULL); return; }

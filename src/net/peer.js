@@ -6,6 +6,8 @@
 // server only introduces the peers. PeerJS is loaded from jsDelivr (pinned,
 // with a checksum) the first time someone hosts or joins.
 
+import { STORE } from '../store.js';
+
 const PEERJS_SRC = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js';
 const PEERJS_SRI = 'sha384-x0YgkOr/3UOZP2CRDxGW9e0Q+2Qjyr3uJrm4xU32Y7ZCNAo7Cc7bjhrZMi/dwczu';
 const PREFIX = 'hearthvale-';   // the game's old name: an internal id only, kept so the peer ids don't change
@@ -139,7 +141,7 @@ export async function listen({ onLink, onTrouble = null }) {
 
 // A guest keeps one PeerJS id per browser tab (reloads included), so a host
 // that has removed someone recognises them if they knock again.
-const ID_KEY = 'hearthvale.mp.peer';
+const ID_KEY = `${STORE}mp.peer`;
 function tabPeerId() {
   try {
     let id = sessionStorage.getItem(ID_KEY);

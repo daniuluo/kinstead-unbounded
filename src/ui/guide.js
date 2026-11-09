@@ -7,6 +7,7 @@ import { EDU } from '../sim/people.js';
 import { visitorCap, visitKind } from '../sim/agents.js';
 import { thumb } from './thumbs.js';
 import { showPathMap } from './pathMap.js';
+import { STORE } from '../store.js';
 
 const esc = (s) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const GUIDE = 'Building guide';
@@ -158,7 +159,7 @@ export function showBuildingGuide(ui, type) {
   }
   const known = ui.windows && ui.windows.has(GUIDE);
   let saved = null;
-  try { saved = localStorage.getItem(`hearthvale.win.${GUIDE}`); } catch {}
+  try { saved = localStorage.getItem(`${STORE}win.${GUIDE}`); } catch {}
   ui.openModal(h, (c) => { c.classList.add('guide'); for (const p of c.querySelectorAll('[data-paths]')) p.onclick = () => showPathMap(ui, null, p.dataset.paths); });
   // the first time, keep it to the left so the map stays clear for building
   const win = ui.windows.get(GUIDE);

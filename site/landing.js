@@ -2,6 +2,8 @@
 // this browser, and figures read from the game's own definitions (so they
 // change with the game), plus the latest changes from GitHub.
 
+import { STORE } from '../src/store.js';
+
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmt = (n) => Math.round(n).toLocaleString('en-US');
@@ -10,7 +12,7 @@ const fmt = (n) => Math.round(n).toLocaleString('en-US');
 // belong to the site, not the page, so the game in play/ finds them too).
 function continueButton() {
   let list = [];
-  try { list = JSON.parse(localStorage.getItem('hearthvale.saves.v1') || '[]'); } catch {}
+  try { list = JSON.parse(localStorage.getItem(`${STORE}saves`) || '[]'); } catch {}
   const latest = list.filter(e => e && e.savedAt).sort((a, b) => (b.savedAt > a.savedAt ? 1 : -1))[0];
   if (!latest) return;
   const a = $('cont');
@@ -49,29 +51,32 @@ async function fromDefs() {
   ].map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
 }
 
+// this copy's own repository (the main game's is daniuluo/kinstead)
+const REPO = 'daniuluo/kinstead-gridless', BRANCH = 'gridless';
+
 // The latest commits to the game, from GitHub (kept for an hour, so a
 // visitor doesn't use up GitHub's allowance for unsigned requests).
 async function news() {
-  const box = $('news'), KEY = 'kinstead.site.news';
+  const box = $('news'), KEY = `${STORE}site.news`;
   let items = null;
   try { const c = JSON.parse(sessionStorage.getItem(KEY) || 'null'); if (c && Date.now() - c.at < 3600e3) items = c.items; } catch {}
   if (!items) {
     try {
-      const r = await fetch('https://api.github.com/repos/daniuluo/kinstead/commits?sha=main&per_page=20', { headers: { Accept: 'application/vnd.github+json' } });
+      const r = await fetch(`https://api.github.com/repos/${REPO}/commits?sha=${BRANCH}&per_page=20`, { headers: { Accept: 'application/vnd.github+json' } });
       if (!r.ok) throw new Error(r.status);
       const list = await r.json();
       items = list.filter(c => c.parents && c.parents.length < 2)
-        .map(c => ({ msg: (c.commit.message || '').split('\n')[0].trim(), date: c.commit.committer?.date || c.commit.author?.date, url: /^https:\/\/github\.com\//.test(c.html_url) ? c.html_url : 'https://github.com/daniuluo/kinstead/commits/main' }))
+        .map(c => ({ msg: (c.commit.message || '').split('\n')[0].trim(), date: c.commit.committer?.date || c.commit.author?.date, url: /^https:\/\/github\.com\//.test(c.html_url) ? c.html_url : `https://github.com/${REPO}/commits/${BRANCH}` }))
         .filter(c => c.msg && !/^(merge|wip)\b/i.test(c.msg)).slice(0, 8);
       try { sessionStorage.setItem(KEY, JSON.stringify({ at: Date.now(), items })); } catch {}
     } catch {
-      box.innerHTML = '<p class="empty">The latest changes are on <a href="https://github.com/daniuluo/kinstead/commits/main">GitHub</a>.</p>';
+      box.innerHTML = `<p class="empty">The latest changes are on <a href="https://github.com/${REPO}/commits/${BRANCH}">GitHub</a>.</p>`;
       return;
     }
   }
   const day = (d) => { try { return new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); } catch { return ''; } };
   box.innerHTML = `<ol>${items.map(c => `<li><time datetime="${esc(c.date)}">${esc(day(c.date))}</time><a href="${esc(c.url)}">${esc(c.msg)}</a></li>`).join('')}</ol>`
-    + '<p style="margin:8px 0 0;font-size:13px"><a href="https://github.com/daniuluo/kinstead/commits/main">Every change on GitHub →</a></p>';
+    + `<p style="margin:8px 0 0;font-size:13px"><a href="https://github.com/${REPO}/commits/${BRANCH}">Every change on GitHub →</a></p>`;
 }
 
 continueButton();

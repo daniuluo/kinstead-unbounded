@@ -9,6 +9,7 @@ import { rect, roundAngle } from '../world/geom.js';
 import { fromGrid } from './fromGrid.js';
 import { cleanText, cleanColor, hasKey, newTownId, isTownId } from '../util/text.js';
 import { pack, unpack } from './pack.js';
+import { STORE, MAIN_INDEX, MAIN_SLOT } from '../store.js';
 
 export const SAVE_FORMAT = 'hearthvale-save';   // the game's old name, kept so every save still loads
 // 2: the town without a grid (roads and track as networks of curves,
@@ -136,8 +137,9 @@ export function deserialize(data) {
 
 // ------------------------------------------------------------ local slots
 
-const INDEX_KEY = 'hearthvale.saves.v1';
-const SLOT_KEY = (id) => `hearthvale.slot.${id}`;
+// (under this copy's own names: src/store.js)
+const INDEX_KEY = `${STORE}saves`;
+const SLOT_KEY = (id) => `${STORE}slot.${id}`;
 
 export const LocalSaves = {
   list() {
@@ -186,6 +188,28 @@ export const LocalSaves = {
       this._writeIndex([...this.list().filter(x => x.id !== to), { ...e, id: to }]);
       return true;
     } catch { return false; }
+  },
+};
+
+// The main game's saves in this browser (the same site keeps both): listed
+// beside this copy's own and opened as towns made over from squares, never
+// written. One saved by a main game newer than this copy knows won't open.
+// (Where this copy ran before it had names of its own, on a computer of its
+// own, its towns are under the main game's names: they open as they are.)
+export const MainSaves = {
+  list() {
+    let idx = [];
+    try { idx = JSON.parse(localStorage.getItem(MAIN_INDEX) || '[]'); } catch {}
+    return Array.isArray(idx) ? idx.filter(e => e && typeof e.id === 'string' && e.savedAt) : [];
+  },
+  load(id) {
+    let s = null;
+    try { s = localStorage.getItem(MAIN_SLOT(id)); } catch {}
+    if (!s) throw new Error('Save not found.');
+    const data = JSON.parse(unpack(s));
+    const ours = data && data.version === 2 && data.roads && Array.isArray(data.roads.n);
+    if (!data || data.format !== SAVE_FORMAT || !(data.version < 2 || ours)) throw new Error("This town was saved by a newer version of the main game, which this copy can't open.");
+    return data;
   },
 };
 

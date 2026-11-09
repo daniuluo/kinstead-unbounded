@@ -2,7 +2,7 @@
 
 A little isometric village builder that runs in your browser — pixel-art rendering in the spirit of *Metropolis 1998* and the late-90s city sims, with a living village of little minions going about their day.
 
-**Play it:** https://daniuluo.github.io/kinstead/play/ · **Wiki:** https://daniuluo.github.io/kinstead/wiki/ · **Home page:** https://daniuluo.github.io/kinstead/ (the live site plays the main game; this fork runs from a copy of its own: see [Running locally](#running-locally))
+**Play it:** https://daniuluo.github.io/kinstead-gridless/play/ · **Wiki:** https://daniuluo.github.io/kinstead-gridless/wiki/ · **Home page:** https://daniuluo.github.io/kinstead-gridless/ (this fork, without the grid; the main game, on squares, is at https://daniuluo.github.io/kinstead/ and its source at https://github.com/daniuluo/kinstead)
 
 ## This fork: Kinstead without the grid
 
@@ -14,8 +14,8 @@ This branch (`gridless`) is Kinstead with the tile grid taken out. The buildings
 - **Fields are squares of farmland** a unit across, at the farm's own angle (or turned one of their own), touching the farm or its other fields, behind and beside it.
 - **No diagonal streets, boulevards or nudges on a plot**: a curve already runs any way, and a building already turns any way. (A boulevard look offered to a street is refused, saying so.)
 - **Distances are in units.** Where this page or the wiki still says tiles, read units: a unit is the width of a cottage's plot, and a valley is still 48 to 96 of them across. The coverage, appeal and pollution maps are still kept a unit square at a time, as the land's heights are.
-- **Saves.** A town saved by this fork is a version 2 save: the roads and track as curves, each building with its middle and its angle, the fields as squares. A town saved by the main game (version 1) loads here: each plot becomes a rectangle standing where it stood, facing one of the four ways (turned only where that's what reaches its street, and fits), each run of road squares a curve through their middles, and each field a square of farmland. From then on it saves as version 2, which the main game can't load. Merging villages works as before, curves and all.
-- **Multiplayer** is the same, with its protocol number moved on (101), so a guest needs this fork as well.
+- **Saves.** A town saved by this fork is a version 2 save: the roads and track as curves, each building with its middle and its angle, the fields as squares. A town saved by the main game (version 1) loads here: each plot becomes a rectangle standing where it stood, facing one of the four ways (turned only where that's what reaches its street, and fits), each run of road squares a curve through their middles, and each field a square of farmland. From then on it saves as version 2, which the main game can't load. Merging villages works as before, curves and all. The fork's site sits beside the main game's on daniuluo.github.io, and the pages of one site share a browser's storage, so this fork keeps its saves, settings and window places under names of its own (`kinstead-gridless.…`, [`src/store.js`](src/store.js)) and never writes the main game's (`hearthvale.…`). The main game's saves in the same browser are listed under this fork's own in **Load a save…**, as **From the main game**: opening one makes it over as above, and leaves the main game's save as it was.
+- **Multiplayer** is the same, with its protocol number moved on (101), so a guest needs this fork as well. A player of the main game who tries the code of a town hosted here is told it is on this copy, and where to join it.
 - **Tests.** The same scripts run here (`check.js`, `starters.js`, `merge-test.js`, `net-check.js`, `playtest.js`, `collide.js`, `site-check.js`), set up with curves and plots along them; `scripts/geom-check.js` tests the geometry underneath, and `check.js` loads a save made by the main game (`scripts/fixtures/grid-town.json`).
 
 ## Features
@@ -200,7 +200,7 @@ How the join is made:
 
 ## Website
 
-The site at https://daniuluo.github.io/kinstead/ (GitHub Pages, from `main`) has three parts. They share one header (Play · Wiki · Features) and the game's look: `style.css` for the windows, buttons and fonts, plus `site/site.css` for the page layouts.
+This fork's site is at https://daniuluo.github.io/kinstead-gridless/ (GitHub Pages, from the `gridless` branch of [daniuluo/kinstead-gridless](https://github.com/daniuluo/kinstead-gridless)); its **What's new** lists that branch's commits. The main game's is at https://daniuluo.github.io/kinstead/ (from `main` of daniuluo/kinstead). Each has three parts. They share one header (Play · Wiki · Features) and the game's look: `style.css` for the windows, buttons and fonts, plus `site/site.css` for the page layouts.
 
 - **Landing page** (`index.html`, the site root):
   - a picture of the Cathedral city and a big **Play** button;

@@ -32,7 +32,8 @@ const HAPPY = {
   road: { want: 'a road', label: 'Road', icon: 'add_road', tip: "Not connected to the town's roads — lay a road to it", act: { label: 'Show homes' } },
 };
 
-import { LocalSaves, serialize, downloadJSON, readJSONFile, saveFileName, saveFileNameFor } from '../save/saves.js';
+import { LocalSaves, MainSaves, serialize, downloadJSON, readJSONFile, saveFileName, saveFileNameFor } from '../save/saves.js';
+import { STORE, MAIN_SITE } from '../store.js';
 import { MergeDialog } from './mergeUI.js';
 import { showMultiplayer, renderNetBox } from './multiplayer.js';
 import { buildingSummary, showBuildingGuide } from './guide.js';
@@ -133,10 +134,10 @@ export class UI {
     for (const el of [$('pop').previousElementSibling, $('btnPeople').firstElementChild]) el.innerHTML = MINIONS;
     const insp = $('inspector');
     // where it was dragged to (on a smaller screen it is brought back on when it opens)
-    try { const p = JSON.parse(localStorage.getItem('hearthvale.win.inspector') || 'null'); if (p) { insp.style.left = `${p.x}px`; insp.style.top = `${p.y}px`; insp.style.right = 'auto'; } } catch {}
+    try { const p = JSON.parse(localStorage.getItem(`${STORE}win.inspector`) || 'null'); if (p) { insp.style.left = `${p.x}px`; insp.style.top = `${p.y}px`; insp.style.right = 'auto'; } } catch {}
     insp.addEventListener('pointerdown', (e) => {
       const r = insp.getBoundingClientRect();
-      if (e.button === 0 && e.clientY - r.top < 24 && !e.target.closest('button') && !this._docked()) this._drag(insp, e, 'hearthvale.win.inspector');
+      if (e.button === 0 && e.clientY - r.top < 24 && !e.target.closest('button') && !this._docked()) this._drag(insp, e, `${STORE}win.inspector`);
     });
     this._watchFit(insp);
     // a smaller browser window or a turned phone brings every window back on screen
@@ -1082,7 +1083,7 @@ export class UI {
     const x = win.querySelector('[data-close]');
     if (x) x.onclick = () => this.closeWindow(win);
     const bar = win.querySelector('h2');
-    if (bar) bar.onpointerdown = (e) => { if (e.button === 0) this._drag(win, e, `hearthvale.win.${key}`); };
+    if (bar) bar.onpointerdown = (e) => { if (e.button === 0) this._drag(win, e, `${STORE}win.${key}`); };
     this._focusWin(win);
     if (mount) mount(win);
     if (fresh) this._placeWin(win, key);
@@ -1091,7 +1092,7 @@ export class UI {
 
   _placeWin(win, key) {
     let pos = null;
-    try { pos = JSON.parse(localStorage.getItem(`hearthvale.win.${key}`) || 'null'); } catch {}
+    try { pos = JSON.parse(localStorage.getItem(`${STORE}win.${key}`) || 'null'); } catch {}
     const r = win.getBoundingClientRect();
     // a window as wide as the screen (a phone) opens in the middle, wherever it was left on a bigger one
     if (r.width > innerWidth - 48) pos = null;
@@ -1272,7 +1273,17 @@ export class UI {
       ${inGame && e.id !== 'autosave' && e.id !== 'previous' ? `<button class="btn small" data-over="${e.id}">Overwrite</button>` : ''}
       <button class="btn small" data-dl="${e.id}" title="Download as .json">⬇</button>
       <button class="btn small danger" data-del="${e.id}">✕</button></div></div>`).join('')}</div>`;
+    // the main game's towns in this browser: opened here made over from
+    // squares, the main game's own save left as it was
+    const main = MainSaves.list();
+    if (main.length) h += `<div class="note" style="margin:14px 0 6px">From <a href="${MAIN_SITE}" target="_blank" rel="noopener">the main game</a>, on squares: a town opens here without the grid, and its save there stays as it is.</div>
+      <div class="saves">${main.map(e => `<div class="save">
+      ${e.thumb && /^data:image\/(png|jpeg|webp);base64,/.test(e.thumb) ? `<img src="${e.thumb}" alt="">` : '<div class="ph">🏡</div>'}
+      <div><div class="t">${esc(e.name)} ${e.id === 'autosave' ? '<span class="chip">Autosave</span>' : e.id === 'previous' ? '<span class="chip">Previous town</span>' : ''}</div>
+      <div class="m">Day ${esc(e.day)} · ${fmt(+e.pop || 0)} villagers</div><div class="m">${esc(new Date(e.savedAt).toLocaleString())}</div></div>
+      <div class="acts"><button class="btn small primary" data-main="${esc(e.id)}">Open</button></div></div>`).join('')}</div>`;
     body.innerHTML = h;
+    for (const b of body.querySelectorAll('[data-main]')) b.onclick = () => { try { g.loadData(MainSaves.load(b.dataset.main)); this.closeModal(); this.toast(`${g.world.townName} opened from the main game`, 'good', '🏡'); } catch (e) { this.toast(e.message, 'bad'); } };
     const nb = body.querySelector('#lsNew');
     if (nb) nb.onclick = () => { if (g.saveLocal('s' + Date.now().toString(36))) this.showSaves('local'); };
     for (const b of body.querySelectorAll('[data-load]')) b.onclick = () => { try { g.loadData(LocalSaves.load(b.dataset.load)); this.closeModal(); } catch (e) { this.toast(e.message, 'bad'); } };
