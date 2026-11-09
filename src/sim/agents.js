@@ -96,6 +96,11 @@ function gateOf(B, d) {
   return [d.x + d.dx * t, d.z + d.dz * t];
 }
 
+// How far in front of a gondola station's middle (in its frame R) its verge
+// runs: just past where its front comes forward to (b.front, which stops
+// 0.06 short of the road), so off the road, where a coach may stand.
+const vergeOut = (stop, R) => R.hd + (stop.front || 0) + 0.05;
+
 // A wander area: [x0, z0, x1, z1] in world space, or across and along the
 // frame of the rectangle area[4] (its own x and z) when there is one. The
 // world point at (lx, lz) in it.
@@ -889,7 +894,7 @@ export class Agents {
   _verge(stop, a, b) {
     const R = plotOf(stop), [ax, az] = toLocal(R, a[0], a[1]), [bx, bz] = toLocal(R, b[0], b[1]);
     if (Math.abs(ax - bx) < 0.08) return [];
-    const out = R.hd + (stop.front || 0) + 0.1;
+    const out = vergeOut(stop, R);
     return [...(az < out - 1e-6 ? [toWorld(R, ax, out)] : []), ...(bz < out - 1e-6 ? [toWorld(R, bx, out)] : [])];
   }
 
@@ -899,7 +904,7 @@ export class Agents {
   // may stand over (they come down to it from a corner).
   _kerb(stop, p) {
     const R = plotOf(stop), [x, z] = toLocal(R, p[0], p[1]);
-    return toWorld(R, x, Math.max(z, R.hd + (stop.front || 0) + 0.1));
+    return toWorld(R, x, Math.max(z, vergeOut(stop, R)));
   }
 
   // Passenger waiting at a stop for line (visible, standing around). At a
