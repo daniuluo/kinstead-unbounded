@@ -869,12 +869,24 @@ export class Agents {
     // off, from the cabin where it stands now)
     const from = rode && rode.mode === 'ride' ? [rode.x, rode.z] : at ? seatAt(at, 0) : null;
     if (!stop.stair || !stop.deck || !from) return 0;
-    const down = stop.stair.slice().reverse();
-    wk.pts.unshift(from, ...down.map(p => [p.x, p.z]));
-    wk.ys = [stop.deck.y, ...down.map(p => p.y)];
+    const down = stop.stair.slice().reverse(), foot = down[down.length - 1];
+    const via = this._verge(stop, [foot.x, foot.z], wk.pts[0]);
+    wk.pts.unshift(from, ...down.map(p => [p.x, p.z]), ...via);
+    wk.ys = [stop.deck.y, ...down.map(p => p.y), ...via.map(() => null)];
     while (wk.ys.length < wk.pts.length) wk.ys.push(null);
     wk.x = from[0]; wk.z = from[1]; wk.y = stop.deck.y;
     return 0.12 / (CONFIG.WALK_SPEED * wk.speedK);
+  }
+
+  // The way between a point by a gondola station and the foot of its stairs
+  // (a, b: [x, z]): out to the verge in front of its plot, along it, and in
+  // again, rather than along the very edge of the plot, where its piers and
+  // posts stand (no points needed for a step straight out).
+  _verge(stop, a, b) {
+    const R = plotOf(stop), [ax, az] = toLocal(R, a[0], a[1]), [bx, bz] = toLocal(R, b[0], b[1]);
+    if (Math.abs(ax - bx) < 0.08) return [];
+    const out = R.hd + (stop.front || 0) + 0.1;
+    return [toWorld(R, ax, Math.max(az, out)), toWorld(R, bx, Math.max(bz, out))];
   }
 
   // Passenger waiting at a stop for line (visible, standing around). At a
@@ -899,8 +911,9 @@ export class Agents {
         const spots = this.game.transit.deckSpots(stop, line);
         end = [spots && spots.length ? spots[(Math.random() * spots.length) | 0] : [d.x, d.z]];
       }
+      const via = onDeck ? [] : this._verge(stop, [wk.x, wk.z], [stop.stair[0].x, stop.stair[0].z]);
       Object.assign(wk, {
-        pts: [[wk.x, wk.z], ...(onDeck ? [] : stop.stair.map(p => [p.x, p.z])), ...end], ys: [onDeck ? d.y : null, ...(onDeck ? [] : stop.stair.map(p => p.y)), ...end.map(() => d.y)],
+        pts: [[wk.x, wk.z], ...via, ...(onDeck ? [] : stop.stair.map(p => [p.x, p.z])), ...end], ys: [onDeck ? d.y : null, ...via.map(() => null), ...(onDeck ? [] : stop.stair.map(p => p.y)), ...end.map(() => d.y)],
         seg: 0, t: 0, mode: 'path', delay: 0, doorIn: 0, doorOut: 0, floorIn: null, floorOut: null, stairsIn: null, stairsOut: null, plotOut: 0, standY: null, sit: false,
         onArrive: () => {
           wk.mode = 'wait';

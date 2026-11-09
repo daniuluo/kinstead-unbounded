@@ -13,8 +13,8 @@
 // Besides what the villagers and vehicles happen to do over a few days, it
 // sweeps every way in to every door, every stroll between a park's walks and
 // seats, every outdoor work area and every gondola route, so nothing is left
-// to luck. No starter has a gondola, so each town gets two lines strung
-// across its busiest part first.
+// to luck. No starter has a gondola, so each town gets two lines first,
+// strung over its roofs where its villagers will ride them.
 // Usage: node scripts/collide.js [towns=all] [days=2] [--verbose] [--probe=id,x,z] [--seed=n] [--everyone]
 //   towns: starter ids, comma-separated ('all': every starter but the heavy
 //   Metropolis, and 'curves' and 'freeform'; 'scale': a big town grown by
@@ -483,9 +483,16 @@ function crowdCheck(game, bump) {
 function gondolas(game) {
   const w = game.world, rng = mulberry(w.N * 7919 + w.buildings.size);
   w.setSandbox({ infiniteMoney: true, unlockAll: true });
-  // (spots for a station along the streets: [x, z, a])
+  // (spots for a station along the streets: [x, z, a], and where a town
+  // packed to its edges has no room, in place of one of its little gardens,
+  // flower beds, statues, courts or play areas: [x, z, a, the one it replaces])
   const open = [];
   findPlot(w, 'gondola', { x: w.N / 2, z: w.N / 2 }, { r: w.N, step: 0.5, test: (x, z, a, chk) => { if (chk && chk.access && open.length < 400) open.push([x, z, a]); return !chk; } });
+  for (const b of w.buildings.values()) {
+    if (!['garden', 'flowers', 'statue', 'courts', 'playground'].includes(b.type) || b.w !== 1 || b.d !== 1 || b.con) continue;
+    const c = w.checkBuild('gondola', b.x, b.z, { a: b.a, except: [b] });
+    if (c.ok && c.access && c.access.conn) open.push([b.x, b.z, b.a, b]);
+  }
   const under = (a, b) => {
     const seen = new Set(), L = Math.hypot(b[0] - a[0], b[1] - a[1]);
     for (let u = 0; u <= L; u += 0.25) {
@@ -494,12 +501,31 @@ function gondolas(game) {
     }
     return seen.size;
   };
-  const station = ([x, z, a]) => {
+  // (and the commutes a line would carry: home and work each by a station
+  // of it, more than a short walk apart; a line is picked for both, so a
+  // city's lines run over its roofs and have riders too)
+  const trips = [];
+  for (const r of w.residents.values()) {
+    const A = w.buildings.get(r.home), B = r.job != null && w.buildings.get(r.job);
+    if (A && B && Math.abs(A.x - B.x) + Math.abs(A.z - B.z) >= 9) trips.push([A.x, A.z, B.x, B.z]);
+  }
+  const serves = (pts) => {
+    const by = (x, z) => pts.findIndex(p => Math.abs(p[0] - x) + Math.abs(p[1] - z) <= 5);
+    let n = 0;
+    for (const [ax, az, bx, bz] of trips) { const i = by(ax, az), j = i < 0 ? -1 : by(bx, bz); if (j >= 0 && i !== j) n++; }
+    return n;
+  };
+  // (what a station stood in place of, put back where it was)
+  const putBack = (was) => { if (was) w.placeBuilding(was.type, was.x, was.z, { a: was.a, instant: true, variant: was.variant }); };
+  const station = ([x, z, a, was]) => {
+    if (was) { if (!w.buildings.has(was.id)) return null; w.removeBuilding(was.id, 0); }
     const r = w.placeBuilding('gondola', x, z, { a, instant: true });
-    if (r.ok && r.building.access) return r.building;
+    if (r.ok && r.building.access) { r.building._was = was; return r.building; }
     if (r.ok) w.removeBuilding(r.building.id, 0);
+    putBack(was);
     return null;
   };
+  const unstation = (s) => { w.removeBuilding(s.id, 0); putBack(s._was); };
   const made = [];
   for (const n of [2, 3]) {
     const tries = [];
@@ -508,35 +534,56 @@ function gondolas(game) {
       for (let j = 1; j < n; j++) pts.push(open[(rng() * open.length) | 0]);
       let ok = true, score = 0;
       for (let j = 1; j < n && ok; j++) { const L = Math.hypot(pts[j][0] - pts[j - 1][0], pts[j][1] - pts[j - 1][1]); if (L < 8 || L > 22) ok = false; else score += under(pts[j - 1], pts[j]); }
-      if (ok) tries.push({ pts, score });
+      if (ok) tries.push({ pts, score: score + 2 * serves(pts) });
     }
     // (the best that the game lets be built: not one whose cable runs along
-    // the other's, say)
+    // the other's, say; and of those, one with a station risen tall enough
+    // over its neighbours for a lift, if any is)
     tries.sort((a, b) => b.score - a.score);
+    let pick = null;
     for (const best of tries.slice(0, 12)) {
       const st = best.pts.map(station);
       const r = st.every(Boolean) ? game.transit.createLine('gondola', st.map(s => s.id)) : { ok: false };
-      if (r.ok) { game.transit.setVehicles(r.line.id, 6); made.push(r.line); break; }
-      for (const s of st) if (s) w.removeBuilding(s.id, 0);
+      if (r.ok) {
+        const R = game.transit._route(r.line), tall = !!R && [...R.lifts.values()].some(k => k >= 1);
+        if (!pick || tall) {
+          if (pick) { game.transit.deleteLine(pick.line.id); pick.st.forEach(unstation); }
+          pick = { line: r.line, st };
+          if (tall) break;
+          continue;
+        }
+        game.transit.deleteLine(r.line.id);
+      }
+      for (const s of st) if (s) unstation(s);
     }
+    if (pick) { game.transit.setVehicles(pick.line.id, 6); made.push(pick.line); }
   }
   // and an interchange where two more lines meet, out from berths of their
   // own to a station each
   const hubs = [];
   findPlot(w, 'gondolahub', { x: w.N / 2, z: w.N / 2 }, { r: w.N, step: 0.5, test: (x, z, a, chk) => { if (chk && chk.access && hubs.length < 200) hubs.push([x, z, a]); return !chk; } });
+  // (those with the most commutes out to a station of their own first)
+  const reach = (h) => open.filter(([x, z]) => { const L = Math.hypot(x - h[0], z - h[1]); return L >= 8 && L <= 20; }).map(p => serves([h, p])).sort((a, b) => b - a)[0] || 0;
+  const hubAt = new Map(hubs.map(h => [h, reach(h)]));
+  hubs.sort((p, q) => hubAt.get(q) - hubAt.get(p));
   for (let k = 0; k < 30 && hubs.length; k++) {
-    const [hx, hz, ha] = hubs.splice((rng() * hubs.length) | 0, 1)[0];
+    const [hx, hz, ha] = hubs.shift();
     const r = w.placeBuilding('gondolahub', hx, hz, { a: ha, instant: true });
     if (!r.ok || !r.building.access) { if (r.ok) w.removeBuilding(r.building.id, 0); continue; }
     const H = r.building, ends = open.filter(([x, z]) => { const L = Math.hypot(x - hx, z - hz); return L >= 8 && L <= 20; });
+    // (the ends with the most commutes from the interchange first)
+    const busy = new Map(ends.map(p => [p, serves([[hx, hz], p])]));
+    ends.sort((p, q) => busy.get(q) - busy.get(p));
     const mine = [];
-    for (let t = 0; t < 40 && mine.length < 2 && ends.length; t++) {
-      const s = station(ends[(rng() * ends.length) | 0]);
+    for (let t = 0; t < 40 && mine.length < 2 && t < ends.length; t++) {
+      // (the two out to different parts of town)
+      if (mine.some(m => Math.hypot(m.s.x - ends[t][0], m.s.z - ends[t][1]) < 8)) continue;
+      const s = station(ends[t]);
       const lr = s ? game.transit.createLine('gondola', [H.id, s.id]) : { ok: false };
-      if (lr.ok) mine.push({ line: lr.line, s }); else if (s) w.removeBuilding(s.id, 0);
+      if (lr.ok) mine.push({ line: lr.line, s }); else if (s) unstation(s);
     }
     if (mine.length === 2) { for (const m of mine) { game.transit.setVehicles(m.line.id, 6); made.push(m.line); } break; }
-    for (const m of mine) { game.transit.deleteLine(m.line.id); w.removeBuilding(m.s.id, 0); }
+    for (const m of mine) { game.transit.deleteLine(m.line.id); unstation(m.s); }
     w.removeBuilding(H.id, 0);
   }
   game.transit.rebuild();

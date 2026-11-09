@@ -173,6 +173,41 @@ export function offsetPath(C, off) {
   return out;
 }
 
+// A line without the points that stand nearer than d to the one before (a
+// road's last point a whisker short of the junction it ends at): moved over
+// to one side (offsetPath), the bend at such a point would swing it about
+// across a step much shorter than it moves. Its ends stay.
+export function thin(C, d = 0.05) {
+  if (C.length < 3) return C.map(p => [p[0], p[1]]);
+  const out = [[C[0][0], C[0][1]]];
+  for (let i = 1; i < C.length; i++) {
+    const p = C[i], q = out[out.length - 1];
+    if (Math.hypot(p[0] - q[0], p[1] - q[1]) >= d) out.push([p[0], p[1]]);
+    else if (i === C.length - 1) { if (out.length > 1) out[out.length - 1] = [p[0], p[1]]; else out.push([p[0], p[1]]); }
+  }
+  return out;
+}
+
+// A line (an offsetPath) with the little loops taken out that moving it to
+// the inside of a tight curve ties in it, where the curve's points stand
+// closer together than it moves over (they'd step back on themselves):
+// where one step crosses one of the next few, it goes straight from the
+// one to the other, where they cross.
+export function untangle(pts, ahead = 16) {
+  const out = pts.map(p => [p[0], p[1]]);
+  for (let i = 0; i + 3 < out.length; i++) {
+    const [ax, az] = out[i], [bx, bz] = out[i + 1];
+    for (let j = Math.min(out.length - 2, i + ahead); j >= i + 2; j--) {
+      const [cx, cz] = out[j], [dx, dz] = out[j + 1];
+      const den = (bx - ax) * (dz - cz) - (bz - az) * (dx - cx);
+      if (Math.abs(den) < 1e-12) continue;
+      const t = ((cx - ax) * (dz - cz) - (cz - az) * (dx - cx)) / den, u = ((cx - ax) * (bz - az) - (cz - az) * (bx - ax)) / den;
+      if (t > 0 && t < 1 && u > 0 && u < 1) { out.splice(i + 1, j - i, [ax + (bx - ax) * t, az + (bz - az) * t]); break; }
+    }
+  }
+  return out;
+}
+
 // Round off sharp corners with a short quadratic curve (for coaches and trains).
 export function smoothPolyline(pts, radius = 0.35, steps = 4) {
   if (pts.length < 3) return pts.slice();

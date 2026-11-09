@@ -7,7 +7,7 @@ import { BUILDINGS, TRANSIT, LINE_COLORS, GONDOLA_COLORS, stopOf } from '../defs
 import { CONFIG } from '../config.js';
 import { GeoBuilder } from '../render/geo.js';
 import { MAT } from '../render/materials.js';
-import { routeCentre, offsetPath, smoothPolyline } from './path.js';
+import { routeCentre, offsetPath, smoothPolyline, untangle, thin } from './path.js';
 import { bridgeDeckY, isOpen, plotOf, ownPlot, HALF } from '../world/world.js';
 import { rect, rectsOverlap, aabbOf, toWorld, angleOf, angDiff } from '../world/geom.js';
 
@@ -487,6 +487,8 @@ export class Transit {
         }
       }
       if (C.length < 2) return null;
+      // (no whisker of a step to swing its lane about, see thin)
+      C = thin(C);
       // (where it turns back, at the end of the line, it swings right across
       // the road: one at a time there, as in a junction, see _zoneAt)
       const n = C.length;
@@ -498,7 +500,7 @@ export class Transit {
     }
     // (round the loop: its first point again at its end, the turn there too)
     if (Math.hypot(C[0][0] - C[C.length - 1][0], C[0][1] - C[C.length - 1][1]) > 1e-6) C.push(C[0].slice());
-    let pts = rail ? C.map(p => [p[0], p[1]]) : offsetPath([C[C.length - 2], ...C, C[1]], LANE).slice(1, -1);
+    let pts = rail ? C.map(p => [p[0], p[1]]) : untangle(offsetPath([C[C.length - 2], ...C, C[1]], LANE).slice(1, -1));
     pts = smoothPolyline(pts, rail ? 0.5 : 0.3, rail ? 6 : 4);
     const cum = [0];
     for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
@@ -656,9 +658,12 @@ export class Transit {
     const legs = [];
     for (let i = 0; i < n - 1; i++) legs.push(this._span(P[i], P[i + 1], stops[i], stops[i + 1], ref.get(stops[i].id), ref.get(stops[i + 1].id)));
     let blocked = this._solve(legs);
-    // and over any older line's cable it doesn't pass well under
+    // and over any older line's cable it doesn't pass well under; again
+    // once it has risen, till it asks no more (where the two cross at a
+    // shallow angle, rising over one stretch of the other can bring it level
+    // with the other a little further on)
     const others = line ? this._olderCables(line) : [];
-    if (others.length && legs.reduce((more, leg) => this._overCables(leg, others) || more, false)) blocked = this._solve(legs);
+    for (let pass = 0; pass < 6 && others.length && legs.reduce((more, leg) => this._overCables(leg, others) || more, false); pass++) blocked = this._solve(legs);
     // a station rises in steps of a quarter tile (the cable only goes higher)
     const lift = new Map();
     for (const [id, s] of ref) if (!lifts) { const k = Math.ceil((s.h - s.base) / 0.25 - 1e-6) * 0.25; s.h = s.base + k; if (k > 0) lift.set(id, k); }
@@ -799,7 +804,9 @@ export class Transit {
   // stations (an interchange's berths keep their lines apart there). Adds
   // that to what the span must clear (req); whether it asks more anywhere.
   _overCables(leg, others) {
-    const { a, ux, uz, L, NS, HL, HW, req, by } = leg, room = G_HANG + 0.12, end = 0.6;
+    // (room for a cabin and its hanger, and a little more: the cable is only
+    // held to it at points along the span, and sags a little between them)
+    const { a, ux, uz, L, NS, HL, HW, req, by } = leg, room = G_HANG + 0.2, end = 0.6;
     let more = false;
     for (const { R, name } of others) for (let i = 0; i + 1 < R.pts.length; i++) {
       const [px, pz] = R.pts[i], [qx, qz] = R.pts[i + 1];
@@ -1111,10 +1118,22 @@ export class Transit {
       if (!r) continue;
       const mine = this.vehicles.filter(v => v.line === line);
       while (mine.length > line.vehicles) this._removeVehicle(mine.pop());
-      for (let k = mine.length; k < line.vehicles; k++) mine.push(this._spawnVehicle(line, r, (r.length * k) / line.vehicles));
+      for (let k = mine.length; k < line.vehicles; k++) mine.push(this._spawnVehicle(line, r, this._clearStart(line, r, (r.length * k) / line.vehicles)));
     }
     this._drawCables();
     this.game.emit('transit:routes');
+  }
+
+  // Where a new coach or train starts along its route r: at s, or a little
+  // further on if another vehicle stands there (on a road two lines share).
+  _clearStart(line, r, s) {
+    if (line.mode === 'gondola') return s;
+    const others = this.vehicles.filter(v => v.line.mode !== 'gondola' && v.route).map(v => this._sample(v.route, v.s));
+    for (let k = 0; k < 12; k++) {
+      const q = this._sample(r, s + k * 0.3);
+      if (others.every(o => Math.hypot(o.x - q.x, o.z - q.z) > 0.9)) return (s + k * 0.3) % r.length;
+    }
+    return s;
   }
 
   _nextMark(route, s) {
@@ -1539,7 +1558,9 @@ export class Transit {
     if (es.length === 1) kind = 0;
     else if (es.length !== 2) kind = 1;
     else if (Math.PI - angDiff(net.dirAt(es[0], n.id), net.dirAt(es[1], n.id)) > 0.6) kind = 2;
-    let r = Math.max(...es.map(e => HALF[e.level])) + 0.3;
+    // (wide enough that one waiting at its edge is clear of the back of a
+    // coach turning through it, which swings out round the corner)
+    let r = Math.max(...es.map(e => HALF[e.level])) + 0.42;
     // (two junctions a short stretch apart are one wide junction: their
     // zones meet halfway along it, so a vehicle claims its way through both
     // at once and never stands between them waiting on one with its tail in
@@ -1565,21 +1586,22 @@ export class Transit {
     }
     for (let i = 0; i < this._turns.length; i++) {
       const [tx, tz] = this._turns[i];
-      if (Math.hypot(tx - x, tz - z) < 0.48) return { k: 1e6 + i, kind: 1, x: tx, z: tz };
+      // (as wide as a junction's: a coach turning round swings its back out as far)
+      if (Math.hypot(tx - x, tz - z) < 0.7) return { k: 1e6 + i, kind: 1, x: tx, z: tz };
     }
     return null;
   }
   _knot(x, z) { const Z = this._zoneAt(x, z); return Z ? Z.kind : 0; }
 
-  // The bit of a junction zone (x, z) is in (an eighth of a unit square
-  // round its middle, as a key for claims on it; -1 off a junction): two
-  // vehicles may be in one junction at once, so long as their ways through
-  // it don't cross.
+  // The bit of a junction zone (x, z) is in (a square 0.15 across, of the
+  // ten by ten round its middle, as a key for claims on it; -1 off a
+  // junction): two vehicles may be in one junction at once, so long as
+  // their ways through it don't cross.
   _cell(x, z) {
     const Z = this._zoneAt(x, z);
     if (!Z) return -1;
-    const i = Math.max(0, Math.min(7, Math.floor((x - Z.x + 0.6) / 0.15))), j = Math.max(0, Math.min(7, Math.floor((z - Z.z + 0.6) / 0.15)));
-    return Z.k * 64 + j * 8 + i;
+    const i = Math.max(0, Math.min(9, Math.floor((x - Z.x + 0.75) / 0.15))), j = Math.max(0, Math.min(9, Math.floor((z - Z.z + 0.75) / 0.15)));
+    return Z.k * 128 + j * 10 + i;
   }
 
   // The bits of junction a vehicle's piece o stands on: it keeps its claim
@@ -1645,10 +1667,20 @@ export class Transit {
       }
     }
     if (!tiles.length) { v.jw = 0; return null; }
+    // (one in the junction already goes through it from the way it faces
+    // now: with its front round a corner and the rest of it still swinging
+    // round behind, it isn't going straight through yet, whatever its way
+    // is from its front on)
+    if (tiles[0].d === 0) tiles[0].h0 = me.rotation.y;
     for (const t of tiles) t.straight = Math.abs(Math.atan2(Math.sin(t.h1 - t.h0), Math.cos(t.h1 - t.h0))) < 0.25;
     const fresh = (h) => h.owner !== v && h.frame >= this.frame - 1;
     const apart = (h, t) => (h.straight && t.straight && Math.abs(Math.cos(h.heading - t.h0)) > 0.95) || (t.bend && Math.cos(h.heading - t.h1 - Math.PI) > 0.9) || behind(h.owner);
-    const short = (t, d) => ({ room: Math.max(0, (t.d > 0 ? t.d : d) - 0.15) });
+    // (short of that tile, or of that bit if it's in it already; but one not
+    // in any yet waits short of the first, however far on the trouble is:
+    // tiles that touch leave nowhere to stand between them, and one waiting
+    // in a turning place for the junction beside it stands where a coach
+    // turning round there must swing)
+    const short = (t, d) => ({ room: Math.max(0, (tiles[0].d > 0 ? tiles[0].d : t.d > 0 ? t.d : d) - 0.15) });
     let block = null;
     for (const t of tiles) {
       for (const [c, d] of t.cells) {
@@ -1919,7 +1951,7 @@ export class Transit {
     if (!route) return null;
     const C = routeCentre(this.world.roads, route);
     if (C.length < 2 || route.len < 0.3) return null;
-    return smoothPolyline(offsetPath(C, LANE), 0.3, 3);
+    return smoothPolyline(untangle(offsetPath(thin(C), LANE)), 0.3, 3);
   }
 
   routeRibbons() {
